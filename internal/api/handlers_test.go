@@ -1152,22 +1152,25 @@ func TestHandleSubAggregates(t *testing.T) {
 }
 
 func TestHandleFilteredMessages(t *testing.T) {
+	var gotFilter query.MessageFilter
 	engine := &querytest.MockEngine{
-		ListResults: []query.MessageSummary{
-			{
+		ListMessagesFunc: func(_ context.Context, filter query.MessageFilter) ([]query.MessageSummary, error) {
+			gotFilter = filter
+			return []query.MessageSummary{{
 				ID:             1,
 				Subject:        "Test Email",
+				MessageType:    "sms",
 				FromEmail:      "alice@example.com",
 				SentAt:         time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
 				Labels:         []string{"INBOX"},
 				HasAttachments: false,
 				SizeEstimate:   1024,
-			},
+			}}, nil
 		},
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/filter?sender=alice@example.com&limit=100", nil)
+	req := httptest.NewRequest("GET", "/api/v1/messages/filter?sender=alice@example.com&message_type=sms&limit=100", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -1187,6 +1190,16 @@ func TestHandleFilteredMessages(t *testing.T) {
 	}
 	if len(messages) != 1 {
 		t.Errorf("messages count = %d, want 1", len(messages))
+	}
+	if gotFilter.MessageType != "sms" {
+		t.Fatalf("message_type filter = %q, want sms", gotFilter.MessageType)
+	}
+	msg, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message row = %#v, want object", messages[0])
+	}
+	if msg["message_type"] != "sms" {
+		t.Fatalf("response message_type = %#v, want sms", msg["message_type"])
 	}
 }
 

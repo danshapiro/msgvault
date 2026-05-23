@@ -47,6 +47,7 @@ type MessageDetail struct {
 	ConversationID       int64      `json:"conversation_id"`
 	SourceConversationID string     `json:"source_conversation_id"` // Gmail Thread ID
 	Subject              string     `json:"subject"`
+	MessageType          string     `json:"message_type,omitempty"`
 	Snippet              string     `json:"snippet"`
 	SentAt               time.Time  `json:"sent_at"`
 	ReceivedAt           *time.Time `json:"received_at,omitempty"`
@@ -197,6 +198,7 @@ type MessageFilter struct {
 	RecipientName string // filter by recipient display name (COALESCE(display_name, email))
 	Domain        string // filter by sender domain
 	Label         string // filter by label name
+	MessageType   string // filter by messages.message_type
 
 	// Filter by conversation (thread)
 	ConversationID *int64 // filter by conversation/thread ID

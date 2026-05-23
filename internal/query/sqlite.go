@@ -295,6 +295,11 @@ func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (str
 		conditions = append(conditions, prefix+"has_attachments = 1")
 	}
 
+	if filter.MessageType != "" {
+		conditions = append(conditions, prefix+"message_type = ?")
+		args = append(args, filter.MessageType)
+	}
+
 	// Sender filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
 	// Also checks phone_number for phone-based lookups (e.g., from:+447...)
 	if filter.Sender != "" {

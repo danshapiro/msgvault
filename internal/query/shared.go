@@ -123,7 +123,7 @@ func fetchMessageLabelsDetail(ctx context.Context, db *sql.DB, tablePrefix strin
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 func fetchParticipantsShared(ctx context.Context, db *sql.DB, tablePrefix string, msg *MessageDetail) error {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT mr.recipient_type, p.email_address, %s
+		SELECT mr.recipient_type, COALESCE(NULLIF(p.email_address, ''), NULLIF(p.phone_number, ''), ''), %s
 		FROM %smessage_recipients mr
 		JOIN %sparticipants p ON p.id = mr.participant_id
 		WHERE mr.message_id = ?
@@ -262,6 +262,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, tablePrefix string
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
 			COALESCE(m.subject, ''),
+			COALESCE(m.message_type, ''),
 			COALESCE(m.snippet, ''),
 			m.sent_at,
 			m.received_at,
@@ -281,6 +282,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, tablePrefix string
 		&msg.ConversationID,
 		&msg.SourceConversationID,
 		&msg.Subject,
+		&msg.MessageType,
 		&msg.Snippet,
 		&sentAt,
 		&receivedAt,

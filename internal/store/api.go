@@ -14,6 +14,7 @@ type APIMessage struct {
 	ID             int64
 	ConversationID int64
 	Subject        string
+	MessageType    string
 	From           string
 	To             []string
 	Cc             []string
@@ -55,6 +56,7 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 			m.id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
+			COALESCE(m.message_type, '') as message_type,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
@@ -100,6 +102,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 			m.id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
+			COALESCE(m.message_type, '') as message_type,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
@@ -115,7 +118,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	var m APIMessage
 	var sentAtStr sql.NullString
 	var deletedAtStr sql.NullString
-	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAtStr)
+	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.MessageType, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAtStr)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -206,6 +209,7 @@ func (s *Store) GetMessagesSummariesByIDs(ids []int64) ([]APIMessage, error) {
 			m.id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
+			COALESCE(m.message_type, '') as message_type,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
@@ -257,6 +261,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 			m.id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
+			COALESCE(m.message_type, '') as message_type,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
@@ -483,6 +488,7 @@ func (s *Store) SearchMessagesQuery(
 			m.id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
+			COALESCE(m.message_type, '') as message_type,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
@@ -578,6 +584,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 			m.id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
+			COALESCE(m.message_type, '') as message_type,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
@@ -623,7 +630,7 @@ func scanMessageRows(rows *loggedRows) ([]APIMessage, []int64, error) {
 	for rows.Next() {
 		var m APIMessage
 		var sentAtStr sql.NullString
-		err := rows.Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
+		err := rows.Scan(&m.ID, &m.ConversationID, &m.Subject, &m.MessageType, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
 		if err != nil {
 			return nil, nil, err
 		}

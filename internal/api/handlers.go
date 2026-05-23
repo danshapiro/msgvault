@@ -77,6 +77,7 @@ type MessageSummary struct {
 	ID             int64    `json:"id"`
 	ConversationID int64    `json:"conversation_id,omitempty"`
 	Subject        string   `json:"subject"`
+	MessageType    string   `json:"message_type,omitempty"`
 	From           string   `json:"from"`
 	To             []string `json:"to"`
 	Cc             []string `json:"cc,omitempty"`
@@ -221,6 +222,7 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 			ID:             qMsg.ID,
 			ConversationID: qMsg.ConversationID,
 			Subject:        qMsg.Subject,
+			MessageType:    qMsg.MessageType,
 			From:           from,
 			To:             toAddrs,
 			Cc:             ccAddrs,
@@ -252,6 +254,7 @@ func toMessageSummary(m APIMessage) MessageSummary {
 		ID:             m.ID,
 		ConversationID: m.ConversationID,
 		Subject:        m.Subject,
+		MessageType:    m.MessageType,
 		From:           m.From,
 		To:             to,
 		Cc:             m.Cc,
@@ -1161,6 +1164,7 @@ func parseMessageFilter(r *http.Request) query.MessageFilter {
 	filter.RecipientName = r.URL.Query().Get("recipient_name")
 	filter.Domain = r.URL.Query().Get("domain")
 	filter.Label = r.URL.Query().Get("label")
+	filter.MessageType = r.URL.Query().Get("message_type")
 
 	if v := r.URL.Query().Get("time_period"); v != "" {
 		filter.TimeRange.Period = v
@@ -1284,6 +1288,7 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 		ID:             m.ID,
 		ConversationID: m.ConversationID,
 		Subject:        m.Subject,
+		MessageType:    m.MessageType,
 		From:           m.FromEmail,
 		To:             []string{}, // Query summary doesn't include recipients
 		SentAt:         m.SentAt.UTC().Format(time.RFC3339),

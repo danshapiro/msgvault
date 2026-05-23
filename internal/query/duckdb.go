@@ -870,6 +870,11 @@ func (e *DuckDBEngine) buildFilterConditions(filter MessageFilter) (string, []in
 		conditions = append(conditions, "msg.has_attachments = true")
 	}
 
+	if filter.MessageType != "" {
+		conditions = append(conditions, "msg.message_type = ?")
+		args = append(args, filter.MessageType)
+	}
+
 	// Sender filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
 	// Also checks phone_number for phone-based lookups (e.g., from:+447...)
 	if filter.Sender != "" {
