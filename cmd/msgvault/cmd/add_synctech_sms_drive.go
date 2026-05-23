@@ -63,7 +63,10 @@ func newAddSynctechSMSDriveCmd() *cobra.Command {
 				return fmt.Errorf("save config: %w", err)
 			}
 			if !opts.SkipAuthForTest {
-				cmd.Println("Drive source configured. OAuth token setup will run during the first sync if no token exists.")
+				if err := ensureSynctechSMSDriveToken(cmd.Context(), opts.GoogleAccount, opts.OAuthApp); err != nil {
+					return err
+				}
+				cmd.Println("Drive source configured.")
 			}
 			return nil
 		},
@@ -191,7 +194,7 @@ func newSynctechSMSDriveClient(ctx context.Context, src config.SynctechSMSSource
 	if err != nil {
 		return nil, err
 	}
-	mgr, err := oauth.NewManagerWithScopes(clientSecrets, cfg.TokensDir(), logger, []string{drive.DriveReadonlyScope})
+	mgr, err := newSynctechSMSDriveOAuthManager(clientSecrets)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +210,30 @@ func newSynctechSMSDriveClient(ctx context.Context, src config.SynctechSMSSource
 		return nil, fmt.Errorf("create Drive service: %w", err)
 	}
 	return synctechsms.NewGoogleDriveClient(service), nil
+}
+
+func ensureSynctechSMSDriveToken(ctx context.Context, googleAccount, oauthApp string) error {
+	clientSecrets, err := cfg.OAuth.ClientSecretsFor(oauthApp)
+	if err != nil {
+		return err
+	}
+	mgr, err := newSynctechSMSDriveOAuthManager(clientSecrets)
+	if err != nil {
+		return err
+	}
+	if mgr.HasToken(googleAccount) {
+		return nil
+	}
+	return mgr.Authorize(ctx, googleAccount)
+}
+
+func newSynctechSMSDriveOAuthManager(clientSecrets string) (*oauth.Manager, error) {
+	// The current OAuth manager validates account identity through Gmail's
+	// profile endpoint, so request a read-only Gmail scope alongside Drive.
+	return oauth.NewManagerWithScopes(clientSecrets, cfg.TokensDir(), logger, []string{
+		drive.DriveReadonlyScope,
+		"https://www.googleapis.com/auth/gmail.readonly",
+	})
 }
 
 func synctechImportOptions(src config.SynctechSMSSource) synctechsms.ImportOptions {
