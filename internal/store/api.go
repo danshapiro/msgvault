@@ -329,7 +329,7 @@ func (s *Store) SearchMessagesQuery(
 	// FTS text terms. ftsEnabled is the authoritative signal that FTS is
 	// active — ftsJoin may be empty on dialects (e.g. PostgreSQL) whose
 	// tsvector lives on the main table and needs no extra join.
-	ftsEnabled := len(q.TextTerms) > 0
+	ftsEnabled := len(q.TextTerms) > 0 && s.fts5Available
 	var ftsJoin, ftsOrder, ftsExpr string
 	var ftsOrderArgCount int
 	if ftsEnabled {
@@ -340,6 +340,20 @@ func (s *Store) SearchMessagesQuery(
 		ftsOrderArgCount = orderArgCount
 		conditions = append(conditions, where)
 		args = append(args, ftsExpr)
+	} else {
+		for _, term := range q.TextTerms {
+			like := "%" + escapeLike(term) + "%"
+			conditions = append(conditions, `(
+				m.subject LIKE ? ESCAPE '\'
+				OR m.snippet LIKE ? ESCAPE '\'
+				OR EXISTS (
+					SELECT 1 FROM message_bodies mb
+					WHERE mb.message_id = m.id
+					  AND mb.body_text LIKE ? ESCAPE '\'
+				)
+			)`)
+			args = append(args, like, like, like)
+		}
 	}
 
 	// from: filter

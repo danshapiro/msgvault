@@ -29,7 +29,7 @@ func NewSQLiteEngine(db *sql.DB) *SQLiteEngine {
 	return &SQLiteEngine{db: db}
 }
 
-// hasFTSTable checks if the messages_fts table exists.
+// hasFTSTable checks if the messages_fts table exists and is queryable.
 // Result is cached after first successful check. Errors cause retries on next call.
 // Thread-safe via mutex.
 func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
@@ -46,15 +46,27 @@ func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
 		SELECT COUNT(*) FROM sqlite_master
 		WHERE type='table' AND name='messages_fts'
 	`).Scan(&count)
-
 	if err != nil {
 		// On error (canceled context, temporary DB issue), return false
 		// but don't cache so next call can retry
 		return false
 	}
+	if count == 0 {
+		e.ftsResult = false
+		e.ftsChecked = true
+		return false
+	}
+
+	var probe int
+	err = e.db.QueryRowContext(ctx, `SELECT 1 FROM messages_fts LIMIT 1`).Scan(&probe)
+	if err != nil && err != sql.ErrNoRows {
+		e.ftsResult = false
+		e.ftsChecked = true
+		return false
+	}
 
 	// Cache successful result
-	e.ftsResult = count > 0
+	e.ftsResult = true
 	e.ftsChecked = true
 	return e.ftsResult
 }
@@ -1193,8 +1205,6 @@ func (e *SQLiteEngine) SearchByDomains(ctx context.Context, domains []string, af
 // buildSearchQueryParts builds the WHERE conditions, args, joins, and FTS join
 // for a search query. This is shared between Search and SearchFastCount.
 func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Query) (conditions []string, args []interface{}, joins []string, ftsJoin string) {
-	// Restrict to email messages only; NULL and '' handle pre-message_type data.
-	conditions = append(conditions, emailOnlyFilterM)
 	// Exclude rows soft-deleted by deduplicate; gate source-deleted on
 	// q.HideDeleted via the helper.
 	conditions = append(conditions, store.LiveMessagesWhere("m", q.HideDeleted))
@@ -1334,12 +1344,18 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 			conditions = append(conditions, "messages_fts MATCH ?")
 			args = append(args, strings.Join(ftsTerms, " "))
 		} else {
-			// Fall back to LIKE-based search on subject/snippet only
-			// Body text is in a separate table; use FTS for body search
+			// Fall back to LIKE-based search when FTS5 is unavailable.
 			for _, term := range q.TextTerms {
 				likeTerm := "%" + term + "%"
-				conditions = append(conditions, "(m.subject LIKE ? OR m.snippet LIKE ?)")
-				args = append(args, likeTerm, likeTerm)
+				conditions = append(conditions, `(
+					m.subject LIKE ?
+					OR m.snippet LIKE ?
+					OR EXISTS (
+						SELECT 1 FROM message_bodies mb
+						WHERE mb.message_id = m.id AND mb.body_text LIKE ?
+					)
+				)`)
+				args = append(args, likeTerm, likeTerm, likeTerm)
 			}
 		}
 	}
