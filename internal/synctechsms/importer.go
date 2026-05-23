@@ -170,7 +170,8 @@ func (i *Importer) importMMS(sourceID int64, mms MMS) (int, error) {
 }
 
 func (i *Importer) importCall(sourceID int64, call Call) error {
-	remoteID, err := i.participantID(call.Number, call.ContactName.String)
+	remoteAddress := callParticipantAddress(call)
+	remoteID, err := i.participantID(remoteAddress, call.ContactName.String)
 	if err != nil {
 		return err
 	}
@@ -185,7 +186,7 @@ func (i *Importer) importCall(sourceID int64, call Call) error {
 		senderID = ownerID
 		recipientIDs = []int64{remoteID}
 	}
-	convID, err := i.ensureConversation(sourceID, "calls:"+canonicalAddress(call.Number), call.ContactName.String)
+	convID, err := i.ensureConversation(sourceID, "calls:"+canonicalAddress(remoteAddress), call.ContactName.String)
 	if err != nil {
 		return err
 	}
@@ -196,7 +197,7 @@ func (i *Importer) importCall(sourceID int64, call Call) error {
 		return err
 	}
 	body := fmt.Sprintf("Call %s, %d seconds", callTypeLabel(call.Type), call.DurationSeconds)
-	msgID := stableID("call", call.Number, call.Timestamp.String(), fmt.Sprint(call.Type), fmt.Sprint(call.DurationSeconds))
+	msgID := stableID("call", remoteAddress, call.Timestamp.String(), fmt.Sprint(call.Type), fmt.Sprint(call.DurationSeconds))
 	return i.upsertTextMessage(sourceID, convID, msgID, "synctech_sms_call", senderID, recipientIDs, fromMe, call.Timestamp, body, body, call)
 }
 
@@ -293,6 +294,14 @@ func stableID(parts ...string) string {
 func canonicalAddress(address string) string {
 	n := textimport.NormalizeAddress(address)
 	return n.Value
+}
+
+func callParticipantAddress(call Call) string {
+	number := strings.TrimSpace(call.Number)
+	if number != "" && !strings.EqualFold(number, "null") {
+		return number
+	}
+	return fmt.Sprintf("unknown-call:%d", call.Presentation)
 }
 
 func sortedKey(ids []int64) string {

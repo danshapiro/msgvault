@@ -63,6 +63,27 @@ func TestImporterRejectsMissingOwnerPhone(t *testing.T) {
 	}
 }
 
+func TestImporterImportsCallWithBlankNumber(t *testing.T) {
+	f := storetest.New(t)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "calls.xml"), `<calls count="1">
+  <call number="" duration="0" date="1775245887101" type="5" presentation="3" contact_name="(Unknown)" />
+</calls>`)
+
+	imp := NewImporter(f.Store, ImportOptions{
+		OwnerPhone:   "+15550000001",
+		IncludeCalls: true,
+	})
+	summary, err := imp.ImportPath(dir)
+	if err != nil {
+		t.Fatalf("ImportPath: %v", err)
+	}
+	if summary.CallsImported != 1 {
+		t.Fatalf("CallsImported = %d, want 1", summary.CallsImported)
+	}
+	assertMessageCount(t, f.Store, 1)
+}
+
 func assertMessageCount(t *testing.T, st *store.Store, want int) {
 	t.Helper()
 	var got int
