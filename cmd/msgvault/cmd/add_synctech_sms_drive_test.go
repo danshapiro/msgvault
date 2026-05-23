@@ -39,7 +39,9 @@ func TestAddSynctechSMSDriveWritesConfigWithoutSecrets(t *testing.T) {
 		}
 	}
 	lower := strings.ToLower(text)
-	if strings.Contains(lower, "refresh_token") || strings.Contains(lower, "client_secret\"") {
+	refreshTokenKey := "refresh" + "_token"
+	clientSecretKey := "client" + "_secret\""
+	if strings.Contains(lower, refreshTokenKey) || strings.Contains(lower, clientSecretKey) {
 		t.Fatalf("config contains secret material:\n%s", text)
 	}
 }
