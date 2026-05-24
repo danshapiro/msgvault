@@ -125,7 +125,7 @@ msgvault import-emlx you@example.com ~/Library/Mail/V10     # explicit path
 
 ### Import SMS Backup & Restore for Android (`synctech-sms`)
 
-Msgvault can import XML backups produced by **SMS Backup & Restore** by SyncTech Pty Ltd. The Android app is listed in Google Play as `SMS Backup & Restore` and uses package `com.riteshsahu.SMSBackupRestore`; the Pro app uses `com.riteshsahu.SMSBackupRestorePro`.
+Msgvault can import XML backups produced by **[SMS Backup & Restore](https://play.google.com/store/apps/details?id=com.riteshsahu.SMSBackupRestore)** by SyncTech Pty Ltd. The Android app is listed in Google Play as `SMS Backup & Restore` and uses package `com.riteshsahu.SMSBackupRestore`; the Pro app uses `com.riteshsahu.SMSBackupRestorePro`.
 
 Install the Android app on the phone that owns the messages, then configure a scheduled backup:
 
