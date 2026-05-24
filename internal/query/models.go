@@ -29,6 +29,9 @@ type MessageSummary struct {
 	FromEmail            string     `json:"from_email"`
 	FromName             string     `json:"from_name"`
 	FromPhone            string     `json:"from_phone,omitempty"` // Phone number (for WhatsApp/chat sources)
+	To                   []Address  `json:"to,omitempty"`
+	Cc                   []Address  `json:"cc,omitempty"`
+	Bcc                  []Address  `json:"bcc,omitempty"`
 	SentAt               time.Time  `json:"sent_at"`
 	SizeEstimate         int64      `json:"size_estimate"`
 	HasAttachments       bool       `json:"has_attachments"`

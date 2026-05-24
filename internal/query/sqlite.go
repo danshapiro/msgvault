@@ -714,6 +714,9 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 
 	// Fetch labels for each message (batch would be more efficient but this is simpler)
 	if len(results) > 0 {
+		if err := fetchParticipantsForMessageList(ctx, e.db, "", results); err != nil {
+			return nil, fmt.Errorf("fetch participants: %w", err)
+		}
 		if err := e.fetchLabelsForMessages(ctx, results); err != nil {
 			return nil, fmt.Errorf("fetch labels: %w", err)
 		}

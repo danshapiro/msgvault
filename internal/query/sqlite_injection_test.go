@@ -144,9 +144,11 @@ func TestListMessagesFiltersByMessageType(t *testing.T) {
 	env := newTestEnv(t)
 	if _, err := env.DB.Exec(`
 		INSERT INTO participants (id, phone_number, display_name) VALUES (99, '+15551234567', 'SMS Sender');
+		INSERT INTO participants (id, phone_number, display_name) VALUES (100, '+15557654321', 'Me');
 		INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at, subject, snippet, size_estimate, has_attachments, attachment_count)
 		VALUES (99, 1, 1, 'sms-99', 'sms', '2024-04-01 08:00:00', '', 'known sms snippet', 17, 0, 0);
 		INSERT INTO message_recipients (message_id, participant_id, recipient_type) VALUES (99, 99, 'from');
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type) VALUES (99, 100, 'to');
 	`); err != nil {
 		t.Fatalf("insert sms fixture: %v", err)
 	}
@@ -164,6 +166,12 @@ func TestListMessagesFiltersByMessageType(t *testing.T) {
 	}
 	if messages[0].MessageType != "sms" {
 		t.Fatalf("message_type = %q, want sms", messages[0].MessageType)
+	}
+	if messages[0].FromPhone != "+15551234567" || messages[0].FromName != "SMS Sender" {
+		t.Fatalf("summary sender = name %q phone %q, want phone-backed SMS sender", messages[0].FromName, messages[0].FromPhone)
+	}
+	if len(messages[0].To) != 1 || messages[0].To[0].Email != "+15557654321" || messages[0].To[0].Name != "Me" {
+		t.Fatalf("summary To = %#v, want phone-backed SMS recipient", messages[0].To)
 	}
 
 	detail, err := env.Engine.GetMessage(env.Ctx, 99)

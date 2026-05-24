@@ -178,11 +178,7 @@ func writeError(w http.ResponseWriter, status int, err string, message string) {
 func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 	from := ""
 	if len(qMsg.From) > 0 {
-		if qMsg.From[0].Name != "" {
-			from = fmt.Sprintf("%s <%s>", qMsg.From[0].Name, qMsg.From[0].Email)
-		} else {
-			from = qMsg.From[0].Email
-		}
+		from = formatQueryAddress(qMsg.From[0])
 	}
 
 	toAddrs := make([]string, 0, len(qMsg.To))
@@ -1284,13 +1280,22 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 	if labels == nil {
 		labels = []string{}
 	}
+	from := m.FromEmail
+	if from == "" && m.FromPhone != "" {
+		from = m.FromPhone
+	}
+	if m.FromName != "" && from != "" {
+		from = fmt.Sprintf("%s <%s>", m.FromName, from)
+	}
 	return MessageSummary{
 		ID:             m.ID,
 		ConversationID: m.ConversationID,
 		Subject:        m.Subject,
 		MessageType:    m.MessageType,
-		From:           m.FromEmail,
-		To:             []string{}, // Query summary doesn't include recipients
+		From:           from,
+		To:             formatQueryAddresses(m.To),
+		Cc:             formatQueryAddresses(m.Cc),
+		Bcc:            formatQueryAddresses(m.Bcc),
 		SentAt:         m.SentAt.UTC().Format(time.RFC3339),
 		DeletedAt:      formatDeletedAt(m.DeletedAt),
 		Snippet:        m.Snippet,
@@ -1298,6 +1303,24 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 		HasAttach:      m.HasAttachments,
 		SizeBytes:      m.SizeEstimate,
 	}
+}
+
+func formatQueryAddresses(addrs []query.Address) []string {
+	if addrs == nil {
+		return []string{}
+	}
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		out = append(out, formatQueryAddress(addr))
+	}
+	return out
+}
+
+func formatQueryAddress(addr query.Address) string {
+	if addr.Name != "" && addr.Email != "" {
+		return fmt.Sprintf("%s <%s>", addr.Name, addr.Email)
+	}
+	return addr.Email
 }
 
 func formatDeletedAt(deletedAt *time.Time) string {

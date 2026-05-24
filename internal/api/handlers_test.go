@@ -1247,6 +1247,49 @@ func TestHandleFilteredMessagesIncludesDeletedAt(t *testing.T) {
 	}
 }
 
+func TestHandleFilteredMessagesFormatsPhoneBackedSMSParticipants(t *testing.T) {
+	engine := &querytest.MockEngine{
+		ListResults: []query.MessageSummary{
+			{
+				ID:          1,
+				Subject:     "",
+				MessageType: "sms",
+				FromName:    "SMS Sender",
+				FromPhone:   "+15551234567",
+				To:          []query.Address{{Email: "+15557654321", Name: "Me"}},
+				SentAt:      time.Date(2024, 4, 1, 8, 0, 0, 0, time.UTC),
+				Snippet:     "known sms snippet",
+			},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/filter?message_type=sms&limit=1", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp struct {
+		Messages []MessageSummary `json:"messages"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Messages) != 1 {
+		t.Fatalf("messages count = %d, want 1", len(resp.Messages))
+	}
+	if resp.Messages[0].From != "SMS Sender <+15551234567>" {
+		t.Fatalf("from = %q, want formatted phone-backed sender", resp.Messages[0].From)
+	}
+	if len(resp.Messages[0].To) != 1 || resp.Messages[0].To[0] != "Me <+15557654321>" {
+		t.Fatalf("to = %#v, want formatted phone-backed recipient", resp.Messages[0].To)
+	}
+}
+
 func TestHandleTotalStats(t *testing.T) {
 	engine := &querytest.MockEngine{
 		Stats: &query.TotalStats{
