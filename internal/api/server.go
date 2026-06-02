@@ -32,6 +32,13 @@ type MessageStore interface {
 	SearchMessagesQuery(q *search.Query, offset, limit int) ([]APIMessage, int64, error)
 }
 
+type SourceStatusStore interface {
+	ListSources(sourceType string) ([]*store.Source, error)
+	GetActiveSync(sourceID int64) (*store.SyncRun, error)
+	GetLatestSync(sourceID int64) (*store.SyncRun, error)
+	GetLastSuccessfulSync(sourceID int64) (*store.SyncRun, error)
+}
+
 // StoreStats is an alias for store.Stats — single source of truth.
 type StoreStats = store.Stats
 
@@ -182,6 +189,7 @@ func (s *Server) setupRouter() chi.Router {
 		r.Get("/accounts", s.handleListAccounts)
 		r.Post("/accounts", s.handleAddAccount)
 		r.Post("/sync/{account}", s.handleTriggerSync)
+		r.Get("/sources/status", s.handleSourceSyncStatus)
 
 		// Scheduler status
 		r.Get("/scheduler/status", s.handleSchedulerStatus)

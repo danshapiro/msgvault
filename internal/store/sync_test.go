@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,47 @@ import (
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
+
+func TestTouchSourceLastSyncAt_UpdatesTimestampsAndPreservesCursor(t *testing.T) {
+	f := storetest.New(t)
+	oldTimestamp := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	const cursor = "cursor-before-touch"
+
+	_, err := f.Store.DB().Exec(`
+		UPDATE sources
+		SET last_sync_at = NULL, sync_cursor = ?, updated_at = ?
+		WHERE id = ?
+	`, cursor, oldTimestamp, f.Source.ID)
+	testutil.MustNoErr(t, err, "seed source timestamps")
+
+	err = f.Store.TouchSourceLastSyncAt(f.Source.ID)
+	testutil.MustNoErr(t, err, "TouchSourceLastSyncAt")
+
+	updated, err := f.Store.GetSourceByID(f.Source.ID)
+	testutil.MustNoErr(t, err, "GetSourceByID")
+
+	if !updated.LastSyncAt.Valid {
+		t.Fatal("LastSyncAt.Valid = false, want true")
+	}
+	if !updated.LastSyncAt.Time.After(oldTimestamp) {
+		t.Errorf("LastSyncAt = %v, want after %v", updated.LastSyncAt.Time, oldTimestamp)
+	}
+	if !updated.UpdatedAt.After(oldTimestamp) {
+		t.Errorf("UpdatedAt = %v, want after %v", updated.UpdatedAt, oldTimestamp)
+	}
+	if !updated.SyncCursor.Valid || updated.SyncCursor.String != cursor {
+		t.Errorf("SyncCursor = %v, want %q", updated.SyncCursor, cursor)
+	}
+}
+
+func TestTouchSourceLastSyncAt_MissingSource(t *testing.T) {
+	f := storetest.New(t)
+
+	err := f.Store.TouchSourceLastSyncAt(999999)
+	if !errors.Is(err, store.ErrSourceNotFound) {
+		t.Fatalf("TouchSourceLastSyncAt missing source error = %v, want ErrSourceNotFound", err)
+	}
+}
 
 // TestScanSource_NullLastSyncAt_Valid verifies that a new source with NULL
 // last_sync_at is handled correctly (Valid=false).

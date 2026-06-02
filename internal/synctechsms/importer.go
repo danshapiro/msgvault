@@ -41,7 +41,7 @@ func (i *Importer) ImportPath(path string) (ImportSummary, error) {
 	if err != nil {
 		return ImportSummary{}, fmt.Errorf("start sync: %w", err)
 	}
-	summary, importErr := i.importFiles(src.ID, files)
+	summary, importErr := i.ImportFilesForSource(src.ID, files)
 	if importErr != nil {
 		_ = i.store.FailSync(syncID, importErr.Error())
 		return summary, importErr
@@ -58,7 +58,24 @@ func (i *Importer) ImportPath(path string) (ImportSummary, error) {
 	return summary, nil
 }
 
-func (i *Importer) importFiles(sourceID int64, files []BackupFile) (ImportSummary, error) {
+// ImportPathForSource imports Synctech backup files from path into an existing
+// source without starting or completing a sync run. Callers that already own a
+// source-level sync lifecycle, such as the Drive connector, use this method to
+// avoid nested sync runs.
+func (i *Importer) ImportPathForSource(sourceID int64, path string) (ImportSummary, error) {
+	if strings.TrimSpace(i.opts.OwnerPhone) == "" {
+		return ImportSummary{}, fmt.Errorf("owner phone is required for synctech-sms imports")
+	}
+	files, err := DiscoverBackupFiles(path)
+	if err != nil {
+		return ImportSummary{}, err
+	}
+	return i.ImportFilesForSource(sourceID, files)
+}
+
+// ImportFilesForSource imports already-discovered Synctech backup files into
+// an existing source without starting or completing a sync run.
+func (i *Importer) ImportFilesForSource(sourceID int64, files []BackupFile) (ImportSummary, error) {
 	var summary ImportSummary
 	summary.FilesSeen = len(files)
 	for _, file := range files {

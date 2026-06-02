@@ -676,6 +676,27 @@ func TestStore_SyncComplete(t *testing.T) {
 	}
 }
 
+func TestStore_GetLatestSync(t *testing.T) {
+	f := storetest.New(t)
+
+	completedID := f.StartSync()
+	err := f.Store.CompleteSync(completedID, "history-12345")
+	testutil.MustNoErr(t, err, "CompleteSync()")
+
+	failedID := f.StartSync()
+	err = f.Store.FailSync(failedID, "network error")
+	testutil.MustNoErr(t, err, "FailSync()")
+
+	latest, err := f.Store.GetLatestSync(f.Source.ID)
+	testutil.MustNoErr(t, err, "GetLatestSync()")
+	if latest == nil {
+		t.Fatal("expected latest sync, got nil")
+	}
+	if latest.ID != failedID || latest.Status != "failed" {
+		t.Fatalf("latest sync = id %d status %q, want id %d failed", latest.ID, latest.Status, failedID)
+	}
+}
+
 func TestStore_SyncFail(t *testing.T) {
 	f := storetest.New(t)
 

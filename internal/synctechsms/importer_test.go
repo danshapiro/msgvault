@@ -63,6 +63,37 @@ func TestImporterRejectsMissingOwnerPhone(t *testing.T) {
 	}
 }
 
+func TestImporterImportPathForSourceDoesNotCreateSyncRun(t *testing.T) {
+	f := storetest.New(t)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "messages.xml"), `<smses count="1">
+  <sms address="+15551234567" date="1717214400000" type="1" body="hello" read="1" status="-1" />
+</smses>`)
+	source, err := f.Store.GetOrCreateSource(SourceType, "+15550000001")
+	if err != nil {
+		t.Fatalf("GetOrCreateSource: %v", err)
+	}
+
+	imp := NewImporter(f.Store, ImportOptions{
+		OwnerPhone: "+15550000001",
+		IncludeSMS: true,
+	})
+	summary, err := imp.ImportPathForSource(source.ID, dir)
+	if err != nil {
+		t.Fatalf("ImportPathForSource: %v", err)
+	}
+	if summary.SMSImported != 1 {
+		t.Fatalf("SMSImported = %d, want 1", summary.SMSImported)
+	}
+	var syncRuns int
+	if err := f.Store.DB().QueryRow(`SELECT COUNT(*) FROM sync_runs WHERE source_id = ?`, source.ID).Scan(&syncRuns); err != nil {
+		t.Fatalf("count sync runs: %v", err)
+	}
+	if syncRuns != 0 {
+		t.Fatalf("sync run count = %d, want 0", syncRuns)
+	}
+}
+
 func TestImporterImportsCallWithBlankNumber(t *testing.T) {
 	f := storetest.New(t)
 	dir := t.TempDir()

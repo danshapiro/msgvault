@@ -252,6 +252,25 @@ func (s *Store) GetActiveSync(sourceID int64) (*SyncRun, error) {
 	return run, err
 }
 
+// GetLatestSync returns the most recent sync run for a source, if any.
+func (s *Store) GetLatestSync(sourceID int64) (*SyncRun, error) {
+	row := s.db.QueryRow(`
+		SELECT id, source_id, started_at, completed_at, status,
+		       messages_processed, messages_added, messages_updated, errors_count,
+		       error_message, cursor_before, cursor_after
+		FROM sync_runs
+		WHERE source_id = ?
+		ORDER BY started_at DESC, id DESC
+		LIMIT 1
+	`, sourceID)
+
+	run, err := scanSyncRun(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return run, err
+}
+
 // GetLatestCheckpointedSync returns the most recent sync run for a source if
 // (and only if) that latest run is running or failed and has a non-empty
 // cursor_before. A completed run after a failed one means the failed run's
@@ -304,6 +323,7 @@ func (s *Store) UpsertSourceImportItem(item SourceImportItem) error {
 
 func (s *Store) GetSourceImportItem(sourceID int64, provider, providerID string) (*SourceImportItem, error) {
 	var item SourceImportItem
+	var checksum sql.NullString
 	err := s.db.QueryRow(`
 		SELECT id, source_id, provider, provider_id, name, checksum, size,
 		       modified_at, imported_at, status, records_imported, error_message
@@ -311,7 +331,7 @@ func (s *Store) GetSourceImportItem(sourceID int64, provider, providerID string)
 		WHERE source_id = ? AND provider = ? AND provider_id = ?
 	`, sourceID, provider, providerID).Scan(
 		&item.ID, &item.SourceID, &item.Provider, &item.ProviderID, &item.Name,
-		&item.Checksum, &item.Size, &item.ModifiedAt, &item.ImportedAt,
+		&checksum, &item.Size, &item.ModifiedAt, &item.ImportedAt,
 		&item.Status, &item.RecordsImported, &item.ErrorMessage,
 	)
 	if err == sql.ErrNoRows {
@@ -320,6 +340,7 @@ func (s *Store) GetSourceImportItem(sourceID int64, provider, providerID string)
 	if err != nil {
 		return nil, fmt.Errorf("get source import item: %w", err)
 	}
+	item.Checksum = checksum.String
 	return &item, nil
 }
 
@@ -335,11 +356,12 @@ func (s *Store) ListImportedSourceItemChecksums(sourceID int64, provider string)
 	defer func() { _ = rows.Close() }()
 	out := map[string]string{}
 	for rows.Next() {
-		var providerID, checksum string
+		var providerID string
+		var checksum sql.NullString
 		if err := rows.Scan(&providerID, &checksum); err != nil {
 			return nil, fmt.Errorf("scan source import item checksum: %w", err)
 		}
-		out[providerID] = checksum
+		out[providerID] = checksum.String
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate source import item checksums: %w", err)
@@ -466,6 +488,27 @@ func (s *Store) UpdateSourceSyncCursor(sourceID int64, cursor string) error {
 		WHERE id = ?
 	`, now, now), cursor, sourceID)
 	return err
+}
+
+// TouchSourceLastSyncAt updates only the last sync timestamp for a source.
+func (s *Store) TouchSourceLastSyncAt(sourceID int64) error {
+	now := s.dialect.Now()
+	res, err := s.db.Exec(fmt.Sprintf(`
+		UPDATE sources
+		SET last_sync_at = %s, updated_at = %s
+		WHERE id = ?
+	`, now, now), sourceID)
+	if err != nil {
+		return fmt.Errorf("touch source last sync at: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("touch source last sync at: check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("source %d: %w", sourceID, ErrSourceNotFound)
+	}
+	return nil
 }
 
 // ListSources returns all sources, optionally filtered by source type.

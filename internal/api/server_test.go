@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // testLogger returns a logger for tests that discards output
@@ -65,6 +67,10 @@ type mockStore struct {
 	stats    *StoreStats
 	messages []APIMessage
 	total    int64
+	sources  []*store.Source
+	active   map[int64]*store.SyncRun
+	latest   map[int64]*store.SyncRun
+	lastOK   map[int64]*store.SyncRun
 
 	// Call counts so tests can assert that bulk hydration paths use
 	// GetMessagesSummariesByIDs (one round-trip) instead of looping
@@ -117,6 +123,37 @@ func (m *mockStore) SearchMessages(query string, offset, limit int) ([]APIMessag
 
 func (m *mockStore) SearchMessagesQuery(q *search.Query, offset, limit int) ([]APIMessage, int64, error) {
 	return m.messages, m.total, nil
+}
+
+func (m *mockStore) ListSources(sourceType string) ([]*store.Source, error) {
+	var out []*store.Source
+	for _, src := range m.sources {
+		if sourceType == "" || src.SourceType == sourceType {
+			out = append(out, src)
+		}
+	}
+	return out, nil
+}
+
+func (m *mockStore) GetActiveSync(sourceID int64) (*store.SyncRun, error) {
+	if m.active == nil {
+		return nil, nil
+	}
+	return m.active[sourceID], nil
+}
+
+func (m *mockStore) GetLatestSync(sourceID int64) (*store.SyncRun, error) {
+	if m.latest == nil {
+		return nil, nil
+	}
+	return m.latest[sourceID], nil
+}
+
+func (m *mockStore) GetLastSuccessfulSync(sourceID int64) (*store.SyncRun, error) {
+	if m.lastOK == nil {
+		return nil, nil
+	}
+	return m.lastOK[sourceID], nil
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -287,6 +324,100 @@ func TestSchedulerStatusNotRunning(t *testing.T) {
 
 	if resp.Running {
 		t.Error("expected scheduler to NOT be running")
+	}
+}
+
+func TestSourceSyncStatusEndpoint(t *testing.T) {
+	now := time.Date(2026, 5, 25, 5, 0, 0, 0, time.UTC)
+	cfg := &config.Config{Server: config.ServerConfig{APIPort: 8080}}
+	sched := newMockScheduler()
+	ms := &mockStore{
+		sources: []*store.Source{
+			{
+				ID:          1,
+				SourceType:  "gmail",
+				Identifier:  "user@example.com",
+				LastSyncAt:  sql.NullTime{Time: now.Add(-time.Hour), Valid: true},
+				UpdatedAt:   now.Add(-time.Hour),
+				DisplayName: sql.NullString{String: "User", Valid: true},
+			},
+			{
+				ID:         2,
+				SourceType: "synctech_sms",
+				Identifier: "+15550000001",
+				LastSyncAt: sql.NullTime{Time: now, Valid: true},
+				UpdatedAt:  now,
+			},
+		},
+		active: map[int64]*store.SyncRun{
+			2: {
+				ID:        22,
+				SourceID:  2,
+				StartedAt: now.Add(-time.Minute),
+				Status:    store.SyncStatusRunning,
+			},
+		},
+		latest: map[int64]*store.SyncRun{
+			2: {
+				ID:           23,
+				SourceID:     2,
+				StartedAt:    now.Add(-30 * time.Second),
+				CompletedAt:  sql.NullTime{Time: now.Add(-15 * time.Second), Valid: true},
+				Status:       store.SyncStatusFailed,
+				ErrorMessage: sql.NullString{String: "Drive list failed", Valid: true},
+			},
+		},
+		lastOK: map[int64]*store.SyncRun{
+			2: {
+				ID:          21,
+				SourceID:    2,
+				CompletedAt: sql.NullTime{Time: now.Add(-2 * time.Hour), Valid: true},
+				Status:      store.SyncStatusCompleted,
+				CursorAfter: sql.NullString{String: "cursor", Valid: true},
+			},
+		},
+	}
+	srv := NewServer(cfg, ms, sched, testLogger())
+
+	req := httptest.NewRequest("GET", "/api/v1/sources/status?source_type=synctech_sms", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp SourceSyncStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Sources) != 1 {
+		t.Fatalf("sources len = %d, want 1", len(resp.Sources))
+	}
+	got := resp.Sources[0]
+	if got.ID != 2 || got.SourceType != "synctech_sms" || got.Identifier != "+15550000001" {
+		t.Fatalf("source status = %#v", got)
+	}
+	if got.LastSyncAt != "2026-05-25T05:00:00Z" {
+		t.Errorf("LastSyncAt = %q", got.LastSyncAt)
+	}
+	if got.ActiveSyncID != 22 || got.LatestSyncID != 23 || got.LatestSyncStatus != store.SyncStatusFailed || got.LastCompletedSyncID != 21 || got.LastCompletedCursor != "cursor" {
+		t.Errorf("sync run fields = %#v", got)
+	}
+	if got.LatestSyncErrorText != "Drive list failed" {
+		t.Errorf("LatestSyncErrorText = %q", got.LatestSyncErrorText)
+	}
+}
+
+func TestSourceSyncStatusEndpointStoreUnavailable(t *testing.T) {
+	cfg := &config.Config{Server: config.ServerConfig{APIPort: 8080}}
+	srv := NewServer(cfg, nil, newMockScheduler(), testLogger())
+
+	req := httptest.NewRequest("GET", "/api/v1/sources/status", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 }
 

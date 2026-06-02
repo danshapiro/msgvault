@@ -173,7 +173,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			Name:     jobName,
 			Schedule: source.Schedule,
 			Run: func(ctx context.Context) error {
-				return runConfiguredSynctechSMSSource(ctx, source)
+				return runConfiguredSynctechSMSSourceWithStore(ctx, s, source)
 			},
 		}); err != nil {
 			logger.Error("failed to schedule synctech-sms source", "source", source.Name, "error", err)
@@ -320,6 +320,22 @@ func (a *storeAPIAdapter) SearchMessagesQuery(q *search.Query, offset, limit int
 	return a.store.SearchMessagesQuery(q, offset, limit)
 }
 
+func (a *storeAPIAdapter) ListSources(sourceType string) ([]*store.Source, error) {
+	return a.store.ListSources(sourceType)
+}
+
+func (a *storeAPIAdapter) GetActiveSync(sourceID int64) (*store.SyncRun, error) {
+	return a.store.GetActiveSync(sourceID)
+}
+
+func (a *storeAPIAdapter) GetLatestSync(sourceID int64) (*store.SyncRun, error) {
+	return a.store.GetLatestSync(sourceID)
+}
+
+func (a *storeAPIAdapter) GetLastSuccessfulSync(sourceID int64) (*store.SyncRun, error) {
+	return a.store.GetLastSuccessfulSync(sourceID)
+}
+
 // schedulerAdapter adapts scheduler.Scheduler to api.SyncScheduler.
 // Since api.AccountStatus is a type alias for scheduler.AccountStatus,
 // the adapter methods are simple pass-throughs.
@@ -441,23 +457,7 @@ func runScheduledSync(ctx context.Context, email string, s *store.Store, getOAut
 	)
 
 	// Rebuild cache if stale (covers new messages and deletions).
-	dbPath := cfg.DatabaseDSN()
-	analyticsDir := cfg.AnalyticsDir()
-	if staleness := cacheNeedsBuild(dbPath, analyticsDir); staleness.NeedsBuild {
-		logger.Info("rebuilding cache after sync",
-			"email", email, "reason", staleness.Reason,
-			"full_rebuild", staleness.FullRebuild)
-		result, err := buildCache(
-			dbPath, analyticsDir, staleness.FullRebuild)
-		if err != nil {
-			logger.Error("cache build failed", "error", err)
-			// Don't fail the sync for cache build errors
-		} else if !result.Skipped {
-			logger.Info("cache build completed",
-				"exported", result.ExportedCount,
-			)
-		}
-	}
+	rebuildCacheAfterSync("gmail", email)
 
 	return nil
 }

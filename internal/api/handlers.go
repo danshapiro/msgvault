@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +65,32 @@ type AccountInfo struct {
 type SchedulerStatusResponse struct {
 	Running  bool            `json:"running"`
 	Accounts []AccountStatus `json:"accounts"`
+}
+
+// SourceSyncStatus represents source-level sync freshness and recent run state.
+type SourceSyncStatus struct {
+	ID                     int64  `json:"id"`
+	SourceType             string `json:"source_type"`
+	Identifier             string `json:"identifier"`
+	DisplayName            string `json:"display_name,omitempty"`
+	LastSyncAt             string `json:"last_sync_at,omitempty"`
+	UpdatedAt              string `json:"updated_at,omitempty"`
+	ActiveSyncID           int64  `json:"active_sync_id,omitempty"`
+	ActiveSyncStartedAt    string `json:"active_sync_started_at,omitempty"`
+	LatestSyncID           int64  `json:"latest_sync_id,omitempty"`
+	LatestSyncStatus       string `json:"latest_sync_status,omitempty"`
+	LatestSyncStartedAt    string `json:"latest_sync_started_at,omitempty"`
+	LatestSyncCompletedAt  string `json:"latest_sync_completed_at,omitempty"`
+	LatestSyncErrorText    string `json:"latest_sync_error_text,omitempty"`
+	LastCompletedSyncID    int64  `json:"last_completed_sync_id,omitempty"`
+	LastCompletedSyncAt    string `json:"last_completed_sync_at,omitempty"`
+	LastCompletedCursor    string `json:"last_completed_cursor,omitempty"`
+	LastCompletedErrorText string `json:"last_completed_error_text,omitempty"`
+}
+
+// SourceSyncStatusResponse represents all source-level sync statuses.
+type SourceSyncStatusResponse struct {
+	Sources []SourceSyncStatus `json:"sources"`
 }
 
 // ErrorResponse represents an API error.
@@ -726,6 +753,97 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 		Running:  s.scheduler.IsRunning(),
 		Accounts: statuses,
 	})
+}
+
+func (s *Server) handleSourceSyncStatus(w http.ResponseWriter, r *http.Request) {
+	statusStore, ok := s.store.(SourceStatusStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "Source status store not available")
+		return
+	}
+
+	sourceType := r.URL.Query().Get("source_type")
+	sources, err := statusStore.ListSources(sourceType)
+	if err != nil {
+		s.logger.Error("failed to list source sync statuses", "source_type", sourceType, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve source statuses")
+		return
+	}
+
+	statuses := make([]SourceSyncStatus, 0, len(sources))
+	for _, src := range sources {
+		status := SourceSyncStatus{
+			ID:          src.ID,
+			SourceType:  src.SourceType,
+			Identifier:  src.Identifier,
+			DisplayName: nullStringValue(src.DisplayName),
+			LastSyncAt:  nullTimeValue(src.LastSyncAt),
+			UpdatedAt:   timeValue(src.UpdatedAt),
+		}
+
+		active, err := statusStore.GetActiveSync(src.ID)
+		if err != nil {
+			s.logger.Error("failed to get active sync", "source_id", src.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve source statuses")
+			return
+		}
+		if active != nil {
+			status.ActiveSyncID = active.ID
+			status.ActiveSyncStartedAt = timeValue(active.StartedAt)
+		}
+
+		latest, err := statusStore.GetLatestSync(src.ID)
+		if err != nil {
+			s.logger.Error("failed to get latest sync", "source_id", src.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve source statuses")
+			return
+		}
+		if latest != nil {
+			status.LatestSyncID = latest.ID
+			status.LatestSyncStatus = latest.Status
+			status.LatestSyncStartedAt = timeValue(latest.StartedAt)
+			status.LatestSyncCompletedAt = nullTimeValue(latest.CompletedAt)
+			status.LatestSyncErrorText = nullStringValue(latest.ErrorMessage)
+		}
+
+		completed, err := statusStore.GetLastSuccessfulSync(src.ID)
+		if err != nil {
+			s.logger.Error("failed to get last completed sync", "source_id", src.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve source statuses")
+			return
+		}
+		if completed != nil {
+			status.LastCompletedSyncID = completed.ID
+			status.LastCompletedSyncAt = nullTimeValue(completed.CompletedAt)
+			status.LastCompletedCursor = nullStringValue(completed.CursorAfter)
+			status.LastCompletedErrorText = nullStringValue(completed.ErrorMessage)
+		}
+
+		statuses = append(statuses, status)
+	}
+
+	writeJSON(w, http.StatusOK, SourceSyncStatusResponse{Sources: statuses})
+}
+
+func nullStringValue(ns sql.NullString) string {
+	if !ns.Valid {
+		return ""
+	}
+	return ns.String
+}
+
+func nullTimeValue(nt sql.NullTime) string {
+	if !nt.Valid {
+		return ""
+	}
+	return timeValue(nt.Time)
+}
+
+func timeValue(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // tokenFile represents the on-disk token format (matches oauth package).
