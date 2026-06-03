@@ -184,11 +184,13 @@ func TestAddAccountsFromConfigWithErrors(t *testing.T) {
 
 func TestSchedulerGenericJobStatus(t *testing.T) {
 	var ran int
+	done := make(chan struct{})
 	s := New(func(context.Context, string) error { return nil })
 	err := s.AddJob(Job{
 		Name:     "synctech-sms:pixel",
 		Schedule: "30 4 * * *",
 		Run: func(ctx context.Context) error {
+			defer close(done)
 			ran++
 			return nil
 		},
@@ -202,6 +204,13 @@ func TestSchedulerGenericJobStatus(t *testing.T) {
 	if err := s.TriggerJob("synctech-sms:pixel"); err != nil {
 		t.Fatalf("TriggerJob: %v", err)
 	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("generic job did not complete")
+	}
+	stopCtx := s.Stop()
+	<-stopCtx.Done()
 	if ran != 1 {
 		t.Fatalf("ran = %d, want 1", ran)
 	}

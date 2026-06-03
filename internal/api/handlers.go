@@ -65,6 +65,7 @@ type AccountInfo struct {
 type SchedulerStatusResponse struct {
 	Running  bool            `json:"running"`
 	Accounts []AccountStatus `json:"accounts"`
+	Jobs     []JobStatus     `json:"jobs"`
 }
 
 // SourceSyncStatus represents source-level sync freshness and recent run state.
@@ -748,10 +749,45 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	if statuses == nil {
 		statuses = []AccountStatus{}
 	}
+	jobs := s.scheduler.JobStatus()
+	if jobs == nil {
+		jobs = []JobStatus{}
+	}
 
 	writeJSON(w, http.StatusOK, SchedulerStatusResponse{
 		Running:  s.scheduler.IsRunning(),
 		Accounts: statuses,
+		Jobs:     jobs,
+	})
+}
+
+func (s *Server) handleTriggerSchedulerJob(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduler_unavailable", "Scheduler not available")
+		return
+	}
+
+	job := chi.URLParam(r, "job")
+	if job == "" {
+		writeError(w, http.StatusBadRequest, "missing_job", "Scheduler job is required")
+		return
+	}
+
+	if !s.scheduler.IsJobScheduled(job) {
+		writeError(w, http.StatusNotFound, "not_found", "Scheduler job is not scheduled: "+job)
+		return
+	}
+
+	if err := s.scheduler.TriggerJob(job); err != nil {
+		s.logger.Error("failed to trigger scheduler job", "job", job, "error", err)
+		writeError(w, http.StatusConflict, "job_error", err.Error())
+		return
+	}
+
+	s.logger.Info("scheduler job triggered via API", "job", job)
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status": "accepted",
+		"job":    job,
 	})
 }
 

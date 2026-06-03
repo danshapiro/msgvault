@@ -351,6 +351,14 @@ func (a *schedulerAdapter) TriggerSync(email string) error {
 	return a.scheduler.TriggerSync(email)
 }
 
+func (a *schedulerAdapter) IsJobScheduled(name string) bool {
+	return a.scheduler.IsJobScheduled(name)
+}
+
+func (a *schedulerAdapter) TriggerJob(name string) error {
+	return a.scheduler.TriggerJob(name)
+}
+
 func (a *schedulerAdapter) AddAccount(email, schedule string) error {
 	return a.scheduler.AddAccount(email, schedule)
 }
@@ -361,6 +369,10 @@ func (a *schedulerAdapter) IsRunning() bool {
 
 func (a *schedulerAdapter) Status() []api.AccountStatus {
 	return a.scheduler.Status()
+}
+
+func (a *schedulerAdapter) JobStatus() []api.JobStatus {
+	return a.scheduler.JobStatus()
 }
 
 // runScheduledSync performs an incremental sync for a scheduled

@@ -24,15 +24,19 @@ func testLogger() *slog.Logger {
 // mockScheduler implements SyncScheduler for tests.
 type mockScheduler struct {
 	scheduled  map[string]bool
+	jobs       map[string]bool
 	running    bool
 	statuses   []AccountStatus
+	jobStatus  []JobStatus
 	triggerFn  func(email string) error
+	triggerJob func(name string) error
 	addedAccts []string // emails added via AddAccount
 }
 
 func newMockScheduler() *mockScheduler {
 	return &mockScheduler{
 		scheduled: make(map[string]bool),
+		jobs:      make(map[string]bool),
 		running:   true,
 	}
 }
@@ -48,6 +52,17 @@ func (m *mockScheduler) TriggerSync(email string) error {
 	return nil
 }
 
+func (m *mockScheduler) IsJobScheduled(name string) bool {
+	return m.jobs[name]
+}
+
+func (m *mockScheduler) TriggerJob(name string) error {
+	if m.triggerJob != nil {
+		return m.triggerJob(name)
+	}
+	return nil
+}
+
 func (m *mockScheduler) AddAccount(email, schedule string) error {
 	m.scheduled[email] = true
 	m.addedAccts = append(m.addedAccts, email)
@@ -56,6 +71,10 @@ func (m *mockScheduler) AddAccount(email, schedule string) error {
 
 func (m *mockScheduler) Status() []AccountStatus {
 	return m.statuses
+}
+
+func (m *mockScheduler) JobStatus() []JobStatus {
+	return m.jobStatus
 }
 
 func (m *mockScheduler) IsRunning() bool {
@@ -278,6 +297,14 @@ func TestSchedulerStatusEndpoint(t *testing.T) {
 			NextRun:  time.Now().Add(time.Hour),
 		},
 	}
+	sched.jobStatus = []JobStatus{
+		{
+			Name:     "synctech-sms:pixel",
+			Running:  false,
+			Schedule: "30 4 * * *",
+			NextRun:  time.Now().Add(2 * time.Hour),
+		},
+	}
 
 	srv := NewServer(cfg, nil, sched, testLogger())
 
@@ -300,6 +327,52 @@ func TestSchedulerStatusEndpoint(t *testing.T) {
 	}
 	if len(resp.Accounts) != 1 {
 		t.Errorf("expected 1 account, got %d", len(resp.Accounts))
+	}
+	if len(resp.Jobs) != 1 || resp.Jobs[0].Name != "synctech-sms:pixel" {
+		t.Fatalf("jobs = %#v", resp.Jobs)
+	}
+}
+
+func TestTriggerSchedulerJob(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+	}
+	sched := newMockScheduler()
+	sched.jobs["synctech-sms:pixel"] = true
+	var triggered string
+	sched.triggerJob = func(name string) error {
+		triggered = name
+		return nil
+	}
+
+	srv := NewServer(cfg, nil, sched, testLogger())
+
+	req := httptest.NewRequest("POST", "/api/v1/scheduler/jobs/synctech-sms:pixel/trigger", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if triggered != "synctech-sms:pixel" {
+		t.Fatalf("triggered = %q", triggered)
+	}
+}
+
+func TestTriggerSchedulerJobNotScheduled(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+	}
+	srv := NewServer(cfg, nil, newMockScheduler(), testLogger())
+
+	req := httptest.NewRequest("POST", "/api/v1/scheduler/jobs/synctech-sms:pixel/trigger", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusNotFound, w.Body.String())
 	}
 }
 

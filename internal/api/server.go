@@ -46,13 +46,19 @@ type StoreStats = store.Stats
 type SyncScheduler interface {
 	IsScheduled(email string) bool
 	TriggerSync(email string) error
+	IsJobScheduled(name string) bool
+	TriggerJob(name string) error
 	AddAccount(email, schedule string) error
 	Status() []AccountStatus
+	JobStatus() []JobStatus
 	IsRunning() bool
 }
 
 // AccountStatus is an alias for scheduler.AccountStatus — single source of truth.
 type AccountStatus = scheduler.AccountStatus
+
+// JobStatus is an alias for scheduler.JobStatus — single source of truth.
+type JobStatus = scheduler.JobStatus
 
 // Server represents the HTTP API server.
 type Server struct {
@@ -193,6 +199,7 @@ func (s *Server) setupRouter() chi.Router {
 
 		// Scheduler status
 		r.Get("/scheduler/status", s.handleSchedulerStatus)
+		r.Post("/scheduler/jobs/{job}/trigger", s.handleTriggerSchedulerJob)
 
 		// Token upload for headless OAuth
 		r.Post("/auth/token/{email}", s.handleUploadToken)

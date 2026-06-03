@@ -168,7 +168,9 @@ func (s *Scheduler) AddJob(job Job) error {
 		return fmt.Errorf("job name and run function are required")
 	}
 	entryID, err := s.cron.AddFunc(job.Schedule, func() {
-		_ = s.TriggerJob(job.Name)
+		if err := s.TriggerJob(job.Name); err != nil {
+			s.logger.Warn("scheduled job trigger skipped", "job", job.Name, "error", err)
+		}
 	})
 	if err != nil {
 		return fmt.Errorf("invalid cron expression %q: %w", job.Schedule, err)
@@ -408,24 +410,38 @@ func (s *Scheduler) TriggerJob(name string) error {
 	}
 	if s.genericRunning[name] {
 		s.mu.Unlock()
-		return nil
+		return fmt.Errorf("job %q is already running", name)
 	}
 	s.genericRunning[name] = true
 	s.wg.Add(1)
 	s.mu.Unlock()
+
+	go s.runJob(name, run)
+	return nil
+}
+
+func (s *Scheduler) runJob(name string, run func(context.Context) error) {
 	defer s.wg.Done()
 
+	s.logger.Info("starting scheduled job", "job", name)
+	start := time.Now()
 	err := run(s.ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.genericRunning[name] = false
 	if err != nil {
 		s.genericLastErr[name] = err
-		return err
+		s.logger.Error("scheduled job failed",
+			"job", name,
+			"duration", time.Since(start),
+			"error", err)
+		return
 	}
 	s.genericLastRun[name] = time.Now()
 	delete(s.genericLastErr, name)
-	return nil
+	s.logger.Info("scheduled job completed",
+		"job", name,
+		"duration", time.Since(start))
 }
 
 // Status returns the current status of all scheduled accounts.
