@@ -179,7 +179,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 			Name:     jobName,
 			Schedule: source.Schedule,
 			Run: func(ctx context.Context) error {
-				return runConfiguredSynctechSMSSourceWithStore(ctx, s, source)
+				var enqueuer sync.EmbedEnqueuer
+				if vf != nil {
+					enqueuer = vf.Enqueuer
+				}
+				return runConfiguredSynctechSMSSourceWithStoreAndEnqueuer(ctx, s, source, enqueuer)
 			},
 		}); err != nil {
 			logger.Error("failed to schedule synctech-sms source", "source", source.Name, "error", err)

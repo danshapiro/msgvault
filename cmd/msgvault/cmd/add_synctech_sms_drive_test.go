@@ -75,8 +75,9 @@ func TestSynctechSMSDriveRunUsesSingleOuterSyncRun(t *testing.T) {
 		},
 	}
 
-	err := runSynctechSMSDriveSourceWithClient(context.Background(), f.Store, src, synctechImportOptions(src), client)
+	summary, err := runSynctechSMSDriveSourceWithClient(context.Background(), f.Store, src, synctechImportOptions(src), client)
 	require.NoError(err, "runSynctechSMSDriveSourceWithClient")
+	require.Len(summary.MessageIDs, 1, "summary message IDs")
 
 	source := getSynctechSource(t, f.Store, src.OwnerPhone)
 	assert.Equal(1, countSyncRuns(t, f.Store, source.ID), "sync run count")
@@ -113,7 +114,7 @@ func TestSynctechSMSDriveRunSetsUpIdentityAndPostSourceMigration(t *testing.T) {
 	src := synctechDriveTestSource()
 	client := fakeSynctechDriveClient{}
 
-	err = runSynctechSMSDriveSourceWithClient(context.Background(), st, src, synctechImportOptions(src), client)
+	_, err = runSynctechSMSDriveSourceWithClient(context.Background(), st, src, synctechImportOptions(src), client)
 	require.NoError(err, "runSynctechSMSDriveSourceWithClient")
 
 	synctechSource := getSynctechSource(t, st, src.OwnerPhone)
@@ -154,7 +155,7 @@ func TestSynctechSMSDriveRunRecordsZeroSelectedPoll(t *testing.T) {
 		}},
 	}
 
-	err := runSynctechSMSDriveSourceWithClient(context.Background(), f.Store, src, synctechImportOptions(src), client)
+	_, err := runSynctechSMSDriveSourceWithClient(context.Background(), f.Store, src, synctechImportOptions(src), client)
 	require.NoError(err, "runSynctechSMSDriveSourceWithClient")
 
 	source := getSynctechSource(t, f.Store, src.OwnerPhone)
@@ -188,7 +189,7 @@ func TestSynctechSMSDriveRunMarksOuterSyncFailedOnDownloadError(t *testing.T) {
 		downloadErr: downloadErr,
 	}
 
-	err := runSynctechSMSDriveSourceWithClient(context.Background(), f.Store, src, synctechImportOptions(src), client)
+	_, err := runSynctechSMSDriveSourceWithClient(context.Background(), f.Store, src, synctechImportOptions(src), client)
 	require.ErrorIs(err, downloadErr, "runSynctechSMSDriveSourceWithClient")
 
 	source := getSynctechSource(t, f.Store, src.OwnerPhone)
@@ -202,6 +203,25 @@ func TestSynctechSMSDriveRunMarksOuterSyncFailedOnDownloadError(t *testing.T) {
 	assert.Equal("failed", item.Status, "source import status")
 	require.True(item.ErrorMessage.Valid, "source import error")
 	assert.Contains(item.ErrorMessage.String, downloadErr.Error(), "source import error")
+}
+
+func TestEnqueueSynctechEmbeddingsUsesImportedMessageIDs(t *testing.T) {
+	ctx := context.Background()
+	enqueuer := &fakeSynctechEmbedEnqueuer{}
+	summary := synctechsms.ImportSummary{MessageIDs: []int64{101, 202}}
+
+	requirepkg.NoError(t, enqueueSynctechEmbeddings(ctx, enqueuer, summary))
+
+	assertpkg.Equal(t, [][]int64{{101, 202}}, enqueuer.calls)
+}
+
+type fakeSynctechEmbedEnqueuer struct {
+	calls [][]int64
+}
+
+func (f *fakeSynctechEmbedEnqueuer) EnqueueMessages(_ context.Context, ids []int64) error {
+	f.calls = append(f.calls, append([]int64(nil), ids...))
+	return nil
 }
 
 type fakeSynctechDriveClient struct {
