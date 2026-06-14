@@ -78,6 +78,7 @@ type Chunk struct {
 //     recipient row).
 //   - SubjectSubstrings each add one `m.subject LIKE ? ESCAPE '\'`
 //     condition, ANDed together (all substrings must match).
+//   - MessageTypes restricts m.message_type by exact value.
 //   - After/Before are half-open against m.sent_at:
 //     `>= After` and `< Before`.
 //   - LargerThan/SmallerThan compare against m.size_estimate.
@@ -93,6 +94,7 @@ type Filter struct {
 	LargerThan        *int64   // `larger:` — strictly greater than
 	SmallerThan       *int64   // `smaller:` — strictly less than
 	SubjectSubstrings []string // one per `subject:` term (ANDed)
+	MessageTypes      []string // exact m.message_type values; empty = unrestricted
 }
 
 // IsEmpty reports whether the filter has no restrictions. A zero-value
@@ -109,7 +111,8 @@ func (f Filter) IsEmpty() bool {
 		f.Before == nil &&
 		f.LargerThan == nil &&
 		f.SmallerThan == nil &&
-		len(f.SubjectSubstrings) == 0
+		len(f.SubjectSubstrings) == 0 &&
+		len(f.MessageTypes) == 0
 }
 
 // Hit is one search result.

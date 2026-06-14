@@ -83,6 +83,9 @@ func BuildFilter(ctx context.Context, db *sql.DB, q *search.Query) (vector.Filte
 	if len(q.SubjectTerms) > 0 {
 		f.SubjectSubstrings = append([]string(nil), q.SubjectTerms...)
 	}
+	if len(q.MessageTypes) > 0 {
+		f.MessageTypes = append([]string(nil), q.MessageTypes...)
+	}
 	return f, nil
 }
 

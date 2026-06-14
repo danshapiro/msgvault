@@ -57,6 +57,10 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	if err != nil {
 		return nil, false, fmt.Errorf("encode source_ids: %w", err)
 	}
+	messageTypes, err := stringsToJSON(req.Filter.MessageTypes)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode message_types: %w", err)
+	}
 	senderGroupSQL, senderGroupArgs, err := senderGroupClauses(req.Filter.SenderGroups)
 	if err != nil {
 		return nil, false, fmt.Errorf("encode sender_groups: %w", err)
@@ -142,6 +146,7 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	// callers (or the test suite) to keep two copies in sync.
 	filterWhere := fmt.Sprintf(`%s
        AND (:source_ids IS NULL OR m.source_id IN (SELECT value FROM json_each(:source_ids)))
+       AND (:message_types IS NULL OR m.message_type IN (SELECT value FROM json_each(:message_types)))
        %s
        %s
        %s
@@ -259,6 +264,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 	// named binds when its placeholder count check fails.
 	filterArgs := []any{
 		sql.Named("source_ids", sourceIDs),
+		sql.Named("message_types", messageTypes),
 		sql.Named("has_attachment", hasAttachment),
 		sql.Named("after", after),
 		sql.Named("before", before),
@@ -446,6 +452,18 @@ func idsToJSON(ids []int64) (sql.NullString, error) {
 	buf, err := json.Marshal(ids)
 	if err != nil {
 		return sql.NullString{}, fmt.Errorf("marshal ids: %w", err)
+	}
+	return sql.NullString{Valid: true, String: string(buf)}, nil
+}
+
+// stringsToJSON encodes a string slice as a JSON array for json_each filters.
+func stringsToJSON(values []string) (sql.NullString, error) {
+	if len(values) == 0 {
+		return sql.NullString{}, nil
+	}
+	buf, err := json.Marshal(values)
+	if err != nil {
+		return sql.NullString{}, fmt.Errorf("marshal strings: %w", err)
 	}
 	return sql.NullString{Valid: true, String: string(buf)}, nil
 }
