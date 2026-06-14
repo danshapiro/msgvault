@@ -48,10 +48,11 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
 	}
 	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{
-		Path:      vecPath,
-		MainPath:  mainPath,
-		Dimension: cfg.Vector.Embeddings.Dimension,
-		MainDB:    mainDB,
+		Path:       vecPath,
+		MainPath:   mainPath,
+		Dimension:  cfg.Vector.Embeddings.Dimension,
+		MainDB:     mainDB,
+		BuildScope: cfg.Vector.Embed.Scope.BuildScope(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open vectors.db: %w", err)
@@ -91,9 +92,10 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		RRFK:                cfg.Vector.Search.RRFK,
 		KPerSignal:          cfg.Vector.Search.KPerSignal,
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,
+		BuildScope:          cfg.Vector.Embed.Scope.BuildScope(),
 	})
 
-	enqueuer := embed.NewEnqueuer(backend.DB())
+	enqueuer := embed.NewScopedEnqueuer(backend.DB(), mainDB, cfg.Vector.Embed.Scope.BuildScope())
 
 	return &vectorFeatures{
 		Backend:      backend,

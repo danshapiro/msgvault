@@ -28,10 +28,11 @@ var _ vector.Backend = (*Backend)(nil)
 
 // Options configures how Open establishes a Backend.
 type Options struct {
-	Path      string
-	MainPath  string  // filesystem path to msgvault.db; required for FusedSearch
-	Dimension int     // default dimension for EnsureVectorTable at open
-	MainDB    *sql.DB // handle to the main msgvault.db
+	Path       string
+	MainPath   string            // filesystem path to msgvault.db; required for FusedSearch
+	Dimension  int               // default dimension for EnsureVectorTable at open
+	MainDB     *sql.DB           // handle to the main msgvault.db
+	BuildScope vector.BuildScope // empty means full corpus
 }
 
 // Backend implements vector.Backend and vector.FusingBackend against a
@@ -42,6 +43,7 @@ type Backend struct {
 	path     string  // filesystem path to vectors.db
 	mainPath string  // filesystem path to msgvault.db (for ATTACH)
 	dim      int
+	scope    vector.BuildScope
 }
 
 // Open opens vectors.db, runs migrations, and retains the main database
@@ -64,6 +66,7 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		path:     opts.Path,
 		mainPath: opts.MainPath,
 		dim:      opts.Dimension,
+		scope:    vector.NewBuildScope(opts.BuildScope.MessageTypes),
 	}, nil
 }
 
@@ -313,8 +316,18 @@ func (b *Backend) seedPending(ctx context.Context, gen vector.GenerationID, now 
 	// soft-deleted, the embedding stays in the vector store and
 	// query-time live filtering (dropDeletedFromSource,
 	// filteredMessageIDs) enforces the live-message contract.
+	where := store.LiveMessagesWhere("", true)
+	args := make([]any, 0, len(b.scope.MessageTypes))
+	if !b.scope.IsEmpty() {
+		placeholders := make([]string, len(b.scope.MessageTypes))
+		for i, typ := range b.scope.MessageTypes {
+			placeholders[i] = "?"
+			args = append(args, typ)
+		}
+		where += fmt.Sprintf(" AND message_type IN (%s)", strings.Join(placeholders, ","))
+	}
 	rows, err := b.mainDB.QueryContext(ctx,
-		fmt.Sprintf(`SELECT id FROM messages WHERE %s`, store.LiveMessagesWhere("", true)))
+		fmt.Sprintf(`SELECT id FROM messages WHERE %s`, where), args...)
 	if err != nil {
 		return fmt.Errorf("select messages: %w", err)
 	}

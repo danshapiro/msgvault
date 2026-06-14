@@ -37,10 +37,11 @@ func runEmbed(cmd *cobra.Command) error {
 		vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
 	}
 	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{
-		Path:      vecPath,
-		MainPath:  cfg.DatabaseDSN(),
-		Dimension: cfg.Vector.Embeddings.Dimension,
-		MainDB:    s.DB(),
+		Path:       vecPath,
+		MainPath:   cfg.DatabaseDSN(),
+		Dimension:  cfg.Vector.Embeddings.Dimension,
+		MainDB:     s.DB(),
+		BuildScope: cfg.Vector.Embed.Scope.BuildScope(),
 	})
 	if err != nil {
 		return fmt.Errorf("open vectors.db: %w", err)

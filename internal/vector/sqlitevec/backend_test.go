@@ -68,6 +68,51 @@ func TestBackend_CreateGeneration_SeedsPending(t *testing.T) {
 	assertpkg.Equal(t, 1, n, "pending count")
 }
 
+func TestBackend_CreateGeneration_SeedPendingScopesMessageTypes(t *testing.T) {
+	ctx := context.Background()
+	main, err := sql.Open("sqlite3", ":memory:")
+	requirepkg.NoError(t, err, "open main")
+	t.Cleanup(func() { _ = main.Close() })
+	_, err = main.Exec(`CREATE TABLE messages (
+		id INTEGER PRIMARY KEY,
+		message_type TEXT NOT NULL,
+		deleted_at DATETIME,
+		deleted_from_source_at DATETIME
+	)`)
+	requirepkg.NoError(t, err, "create messages")
+	_, err = main.Exec(`
+		INSERT INTO messages (id, message_type, deleted_from_source_at) VALUES
+		(1, 'email', NULL),
+		(2, 'sms', NULL),
+		(3, 'mms', NULL),
+		(4, 'sms', CURRENT_TIMESTAMP)`)
+	requirepkg.NoError(t, err, "insert messages")
+
+	b, err := Open(ctx, Options{
+		Path:       filepath.Join(t.TempDir(), "vectors.db"),
+		Dimension:  768,
+		MainDB:     main,
+		BuildScope: vector.NewBuildScope([]string{"sms", "mms"}),
+	})
+	requirepkg.NoError(t, err, "Open")
+	t.Cleanup(func() { _ = b.Close() })
+
+	gid, err := b.CreateGeneration(ctx, "m", 768, "")
+	requirepkg.NoError(t, err, "Create")
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT message_id FROM pending_embeddings WHERE generation_id = ? ORDER BY message_id`, gid)
+	requirepkg.NoError(t, err, "select pending")
+	defer func() { _ = rows.Close() }()
+	var got []int64
+	for rows.Next() {
+		var id int64
+		requirepkg.NoError(t, rows.Scan(&id), "scan pending")
+		got = append(got, id)
+	}
+	requirepkg.NoError(t, rows.Err(), "iterate pending")
+	assertpkg.Equal(t, []int64{2, 3}, got)
+}
+
 // TestBackend_CreateGeneration_ResumesBuilding confirms that calling
 // CreateGeneration while a building row already exists with the same
 // fingerprint returns the existing id instead of failing on the unique

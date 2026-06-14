@@ -56,10 +56,11 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 	}
 
 	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{
-		Path:      vecDBPath,
-		MainPath:  cfg.DatabaseDSN(),
-		Dimension: cfg.Vector.Embeddings.Dimension,
-		MainDB:    mainDB,
+		Path:       vecDBPath,
+		MainPath:   cfg.DatabaseDSN(),
+		Dimension:  cfg.Vector.Embeddings.Dimension,
+		MainDB:     mainDB,
+		BuildScope: cfg.Vector.Embed.Scope.BuildScope(),
 	})
 	if err != nil {
 		return fmt.Errorf("open vectors.db: %w", err)
@@ -85,6 +86,7 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 		RRFK:                cfg.Vector.Search.RRFK,
 		KPerSignal:          cfg.Vector.Search.KPerSignal,
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,
+		BuildScope:          cfg.Vector.Embed.Scope.BuildScope(),
 	})
 
 	q := search.Parse(queryStr)

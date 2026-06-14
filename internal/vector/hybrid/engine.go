@@ -60,6 +60,7 @@ type Config struct {
 	RRFK                int
 	KPerSignal          int
 	SubjectBoost        float64
+	BuildScope          vector.BuildScope
 }
 
 // Engine orchestrates the generation check, query embedding, and fusion
@@ -105,6 +106,9 @@ func (e *Engine) Search(ctx context.Context, req SearchRequest) ([]vector.FusedH
 
 	active, err := vector.ResolveActiveForFingerprint(ctx, e.backend, e.cfg.ExpectedFingerprint)
 	if err != nil {
+		return nil, ResultMeta{}, err
+	}
+	if err := e.validateBuildScope(req.Filter); err != nil {
 		return nil, ResultMeta{}, err
 	}
 
@@ -181,6 +185,24 @@ func (e *Engine) Search(ctx context.Context, req SearchRequest) ([]vector.FusedH
 		ReturnedCount: len(hits),
 		PoolSaturated: saturated,
 	}, nil
+}
+
+func (e *Engine) validateBuildScope(filter vector.Filter) error {
+	scope := vector.NewBuildScope(e.cfg.BuildScope.MessageTypes)
+	if scope.IsEmpty() {
+		return nil
+	}
+	if len(filter.MessageTypes) == 0 {
+		return fmt.Errorf("%w: index is scoped to message_type=%s; add a matching message_type filter",
+			vector.ErrIndexScopeMismatch, strings.Join(scope.MessageTypes, ","))
+	}
+	if !scope.AllowsMessageTypes(filter.MessageTypes) {
+		return fmt.Errorf("%w: index is scoped to message_type=%s, query requested message_type=%s",
+			vector.ErrIndexScopeMismatch,
+			strings.Join(scope.MessageTypes, ","),
+			strings.Join(vector.NewBuildScope(filter.MessageTypes).MessageTypes, ","))
+	}
+	return nil
 }
 
 // vectorHitsToFused wraps pure-vector hits in the FusedHit schema.

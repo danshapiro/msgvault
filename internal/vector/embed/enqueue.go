@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/vector"
@@ -18,12 +19,25 @@ import (
 // two non-retired generations (active + building); every newly-synced
 // message gets queued into both so the building index stays current.
 type Enqueuer struct {
-	db *sql.DB
+	db     *sql.DB
+	mainDB *sql.DB
+	scope  vector.BuildScope
 }
 
 // NewEnqueuer returns an Enqueuer backed by vectors.db.
 func NewEnqueuer(db *sql.DB) *Enqueuer {
-	return &Enqueuer{db: db}
+	return NewScopedEnqueuer(db, nil, vector.BuildScope{})
+}
+
+// NewScopedEnqueuer returns an Enqueuer that only queues messages
+// matching the supplied build scope. mainDB is required when scope is
+// non-empty so message IDs can be checked against messages.message_type.
+func NewScopedEnqueuer(db *sql.DB, mainDB *sql.DB, scope vector.BuildScope) *Enqueuer {
+	return &Enqueuer{
+		db:     db,
+		mainDB: mainDB,
+		scope:  vector.NewBuildScope(scope.MessageTypes),
+	}
 }
 
 // EnqueueMessages adds the given IDs to pending_embeddings for every
@@ -34,6 +48,15 @@ func (e *Enqueuer) EnqueueMessages(ctx context.Context, messageIDs []int64) erro
 	if len(messageIDs) == 0 {
 		return nil
 	}
+	filteredIDs, err := e.filterMessageIDs(ctx, messageIDs)
+	if err != nil {
+		return err
+	}
+	if len(filteredIDs) == 0 {
+		return nil
+	}
+	messageIDs = filteredIDs
+
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin enqueue tx: %w", err)
@@ -90,4 +113,46 @@ func (e *Enqueuer) EnqueueMessages(ctx context.Context, messageIDs []int64) erro
 		return fmt.Errorf("commit enqueue: %w", err)
 	}
 	return nil
+}
+
+func (e *Enqueuer) filterMessageIDs(ctx context.Context, messageIDs []int64) ([]int64, error) {
+	if e.scope.IsEmpty() {
+		return messageIDs, nil
+	}
+	if e.mainDB == nil {
+		return nil, fmt.Errorf("main db is required for scoped embedding enqueue")
+	}
+	blob, err := json.Marshal(messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("encode message ids: %w", err)
+	}
+	placeholders := make([]string, len(e.scope.MessageTypes))
+	args := make([]any, 0, 1+len(e.scope.MessageTypes))
+	args = append(args, string(blob))
+	for i, typ := range e.scope.MessageTypes {
+		placeholders[i] = "?"
+		args = append(args, typ)
+	}
+	rows, err := e.mainDB.QueryContext(ctx, fmt.Sprintf(`
+		SELECT m.id
+		  FROM messages m
+		  JOIN json_each(?) ids ON m.id = CAST(ids.value AS INTEGER)
+		 WHERE m.message_type IN (%s)`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, fmt.Errorf("filter scoped message ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]int64, 0, len(messageIDs))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan scoped message id: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate scoped message ids: %w", err)
+	}
+	return out, nil
 }

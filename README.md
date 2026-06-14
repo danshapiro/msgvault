@@ -111,6 +111,8 @@ msgvault can search your archive semantically using vector embeddings in additio
 
 A separate MCP tool, `find_similar_messages`, returns nearest neighbors for a seed message. See the [Vector Search guide](https://msgvault.io/usage/vector-search/) for setup, backfill, and troubleshooting.
 
+Large archives can scope an embedding generation with `[vector.embed.scope] message_types = ["sms", "mms"]`. Scoped vector and hybrid searches must include a matching `message_type` filter so a partial index is never used as if it covered the whole archive.
+
 ## Importing from MBOX or Apple Mail
 
 Import email from providers that offer MBOX exports or from a local Apple Mail data directory:
