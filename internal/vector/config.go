@@ -341,7 +341,7 @@ func (c *Config) ApplyDefaults() {
 	if c.Embeddings.MaxInputChars == 0 {
 		c.Embeddings.MaxInputChars = defaultEmbeddingMaxInputChars
 	}
-	if c.Embeddings.ETAWindow <= 0 {
+	if c.Embeddings.ETAWindow == 0 {
 		c.Embeddings.ETAWindow = defaultEmbeddingETAWindow
 	}
 	if c.Search.RRFK == 0 {

@@ -316,6 +316,18 @@ func TestEmbeddingsConfig_ETAWindowExplicit(t *testing.T) {
 	requirepkg.Equal(t, 25, c.Embeddings.ETAWindow, "ETAWindow explicit")
 }
 
+func TestEmbeddingsConfig_ETAWindowNegativeRejectedAfterDefaults(t *testing.T) {
+	c := validConfig()
+	c.Embeddings.ETAWindow = -1
+
+	c.ApplyDefaults()
+	assertpkg.Equal(t, -1, c.Embeddings.ETAWindow)
+
+	err := c.Validate()
+	requirepkg.Error(t, err)
+	assertpkg.Contains(t, err.Error(), "eta_window")
+}
+
 func TestApplyDefaults_EmbeddingDefaultsStayDocsAligned(t *testing.T) {
 	var c Config
 	c.ApplyDefaults()
