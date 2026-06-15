@@ -120,7 +120,7 @@ max_retries = 3
 max_input_chars = 2000
 ```
 
-`max_input_chars` is the per-chunk character window. The default `2000` is meant to stay comfortably under a 2K-context local embedding model's limit; set it below your model's context window. Long messages are split into overlapping chunks before embedding, so a single message can produce multiple embedding inputs.
+`max_input_chars` is the per-chunk character window. The default `2000` keeps chunks conservative for local embedding models; if you use another model, choose a character window that leaves room under that model's context limit. Long messages are split into overlapping chunks before embedding, so a single message can produce multiple embedding inputs.
 
 Estimate rebuild cost before starting a large full rebuild:
 
