@@ -35,6 +35,15 @@ var embeddingsListCmd = &cobra.Command{
 	Short: "List vector embedding generations",
 	RunE:  runEmbeddingsList,
 }
+var embeddingsEstimateCmd = &cobra.Command{
+	Use:   "estimate",
+	Short: "Estimate the work and storage for a full embedding rebuild",
+	Long: `Estimate the message count, chunk count, request count, and raw vector
+storage for a full embedding rebuild using the current archive and embed
+planner configuration. This is a dry run and does not contact the embedding
+endpoint or modify vectors.db.`,
+	RunE: runEmbeddingsEstimate,
+}
 var embeddingsRetireCmd = &cobra.Command{
 	Use:   "retire <generation-id>",
 	Short: "Retire a vector embedding generation",
@@ -92,6 +101,7 @@ func runEmbeddingsResume(cmd *cobra.Command, args []string) error {
 
 func init() {
 	embedCmd.Deprecated = "use 'msgvault embeddings build' instead"
+	embeddingsEstimateCmd.Flags().IntVar(&embeddingsEstimateDimension, "dimension", 0, "Override the embedding dimension for raw byte estimates")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireYes, "yes", false, "Skip confirmation prompt")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireForceActive, "force-active", false, "Allow retiring the active generation")
 	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateYes, "yes", false, "Skip confirmation prompt")
@@ -99,6 +109,7 @@ func init() {
 	embeddingsCmd.AddCommand(embeddingsBuildCmd)
 	embeddingsCmd.AddCommand(embeddingsResumeCmd)
 	embeddingsCmd.AddCommand(embeddingsListCmd)
+	embeddingsCmd.AddCommand(embeddingsEstimateCmd)
 	embeddingsCmd.AddCommand(embeddingsRetireCmd)
 	embeddingsCmd.AddCommand(embeddingsActivateCmd)
 	rootCmd.AddCommand(embeddingsCmd)
