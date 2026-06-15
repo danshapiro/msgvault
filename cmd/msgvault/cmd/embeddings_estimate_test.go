@@ -19,9 +19,9 @@ import (
 
 func TestRunEmbeddingsEstimate_PrintsChunkAndStorageSummary(t *testing.T) {
 	dataDir, db := newEmbeddingEstimateArchive(t)
-	seedEstimateMessage(t, db, 1, "email", "Short synthetic subject", "short synthetic body", "", false, false)
-	seedEstimateMessage(t, db, 2, "email", "Long synthetic subject", strings.Repeat("longbody ", 900), "", false, false)
-	seedEstimateMessage(t, db, 3, "sms", "", "synthetic sms body", "", false, false)
+	seedEstimateMessage(t, db, 1, "email", "", "short-email", "", false, false)
+	seedEstimateMessage(t, db, 2, "email", "", strings.Repeat("x-", 2500), "", false, false)
+	seedEstimateMessage(t, db, 3, "sms", "", "sms-body", "", false, false)
 
 	oldCfg := cfg
 	oldDimension := embeddingsEstimateDimension
@@ -58,11 +58,11 @@ func TestRunEmbeddingsEstimate_PrintsChunkAndStorageSummary(t *testing.T) {
 	assertpkg.Contains(t, out, "dimension: 768")
 	assertpkg.Contains(t, out, "candidate messages: 3")
 	assertpkg.Contains(t, out, "embeddable messages: 3")
-	assertpkg.Contains(t, out, "estimated chunks:")
-	assertpkg.Contains(t, out, "estimated embed requests:")
-	assertpkg.Contains(t, out, "estimated raw vector bytes:")
-	assertpkg.Contains(t, out, "email:")
-	assertpkg.Contains(t, out, "sms:")
+	assertpkg.Contains(t, out, "estimated chunks: 5")
+	assertpkg.Contains(t, out, "estimated embed requests: 1")
+	assertpkg.Contains(t, out, "estimated raw vector bytes: 15360")
+	assertpkg.Contains(t, out, "  email: candidates=2 embeddable=2 chunks=4 capped=0 empty=0")
+	assertpkg.Contains(t, out, "  sms: candidates=1 embeddable=1 chunks=1 capped=0 empty=0")
 }
 
 func TestRunEmbeddingsEstimate_AllowsDimensionFlagWithoutVectorEnabled(t *testing.T) {
@@ -80,13 +80,14 @@ func TestRunEmbeddingsEstimate_AllowsDimensionFlagWithoutVectorEnabled(t *testin
 		HomeDir: dataDir,
 		Data:    config.DataConfig{DataDir: dataDir},
 	}
-	embeddingsEstimateDimension = 768
 
 	var stdout bytes.Buffer
 	cmd := &cobra.Command{Use: "estimate"}
+	cmd.Flags().IntVar(&embeddingsEstimateDimension, "dimension", 0, "Override the embedding dimension for raw byte estimates")
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stdout)
 	cmd.SetContext(context.Background())
+	requirepkg.NoError(t, cmd.Flags().Set("dimension", "768"), "set dimension flag")
 
 	requirepkg.NoError(t, runEmbeddingsEstimate(cmd, nil), "runEmbeddingsEstimate")
 	assertpkg.Contains(t, stdout.String(), "dimension: 768")
