@@ -87,6 +87,41 @@ func TestConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestConfig_ValidateNumericVectorFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"OK", func(c *Config) {}, ""},
+		{"NegativeTimeout", func(c *Config) { c.Embeddings.Timeout = -time.Second }, "timeout"},
+		{"NegativeRetries", func(c *Config) { c.Embeddings.MaxRetries = -1 }, "max_retries"},
+		{"NegativeMaxInputChars", func(c *Config) { c.Embeddings.MaxInputChars = -1 }, "max_input_chars"},
+		{"NegativeETAWindow", func(c *Config) { c.Embeddings.ETAWindow = -1 }, "eta_window"},
+		{"ZeroRRFK", func(c *Config) { c.Search.RRFK = 0 }, ""},
+		{"NegativeRRFK", func(c *Config) { c.Search.RRFK = -1 }, "rrf_k"},
+		{"ZeroKPerSignal", func(c *Config) { c.Search.KPerSignal = 0 }, ""},
+		{"NegativeKPerSignal", func(c *Config) { c.Search.KPerSignal = -1 }, "k_per_signal"},
+		{"NegativeSubjectBoost", func(c *Config) { c.Search.SubjectBoost = -0.1 }, "subject_boost"},
+		{"ExplicitHybridClampZero", func(c *Config) { c.Search.MaxPageSizeHybrid = new(int) }, ""},
+		{"NegativeHybridClamp", func(c *Config) { v := -1; c.Search.MaxPageSizeHybrid = &v }, "max_page_size_hybrid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validConfig()
+			c.ApplyDefaults()
+			tt.mutate(&c)
+			err := c.Validate()
+			if tt.wantErr == "" {
+				requirepkg.NoError(t, err)
+				return
+			}
+			requirepkg.Error(t, err)
+			assertpkg.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func validConfig() Config {
 	return Config{
 		Enabled: true,
@@ -239,7 +274,7 @@ func TestApplyDefaults_OverridesZeroValues(t *testing.T) {
 	assert.Equal(32, c.Embeddings.BatchSize)
 	assert.Equal(30*time.Second, c.Embeddings.Timeout)
 	assert.Equal(3, c.Embeddings.MaxRetries)
-	assert.Equal(32768, c.Embeddings.MaxInputChars)
+	assert.Equal(2000, c.Embeddings.MaxInputChars)
 	assert.Equal(60, c.Search.RRFK)
 	assert.Equal(100, c.Search.KPerSignal)
 	assert.InDelta(2.0, c.Search.SubjectBoost, 1e-9)
@@ -279,6 +314,17 @@ func TestEmbeddingsConfig_ETAWindowExplicit(t *testing.T) {
 	c.Embeddings.ETAWindow = 25
 	c.ApplyDefaults()
 	requirepkg.Equal(t, 25, c.Embeddings.ETAWindow, "ETAWindow explicit")
+}
+
+func TestApplyDefaults_EmbeddingDefaultsStayDocsAligned(t *testing.T) {
+	var c Config
+	c.ApplyDefaults()
+
+	assertpkg.Equal(t, 32, c.Embeddings.BatchSize)
+	assertpkg.Equal(t, 30*time.Second, c.Embeddings.Timeout)
+	assertpkg.Equal(t, 3, c.Embeddings.MaxRetries)
+	assertpkg.Equal(t, 2000, c.Embeddings.MaxInputChars)
+	assertpkg.Equal(t, 10, c.Embeddings.ETAWindow)
 }
 
 // TestSearchConfig_PointerSemantics_FromTOML rounds out the
@@ -397,21 +443,22 @@ func TestConfig_GenerationFingerprintFolds(t *testing.T) {
 // different cap values therefore produce two different embedding
 // spaces and must not share one active generation.
 func TestConfig_GenerationFingerprint_IncludesMaxInputChars(t *testing.T) {
-	base := Config{
+	base := Config{Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8}}
+	base.ApplyDefaults()
+	assertpkg.Contains(t, base.GenerationFingerprint(), ":c2000:")
+
+	explicit := Config{
 		Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8, MaxInputChars: 6000},
 	}
-	baseline := base.GenerationFingerprint()
+	baseline := explicit.GenerationFingerprint()
 
-	bumped := base
+	bumped := explicit
 	bumped.Embeddings.MaxInputChars = 12000
 	assertpkg.NotEqual(t, baseline, bumped.GenerationFingerprint(),
 		"GenerationFingerprint should change when MaxInputChars goes 6000→12000")
 
-	// The zero-cap case (Preprocess treats <=0 as "no truncation")
-	// must also be distinguishable from any positive cap, otherwise
-	// disabling truncation later wouldn't stale a generation that had
-	// always been truncating.
-	zeroed := base
+	// An explicit raw zero remains distinguishable from any positive cap.
+	zeroed := explicit
 	zeroed.Embeddings.MaxInputChars = 0
 	assertpkg.NotEqual(t, baseline, zeroed.GenerationFingerprint(),
 		"GenerationFingerprint should change when MaxInputChars goes 6000→0")

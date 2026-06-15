@@ -38,6 +38,19 @@ const preprocessVersion = 1
 // splits the result into MaxInputChars-bounded chunks via ChunkText).
 const embedPolicyVersion = 1
 
+const (
+	defaultEmbeddingBatchSize     = 32
+	defaultEmbeddingTimeout       = 30 * time.Second
+	defaultEmbeddingMaxRetries    = 3
+	defaultEmbeddingMaxInputChars = 2000
+	defaultEmbeddingETAWindow     = 10
+
+	defaultSearchRRFK              = 60
+	defaultSearchKPerSignal        = 100
+	defaultSearchSubjectBoost      = 2.0
+	defaultSearchMaxPageSizeHybrid = 50
+)
+
 // Config is the top-level vector-search configuration, loaded from the
 // [vector] TOML table.
 type Config struct {
@@ -283,6 +296,30 @@ func (c *Config) Validate() error {
 	if c.Embeddings.BatchSize <= 0 {
 		return fmt.Errorf("vector.embeddings.batch_size: must be positive, got %d", c.Embeddings.BatchSize)
 	}
+	if c.Embeddings.Timeout < 0 {
+		return fmt.Errorf("vector.embeddings.timeout: must be non-negative, got %s", c.Embeddings.Timeout)
+	}
+	if c.Embeddings.MaxRetries < 0 {
+		return fmt.Errorf("vector.embeddings.max_retries: must be non-negative, got %d", c.Embeddings.MaxRetries)
+	}
+	if c.Embeddings.MaxInputChars < 0 {
+		return fmt.Errorf("vector.embeddings.max_input_chars: must be non-negative, got %d", c.Embeddings.MaxInputChars)
+	}
+	if c.Embeddings.ETAWindow < 0 {
+		return fmt.Errorf("vector.embeddings.eta_window: must be non-negative, got %d", c.Embeddings.ETAWindow)
+	}
+	if c.Search.RRFK < 0 {
+		return fmt.Errorf("vector.search.rrf_k: must be non-negative, got %d", c.Search.RRFK)
+	}
+	if c.Search.KPerSignal < 0 {
+		return fmt.Errorf("vector.search.k_per_signal: must be non-negative, got %d", c.Search.KPerSignal)
+	}
+	if c.Search.SubjectBoost < 0 {
+		return fmt.Errorf("vector.search.subject_boost: must be non-negative, got %g", c.Search.SubjectBoost)
+	}
+	if c.Search.MaxPageSizeHybrid != nil && *c.Search.MaxPageSizeHybrid < 0 {
+		return fmt.Errorf("vector.search.max_page_size_hybrid: must be non-negative, got %d", *c.Search.MaxPageSizeHybrid)
+	}
 	return nil
 }
 
@@ -293,31 +330,31 @@ func (c *Config) ApplyDefaults() {
 		c.Backend = "sqlite-vec"
 	}
 	if c.Embeddings.BatchSize == 0 {
-		c.Embeddings.BatchSize = 32
+		c.Embeddings.BatchSize = defaultEmbeddingBatchSize
 	}
 	if c.Embeddings.Timeout == 0 {
-		c.Embeddings.Timeout = 30 * time.Second
+		c.Embeddings.Timeout = defaultEmbeddingTimeout
 	}
 	if c.Embeddings.MaxRetries == 0 {
-		c.Embeddings.MaxRetries = 3
+		c.Embeddings.MaxRetries = defaultEmbeddingMaxRetries
 	}
 	if c.Embeddings.MaxInputChars == 0 {
-		c.Embeddings.MaxInputChars = 32768
+		c.Embeddings.MaxInputChars = defaultEmbeddingMaxInputChars
 	}
 	if c.Embeddings.ETAWindow <= 0 {
-		c.Embeddings.ETAWindow = 10
+		c.Embeddings.ETAWindow = defaultEmbeddingETAWindow
 	}
 	if c.Search.RRFK == 0 {
-		c.Search.RRFK = 60
+		c.Search.RRFK = defaultSearchRRFK
 	}
 	if c.Search.KPerSignal == 0 {
-		c.Search.KPerSignal = 100
+		c.Search.KPerSignal = defaultSearchKPerSignal
 	}
 	if c.Search.SubjectBoost == 0 {
-		c.Search.SubjectBoost = 2.0
+		c.Search.SubjectBoost = defaultSearchSubjectBoost
 	}
 	if c.Search.MaxPageSizeHybrid == nil {
-		v := 50
+		v := defaultSearchMaxPageSizeHybrid
 		c.Search.MaxPageSizeHybrid = &v
 	}
 	// Preprocess booleans are *bool so unset (nil) means "default true"
