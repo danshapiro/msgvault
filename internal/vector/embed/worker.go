@@ -497,12 +497,14 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	policy := DefaultChunkingPolicy(w.deps.MaxInputChars)
 	var pieces []inputChunk
 	var inputs []string
+	embeddableMessages := 0
 	for _, m := range msgs {
 		prepared := PrepareMessageInputs(m, w.deps.Preprocess, policy)
 		if prepared.Empty {
 			empty = append(empty, m.ID)
 			continue
 		}
+		embeddableMessages++
 		for _, ch := range prepared.Chunks {
 			ic := inputChunk{
 				ID:         ch.ID,
@@ -546,7 +548,7 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		vecs = append(vecs, got...)
 	}
 	w.deps.Log.Debug("embed batch",
-		"messages", len(msgs), "chunks", len(pieces),
+		"messages", embeddableMessages, "chunks", len(pieces),
 		"chars", totalPieceChars(pieces),
 		"sub_batches", (len(inputs)+embedSubBatchSize-1)/embedSubBatchSize,
 		"duration_ms", time.Since(start).Milliseconds())
@@ -759,8 +761,8 @@ func (w *Worker) reportProgress(done, batchMsgs, batchChars int, batchElapsed ti
 }
 
 // totalPieceChars sums the rune counts of every chunk in the batch, for
-// debug logging — distinct from totalChars because a long message
-// contributes one msgText row but several inputChunk rows.
+// debug logging — distinct from the per-message count because one
+// embeddable message can fan out into several inputChunk rows.
 func totalPieceChars(pieces []inputChunk) int {
 	n := 0
 	for _, p := range pieces {
