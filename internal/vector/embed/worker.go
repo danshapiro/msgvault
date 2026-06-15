@@ -5,13 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"go.kenn.io/msgvault/internal/vector"
 	"log/slog"
 	"strings"
 	"time"
-	"unicode/utf8"
-
-	"go.kenn.io/msgvault/internal/mime"
-	"go.kenn.io/msgvault/internal/vector"
 )
 
 // EmbeddingClient is the subset of *Client used by Worker; allowing tests
@@ -147,20 +144,6 @@ func derivedStaleThreshold(timeout time.Duration, maxRetries int) time.Duration 
 // RunResult summarizes the outcome of RunOnce.
 type RunResult struct {
 	Claimed, Succeeded, Failed, Truncated int
-}
-
-// msgText is the per-message preprocessed input to the chunker, carried
-// from fetch through ChunkText. One msgText fans out to one or more
-// inputChunks below. BodyTruncated tracks whether Preprocess hit its
-// MaxBodyRunes cap and silently dropped tail content; we propagate
-// this onto every chunk's Truncated flag so downstream accounting
-// records the message as truncated regardless of which chunk surfaces
-// it.
-type msgText struct {
-	ID            int64
-	Text          string
-	Chars         int
-	BodyTruncated bool
 }
 
 // inputChunk is one window into a message's preprocessed text, fed
@@ -473,7 +456,7 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	}
 	defer func() { _ = rows.Close() }()
 
-	var msgs []msgText
+	var msgs []MessageInput
 	var empty []int64
 	fetched := make(map[int64]struct{}, len(ids))
 	for rows.Next() {
@@ -482,39 +465,8 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		if err := rows.Scan(&id, &subject, &bodyText, &bodyHTML); err != nil {
 			return embedBatchResult{}, fmt.Errorf("scan message row: %w", err)
 		}
-		// Fall back to HTML-to-text when the plaintext body is empty —
-		// HTML-only messages would otherwise get subject-only embeddings
-		// and have materially worse semantic recall.
-		body := bodyText
-		if body == "" && bodyHTML != "" {
-			body = mime.StripHTML(bodyHTML)
-		}
-		// Sized to give Preprocess a generous-but-bounded budget: the
-		// chunker emits at most maxSpansPerMessage * MaxInputChars
-		// runes of *post-sanitize* output, and sanitize routinely
-		// strips 10x of HTML/base64 noise from polluted bodies; the
-		// rawBodyMultiplier covers the worst case. Preprocess applies
-		// this cap *between* its cheap pollution-removal pass (CRLF
-		// normalize + base64 strip) and the heavier regex transforms,
-		// so a body whose first MB is an inline base64 image still
-		// gets its prose tail through the cap.
-		preprocessCfg := w.deps.Preprocess
-		if preprocessCfg.MaxBodyRunes == 0 && w.deps.MaxInputChars > 0 {
-			preprocessCfg.MaxBodyRunes = w.deps.MaxInputChars * maxSpansPerMessage * rawBodyMultiplier
-		}
-		// Pass maxChars=0 so Preprocess does NOT truncate the final
-		// output by character count. Chunking (below) takes the full
-		// preprocessed text and divides it into windows of at most
-		// MaxInputChars runes each, so output truncation would just
-		// throw away tail content that ChunkText would otherwise
-		// embed in a later chunk.
-		txt, bodyTrunc := Preprocess(subject, body, 0, preprocessCfg)
 		fetched[id] = struct{}{}
-		if strings.TrimSpace(txt) == "" {
-			empty = append(empty, id)
-			continue
-		}
-		msgs = append(msgs, msgText{ID: id, Text: txt, Chars: utf8.RuneCountInString(txt), BodyTruncated: bodyTrunc})
+		msgs = append(msgs, MessageInput{ID: id, Subject: subject, BodyText: bodyText, BodyHTML: bodyHTML})
 	}
 	if err := rows.Err(); err != nil {
 		return embedBatchResult{}, fmt.Errorf("iterate message rows: %w", err)
@@ -542,40 +494,27 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	// system error dumps, base64 blobs that survived sanitize): one
 	// such message could otherwise produce thousands of chunks and
 	// blow the batch past the embedder's request-time budget.
-	chunkWindow := w.deps.MaxInputChars
-	overlap := chunkOverlapFor(chunkWindow)
-	maxSpans := maxSpansPerMessage
+	policy := DefaultChunkingPolicy(w.deps.MaxInputChars)
 	var pieces []inputChunk
 	var inputs []string
 	for _, m := range msgs {
-		spans, chunkTail := ChunkText(m.Text, chunkWindow, overlap, maxSpans)
-		// A message is "truncated" if any of its content was dropped:
-		//   - body hit Preprocess's MaxBodyRunes cap, OR
-		//   - ChunkText dropped tail past maxSpans (regardless of
-		//     whether the last emitted chunk happened to land on a
-		//     soft break, in which case the per-chunk hard-cut flag
-		//     wouldn't fire).
-		msgTrunc := m.BodyTruncated || chunkTail
-		for j, sp := range spans {
+		prepared := PrepareMessageInputs(m, w.deps.Preprocess, policy)
+		if prepared.Empty {
+			empty = append(empty, m.ID)
+			continue
+		}
+		for _, ch := range prepared.Chunks {
 			ic := inputChunk{
-				ID:         m.ID,
-				ChunkIndex: j,
-				Text:       sp.Text,
-				Chars:      sp.CharEnd - sp.CharStart,
-				CharStart:  sp.CharStart,
-				CharEnd:    sp.CharEnd,
-				// Trunc flags either: a hard-cut chunk where a
-				// sentence may have been split across the boundary
-				// (overlap exists to recover from this), or any
-				// chunk of a message that was truncated upstream.
-				// Both feed embeddings.truncated and the per-message
-				// counter so users see a faithful picture of which
-				// embeddings cover their full source content.
-				Trunc: msgTrunc ||
-					(chunkWindow > 0 && (sp.CharEnd-sp.CharStart) == chunkWindow && j < len(spans)-1),
+				ID:         ch.ID,
+				ChunkIndex: ch.ChunkIndex,
+				Text:       ch.Text,
+				Chars:      ch.Runes,
+				CharStart:  ch.CharStart,
+				CharEnd:    ch.CharEnd,
+				Trunc:      ch.Truncated,
 			}
 			pieces = append(pieces, ic)
-			inputs = append(inputs, sp.Text)
+			inputs = append(inputs, ch.Text)
 		}
 	}
 
