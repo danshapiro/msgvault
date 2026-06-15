@@ -144,7 +144,7 @@ func runConfiguredSynctechSMSSourceWithStoreAndEnqueuer(ctx context.Context, st 
 	if err := enqueueSynctechEmbeddings(ctx, enqueuer, summary); err != nil {
 		return err
 	}
-	rebuildCacheAfterScheduledSync("synctech-sms:" + src.Name)
+	rebuildCacheAfterScheduledSync(ctx, "synctech-sms:"+src.Name)
 	return nil
 }
 

@@ -127,8 +127,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	} else {
 		staleness := cacheNeedsBuild(dbPath, analyticsDir)
 		if !staleness.NeedsBuild && query.HasCompleteParquetData(analyticsDir) {
+			// DisableSQLiteScanner keeps DuckDB's bundled SQLite library
+			// from ATTACHing the live database for the daemon's entire
+			// lifetime, which would corrupt the daemon's own go-sqlite3
+			// connections' WAL/lock state (issue #379). Detail queries
+			// route through the shared go-sqlite3 connection instead;
+			// aggregates still read Parquet.
 			duckEngine, engineErr := query.NewDuckDBEngine(
 				analyticsDir, dbPath, s.DB(),
+				query.DuckDBOptions{DisableSQLiteScanner: true},
 			)
 			if engineErr != nil {
 				logger.Warn("DuckDB engine failed, falling back to SQLite",
@@ -430,7 +437,7 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 		"duration", time.Since(startTime),
 	)
 
-	rebuildCacheAfterScheduledSync(identifier)
+	rebuildCacheAfterScheduledSync(ctx, identifier)
 
 	return nil
 }
