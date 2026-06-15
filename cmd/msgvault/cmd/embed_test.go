@@ -31,6 +31,11 @@ func TestEmbeddingsCommandRegistration(t *testing.T) {
 	require.NoError(err)
 	require.Equal("list", listCmd.Name())
 
+	estimateCmd, _, err := rootCmd.Find([]string{"embeddings", "estimate"})
+	require.NoError(err)
+	require.Equal("estimate", estimateCmd.Name())
+	require.NotNil(estimateCmd.Flags().Lookup("dimension"))
+
 	retireCmd, _, err := rootCmd.Find([]string{"embeddings", "retire"})
 	require.NoError(err)
 	require.Equal("retire", retireCmd.Name())

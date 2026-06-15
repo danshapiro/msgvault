@@ -46,9 +46,17 @@ type embeddingEstimateConfig struct {
 }
 
 func runEmbeddingsEstimate(cmd *cobra.Command, _ []string) error {
+	defer resetEmbeddingsEstimateFlagState(cmd)
+
 	dimension := cfg.Vector.Embeddings.Dimension
-	if embeddingsEstimateDimension != 0 {
-		dimension = embeddingsEstimateDimension
+	if cmd != nil {
+		if flag := cmd.Flags().Lookup("dimension"); flag != nil && flag.Changed {
+			override, err := cmd.Flags().GetInt("dimension")
+			if err != nil {
+				return fmt.Errorf("read dimension flag: %w", err)
+			}
+			dimension = override
+		}
 	}
 	if dimension < 0 {
 		return fmt.Errorf("dimension must be non-negative, got %d", dimension)
@@ -75,25 +83,36 @@ func runEmbeddingsEstimate(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func estimateConfigFromRuntime(dimension int) embeddingEstimateConfig {
-	batchSize := cfg.Vector.Embeddings.BatchSize
-	if batchSize <= 0 {
-		batchSize = 32
+func resetEmbeddingsEstimateFlagState(cmd *cobra.Command) {
+	embeddingsEstimateDimension = 0
+	if cmd == nil {
+		return
 	}
+	flag := cmd.Flags().Lookup("dimension")
+	if flag == nil {
+		return
+	}
+	_ = flag.Value.Set("0")
+	flag.Changed = false
+}
+
+func estimateConfigFromRuntime(dimension int) embeddingEstimateConfig {
+	vectorCfg := cfg.Vector
+	vectorCfg.ApplyDefaults()
 	return embeddingEstimateConfig{
-		Model:         cfg.Vector.Embeddings.Model,
+		Model:         vectorCfg.Embeddings.Model,
 		Dimension:     dimension,
-		BatchSize:     batchSize,
-		MaxInputChars: cfg.Vector.Embeddings.MaxInputChars,
+		BatchSize:     vectorCfg.Embeddings.BatchSize,
+		MaxInputChars: vectorCfg.Embeddings.MaxInputChars,
 		Preprocess: embed.PreprocessConfig{
-			StripQuotes:        cfg.Vector.Preprocess.StripQuotesEnabled(),
-			StripSignatures:    cfg.Vector.Preprocess.StripSignaturesEnabled(),
-			StripHTML:          cfg.Vector.Preprocess.StripHTMLEnabled(),
-			StripBase64:        cfg.Vector.Preprocess.StripBase64Enabled(),
-			StripURLTracking:   cfg.Vector.Preprocess.StripURLTrackingEnabled(),
-			CollapseWhitespace: cfg.Vector.Preprocess.CollapseWhitespaceEnabled(),
+			StripQuotes:        vectorCfg.Preprocess.StripQuotesEnabled(),
+			StripSignatures:    vectorCfg.Preprocess.StripSignaturesEnabled(),
+			StripHTML:          vectorCfg.Preprocess.StripHTMLEnabled(),
+			StripBase64:        vectorCfg.Preprocess.StripBase64Enabled(),
+			StripURLTracking:   vectorCfg.Preprocess.StripURLTrackingEnabled(),
+			CollapseWhitespace: vectorCfg.Preprocess.CollapseWhitespaceEnabled(),
 		},
-		BuildScope: cfg.Vector.Embed.Scope.BuildScope(),
+		BuildScope: vectorCfg.Embed.Scope.BuildScope(),
 	}
 }
 

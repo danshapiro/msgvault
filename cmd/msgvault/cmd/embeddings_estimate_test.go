@@ -67,7 +67,7 @@ func TestRunEmbeddingsEstimate_PrintsChunkAndStorageSummary(t *testing.T) {
 
 func TestRunEmbeddingsEstimate_AllowsDimensionFlagWithoutVectorEnabled(t *testing.T) {
 	dataDir, db := newEmbeddingEstimateArchive(t)
-	seedEstimateMessage(t, db, 1, "email", "Synthetic subject", "synthetic body", "", false, false)
+	seedEstimateMessage(t, db, 1, "email", "Synthetic subject", strings.Repeat("x-", 2500), "", false, false)
 
 	oldCfg := cfg
 	oldDimension := embeddingsEstimateDimension
@@ -90,7 +90,62 @@ func TestRunEmbeddingsEstimate_AllowsDimensionFlagWithoutVectorEnabled(t *testin
 	requirepkg.NoError(t, cmd.Flags().Set("dimension", "768"), "set dimension flag")
 
 	requirepkg.NoError(t, runEmbeddingsEstimate(cmd, nil), "runEmbeddingsEstimate")
-	assertpkg.Contains(t, stdout.String(), "dimension: 768")
+	out := stdout.String()
+	assertpkg.Contains(t, out, "dimension: 768")
+	assertpkg.Contains(t, out, "max_input_chars: 2000")
+	assertpkg.Contains(t, out, "candidate messages: 1")
+	assertpkg.Contains(t, out, "embeddable messages: 1")
+	assertpkg.Contains(t, out, "estimated chunks: 3")
+	assertpkg.Contains(t, out, "estimated embed requests: 1")
+	assertpkg.Contains(t, out, "estimated raw vector bytes: 9216")
+	assertpkg.Contains(t, out, "  email: candidates=1 embeddable=1 chunks=3 capped=0 empty=0")
+}
+
+func TestRunEmbeddingsEstimate_DimensionOverrideDoesNotLeakAcrossRepeatedRuns(t *testing.T) {
+	dataDir, db := newEmbeddingEstimateArchive(t)
+	seedEstimateMessage(t, db, 1, "email", "Synthetic subject", "synthetic body", "", false, false)
+
+	oldCfg := cfg
+	oldDimension := embeddingsEstimateDimension
+	flag := embeddingsEstimateCmd.Flags().Lookup("dimension")
+	requirepkg.NotNil(t, flag)
+	oldFlagValue := flag.Value.String()
+	oldFlagChanged := flag.Changed
+	oldOut := embeddingsEstimateCmd.OutOrStdout()
+	oldErr := embeddingsEstimateCmd.ErrOrStderr()
+	oldCtx := embeddingsEstimateCmd.Context()
+	t.Cleanup(func() {
+		cfg = oldCfg
+		embeddingsEstimateDimension = oldDimension
+		requirepkg.NoError(t, flag.Value.Set(oldFlagValue))
+		flag.Changed = oldFlagChanged
+		embeddingsEstimateCmd.SetOut(oldOut)
+		embeddingsEstimateCmd.SetErr(oldErr)
+		embeddingsEstimateCmd.SetContext(oldCtx)
+	})
+
+	cfg = &config.Config{
+		HomeDir: dataDir,
+		Data:    config.DataConfig{DataDir: dataDir},
+	}
+
+	var first bytes.Buffer
+	embeddingsEstimateCmd.SetOut(&first)
+	embeddingsEstimateCmd.SetErr(&first)
+	embeddingsEstimateCmd.SetContext(context.Background())
+	requirepkg.NoError(t, embeddingsEstimateCmd.Flags().Set("dimension", "768"), "set dimension flag")
+
+	requirepkg.NoError(t, runEmbeddingsEstimate(embeddingsEstimateCmd, nil), "first runEmbeddingsEstimate")
+	assertpkg.Contains(t, first.String(), "dimension: 768")
+
+	var second bytes.Buffer
+	embeddingsEstimateCmd.SetOut(&second)
+	embeddingsEstimateCmd.SetErr(&second)
+	embeddingsEstimateCmd.SetContext(context.Background())
+
+	requirepkg.NoError(t, runEmbeddingsEstimate(embeddingsEstimateCmd, nil), "second runEmbeddingsEstimate")
+	assertpkg.Contains(t, second.String(), "dimension: unavailable (set vector.embeddings.dimension or --dimension)")
+	assertpkg.Contains(t, second.String(), "estimated raw vector bytes: unavailable (dimension not configured)")
 }
 
 func TestEstimateEmbeddingsHonorsLiveRowsAndMessageTypeScope(t *testing.T) {
