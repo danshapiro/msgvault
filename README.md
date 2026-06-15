@@ -103,7 +103,38 @@ See the [CLI Reference](https://msgvault.io/cli-reference/) for full details.
 
 ## Vector Search
 
-msgvault can search your archive semantically using vector embeddings in addition to the default FTS5 keyword search. Point it at a self-hosted OpenAI-compatible embedding endpoint (Ollama, llama.cpp, LM Studio) and three surfaces accept either pure semantic search or BM25+vector fused via Reciprocal Rank Fusion:
+msgvault can search your archive semantically using vector embeddings in addition to the default FTS5 keyword search. It works with any OpenAI-compatible `/v1/embeddings` endpoint. For a simple local setup, use Ollama with EmbeddingGemma:
+
+```toml
+[vector]
+enabled = true
+backend = "sqlite-vec"
+
+[vector.embeddings]
+endpoint = "http://localhost:11434/v1"
+model = "embeddinggemma"
+dimension = 768
+batch_size = 32
+timeout = "30s"
+max_retries = 3
+max_input_chars = 2000
+```
+
+`max_input_chars` is the per-chunk character window. The default `2000` is intended for 2k-token local embedding models; set it below your model's context window. Long messages are split into overlapping chunks before embedding, so a single message can produce multiple embedding inputs.
+
+Estimate rebuild cost before starting a large full rebuild:
+
+```bash
+msgvault embeddings estimate --dimension 768
+```
+
+Then build or rebuild:
+
+```bash
+msgvault embeddings build --full-rebuild
+```
+
+Three search surfaces accept either pure semantic search or BM25+vector fused via Reciprocal Rank Fusion:
 
 - **CLI:** `msgvault search "..." --mode vector` or `--mode hybrid`
 - **HTTP:** `GET /api/v1/search?q=...&mode=vector` or `mode=hybrid`
