@@ -103,7 +103,7 @@ See the [CLI Reference](https://msgvault.io/cli-reference/) for full details.
 
 ## Vector Search
 
-msgvault can search your archive semantically using vector embeddings in addition to the default FTS5 keyword search. It works with any OpenAI-compatible `/v1/embeddings` endpoint. For a simple local setup, use Ollama with EmbeddingGemma (recent Ollama releases only):
+msgvault can search your archive semantically using vector embeddings in addition to the default FTS5 keyword search. It works with any OpenAI-compatible `/v1/embeddings` endpoint. For a simple local CPU setup, use Ollama with `all-minilm`:
 
 ```toml
 [vector]
@@ -112,20 +112,20 @@ backend = "sqlite-vec"
 
 [vector.embeddings]
 endpoint = "http://localhost:11434/v1"
-model = "embeddinggemma"
-dimension = 768
-batch_size = 32
-timeout = "30s"
-max_retries = 3
-max_input_chars = 2000
+model = "all-minilm"
+dimension = 384
+batch_size = 64
+timeout = "300s"
+max_retries = 2
+max_input_chars = 512
 ```
 
-`max_input_chars` is the per-chunk character window. The default `2000` keeps chunks conservative for local embedding models; lower it if your endpoint is slow or rejects long inputs. Long messages are split into overlapping chunks before embedding, so a single message can produce multiple embedding inputs.
+`max_input_chars` is the per-chunk character window. The default `512` keeps chunks small for the tested local CPU setup. Long messages are split into overlapping chunks before embedding, so a single message can produce multiple embedding inputs.
 
 Estimate rebuild cost before starting a large full rebuild:
 
 ```bash
-msgvault embeddings estimate --dimension 768
+msgvault embeddings estimate --dimension 384
 ```
 
 Then build or rebuild:

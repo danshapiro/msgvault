@@ -92,13 +92,13 @@ func TestRunEmbeddingsEstimate_AllowsDimensionFlagWithoutVectorEnabled(t *testin
 	requirepkg.NoError(t, runEmbeddingsEstimate(cmd, nil), "runEmbeddingsEstimate")
 	out := stdout.String()
 	assertpkg.Contains(t, out, "dimension: 768")
-	assertpkg.Contains(t, out, "max_input_chars: 2000")
+	assertpkg.Contains(t, out, "max_input_chars: 512")
 	assertpkg.Contains(t, out, "candidate messages: 1")
 	assertpkg.Contains(t, out, "embeddable messages: 1")
-	assertpkg.Contains(t, out, "estimated chunks: 3")
+	assertpkg.Contains(t, out, "estimated chunks: 11")
 	assertpkg.Contains(t, out, "estimated embed requests: 1")
-	assertpkg.Contains(t, out, "estimated raw vector bytes: 9216")
-	assertpkg.Contains(t, out, "  email: candidates=1 embeddable=1 chunks=3 capped=0 empty=0")
+	assertpkg.Contains(t, out, "estimated raw vector bytes: 33792")
+	assertpkg.Contains(t, out, "  email: candidates=1 embeddable=1 chunks=11 capped=0 empty=0")
 }
 
 func TestRunEmbeddingsEstimate_DimensionOverrideDoesNotLeakAcrossRepeatedRuns(t *testing.T) {

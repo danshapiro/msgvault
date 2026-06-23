@@ -42,7 +42,7 @@ const (
 	defaultEmbeddingBatchSize     = 32
 	defaultEmbeddingTimeout       = 30 * time.Second
 	defaultEmbeddingMaxRetries    = 3
-	defaultEmbeddingMaxInputChars = 2000
+	defaultEmbeddingMaxInputChars = 512
 	defaultEmbeddingETAWindow     = 10
 
 	defaultSearchRRFK              = 60

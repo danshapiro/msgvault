@@ -274,7 +274,7 @@ func TestApplyDefaults_OverridesZeroValues(t *testing.T) {
 	assert.Equal(32, c.Embeddings.BatchSize)
 	assert.Equal(30*time.Second, c.Embeddings.Timeout)
 	assert.Equal(3, c.Embeddings.MaxRetries)
-	assert.Equal(2000, c.Embeddings.MaxInputChars)
+	assert.Equal(512, c.Embeddings.MaxInputChars)
 	assert.Equal(60, c.Search.RRFK)
 	assert.Equal(100, c.Search.KPerSignal)
 	assert.InDelta(2.0, c.Search.SubjectBoost, 1e-9)
@@ -335,7 +335,7 @@ func TestApplyDefaults_EmbeddingDefaultsStayDocsAligned(t *testing.T) {
 	assertpkg.Equal(t, 32, c.Embeddings.BatchSize)
 	assertpkg.Equal(t, 30*time.Second, c.Embeddings.Timeout)
 	assertpkg.Equal(t, 3, c.Embeddings.MaxRetries)
-	assertpkg.Equal(t, 2000, c.Embeddings.MaxInputChars)
+	assertpkg.Equal(t, 512, c.Embeddings.MaxInputChars)
 	assertpkg.Equal(t, 10, c.Embeddings.ETAWindow)
 }
 
@@ -457,7 +457,7 @@ func TestConfig_GenerationFingerprintFolds(t *testing.T) {
 func TestConfig_GenerationFingerprint_IncludesMaxInputChars(t *testing.T) {
 	base := Config{Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8}}
 	base.ApplyDefaults()
-	assertpkg.Contains(t, base.GenerationFingerprint(), ":c2000:")
+	assertpkg.Contains(t, base.GenerationFingerprint(), ":c512:")
 
 	explicit := Config{
 		Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8, MaxInputChars: 6000},
