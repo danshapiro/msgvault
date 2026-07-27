@@ -180,6 +180,34 @@ CREATE TABLE IF NOT EXISTS messages (
     -- stamps this column after a successful upsert (or skip).
     embed_gen INTEGER,
 
+    -- Content-change watermark, maintained ENTIRELY by the database (triggers
+    -- created by EnsureTriggers), never by application write paths. Unlike
+    -- last_modified above, which bumps on ANY change to the row, this moves
+    -- only when the message's own content, routing, or lifecycle actually
+    -- changes value -- see MessagesContentColumns in content_columns.go for
+    -- the list and the reason each column is in or out. It exists so a
+    -- consumer maintaining an incremental copy of the archive can page "what
+    -- changed since X?" without being woken by internal bookkeeping such as
+    -- embedding watermarks or index versions.
+    --
+    -- The DEFAULT is the INSERT-time writer on a fresh database, and it must
+    -- stay byte-compatible with SQLiteDialect.ContentChangedNow (the trigger
+    -- that stamps everything else) -- the feed's cursor comparison is lexical,
+    -- so a stamp of a different width sorts into the wrong place. It is here
+    -- rather than only in the trigger because SQLite triggers cannot assign to
+    -- NEW: an AFTER INSERT trigger has to re-UPDATE the row it just saw, which
+    -- also re-fires the blanket last_modified trigger, turning one row write
+    -- into three (measured ~6x slower and a 17% larger file over a 100k-row
+    -- bulk insert). A database upgraded by ALTER TABLE ADD COLUMN cannot carry
+    -- this DEFAULT -- SQLite rejects a non-constant default there -- so the
+    -- trigger stays, guarded by WHEN NEW.content_changed_at IS NULL, and is a
+    -- no-op on fresh databases.
+    --
+    -- This column MUST stay last: subset.go copies messages positionally
+    -- ("INSERT INTO messages SELECT * FROM src.messages") and ALTER TABLE ADD
+    -- COLUMN always appends, so an upgraded database has it last too.
+    content_changed_at DATETIME DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+
     UNIQUE(source_id, source_message_id)
 );
 

@@ -7,14 +7,28 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 
 	"github.com/mattn/go-sqlite3"
 	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
+// SQLiteTimestampLayout is the Go layout matching strftime('%Y-%m-%d %H:%M:%f').
+const SQLiteTimestampLayout = "2006-01-02 15:04:05.000"
+
 // SQLiteDialect implements Dialect for SQLite (the default backend).
-type SQLiteDialect struct{}
+//
+// The zero value is ready to use, and every method except ReadWatermarkBounds
+// is stateless — callers outside Store that only want Rebind or BuildFTSArg can
+// go on constructing one per call. ReadWatermarkBounds remembers the newest
+// instant it has proved the database had no write in flight, which the Store's
+// single long-lived instance accumulates across pages.
+type SQLiteDialect struct {
+	quiescentMu sync.Mutex
+	quiescentAt time.Time
+}
 
 func (d *SQLiteDialect) DriverName() string { return sqliteutil.DriverName() }
 
@@ -23,6 +37,209 @@ func (d *SQLiteDialect) Rebind(query string) string { return query }
 
 // Now returns the SQLite expression for the current UTC timestamp.
 func (d *SQLiteDialect) Now() string { return "datetime('now')" }
+
+// ContentChangedNow returns the SQLite expression that stamps
+// content_changed_at at millisecond resolution. strftime's %f gives
+// milliseconds as a floor on collision spacing, not a guarantee of
+// distinctness, but it is the finest resolution SQLite's DATETIME text
+// format supports, and the trigger's WHEN guard plus the (content_changed_at,
+// id) cursor tolerate ties.
+func (d *SQLiteDialect) ContentChangedNow() string {
+	return `strftime('%Y-%m-%d %H:%M:%f','now')`
+}
+
+// TimestampParam formats t to match ContentChangedNow's textual format.
+// SQLite's driver otherwise serialises time.Time with a "+00:00" suffix,
+// which sorts BELOW an equal stored value under lexical comparison and
+// would silently drop every row sharing the cursor's instant.
+func (d *SQLiteDialect) TimestampParam(t time.Time) any {
+	if t.IsZero() {
+		return "" // sorts below every stored timestamp: "from the beginning"
+	}
+	return t.UTC().Format(SQLiteTimestampLayout)
+}
+
+// sqliteQuiescentProbeTimeout is how long ReadWatermarkBounds waits for the
+// SQLite write lock before giving up on advancing the bound for this page. It
+// is deliberately short: a page that waits is a consumer that waits, and the
+// fallback (the newest instant the database was already proved quiescent at)
+// costs only freshness, never correctness. SQLite write transactions are
+// normally sub-millisecond, so 250ms times out only against a writer that is
+// genuinely holding the lock — which is exactly the case where waiting longer
+// would not have helped either.
+//
+// The probe is a WRITE-lock acquisition, so polling the feed costs the database
+// writer throughput in a way an ordinary read does not: measured on one machine
+// against three concurrent writers, eight clients paging the feed in a tight
+// loop cut writes to 15% of the unloaded rate, where eight clients running an
+// equivalent plain SELECT left 49%. One consumer polling once a second is free;
+// a consumer that polls as fast as it can is competing with the importer for
+// the write lock. Poll on an interval, and use has_more (not a tighter poll) to
+// drain a backlog.
+const sqliteQuiescentProbeTimeout = 250 * time.Millisecond
+
+// ReadWatermarkBounds implements Dialect.
+//
+// SQLite has no pg_stat_activity: nothing exposes when another connection's
+// write transaction began, or whether one is open at all. What it has instead
+// is a single writer. Acquiring the write lock is therefore a proof rather than
+// an observation — while this probe holds it, no other write transaction
+// exists, so every content_changed_at stamp in the database has committed. The
+// clock read inside that lock is a valid commit bound:
+//
+//   - A write that committed before the lock was acquired stamped itself
+//     earlier still, so it is strictly below the reading (or equal to it, which
+//     the page's strict `<` also excludes — a delay, not a loss).
+//   - A write that starts after the probe releases the lock cannot be stamped
+//     before it acquires the lock, which is after the reading.
+//
+// When the lock cannot be taken within sqliteQuiescentProbeTimeout, a writer is
+// in flight and its start time is unknowable, so the bound falls back to the
+// newest instant this dialect has already proved quiescent — the last probe
+// that succeeded. That is always safe (any write in flight now began after it)
+// and it is why the instant is remembered rather than recomputed: the fallback
+// is the whole liveness story on SQLite. The feed then stops advancing until
+// the writer finishes, and says so through the lag between CommitBound and Now.
+//
+// A fresh dialect that has never completed a probe reports the zero time, so
+// the feed publishes nothing until it first sees the database idle. That is the
+// honest answer — it has no evidence any stamp has committed — and it resolves
+// on the first quiet moment.
+//
+// The probe holds the write lock for one clock read, and commits nothing, so it
+// writes no WAL frames.
+func (d *SQLiteDialect) ReadWatermarkBounds(
+	ctx context.Context, db *sql.DB,
+) (WatermarkBounds, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return WatermarkBounds{}, fmt.Errorf("read change-feed watermark bounds: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	quiescent, proved, err := d.probeQuiescentInstant(ctx, conn)
+	if err != nil {
+		return WatermarkBounds{}, err
+	}
+	// A successful probe already read the clock, under the write lock; that
+	// reading is this call's server_time as much as a bare SELECT would be, and
+	// reusing it keeps Now and CommitBound from disagreeing by a millisecond
+	// for no reason. Only a probe that timed out needs the clock separately.
+	now := quiescent
+	if !proved {
+		if now, err = d.readClock(ctx, conn); err != nil {
+			return WatermarkBounds{}, err
+		}
+	}
+
+	d.quiescentMu.Lock()
+	defer d.quiescentMu.Unlock()
+	if proved {
+		// The MOST RECENT proof, not the greatest one. They differ only if the
+		// database clock steps backwards, and there the greatest is the wrong
+		// answer: it would stand above stamps taken after the step, which may
+		// still be in flight.
+		d.quiescentAt = quiescent
+	}
+	bound := d.quiescentAt
+	if bound.After(now) {
+		// Only reachable if the database clock stepped backwards between two
+		// probes, which breaks the watermark itself and is outside what this
+		// bound can repair (docs/api-server.md says so). Hold the published
+		// invariant — CommitBound is never after Now — rather than emit a pair
+		// that contradicts the contract on top of it.
+		bound = now
+	}
+	return WatermarkBounds{Now: now, CommitBound: bound}, nil
+}
+
+// probeQuiescentInstant takes the SQLite write lock, reads the clock under it,
+// and releases it. The second return is false when a writer held the lock for
+// longer than the probe was willing to wait — not an error, just no new
+// evidence.
+func (d *SQLiteDialect) probeQuiescentInstant(
+	ctx context.Context, conn *sql.Conn,
+) (time.Time, bool, error) {
+	restore, err := d.useProbeBusyTimeout(ctx, conn)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	defer restore()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		if d.IsBusyError(err) {
+			return time.Time{}, false, nil
+		}
+		if isSQLiteError(err, "readonly") {
+			// A read-only handle can never take the write lock, so it can never
+			// establish the bound — and it cannot assume there is no writer
+			// either, because another process may hold the same file open for
+			// writing. Say so instead of serving a feed that silently returns
+			// nothing.
+			return time.Time{}, false, fmt.Errorf(
+				"read change-feed watermark bounds: the content-change feed needs a "+
+					"writable database handle to establish how far writes have "+
+					"committed: %w", err)
+		}
+		return time.Time{}, false, fmt.Errorf("read change-feed watermark bounds: %w", err)
+	}
+
+	stamp, err := d.readClock(ctx, conn)
+	if err != nil {
+		d.rollback(ctx, conn)
+		return time.Time{}, false, err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		d.rollback(ctx, conn)
+		return time.Time{}, false, fmt.Errorf("release change-feed watermark probe: %w", err)
+	}
+	return stamp, true, nil
+}
+
+// useProbeBusyTimeout narrows this connection's busy timeout to the probe's,
+// returning a function that puts the connection's own value back. The
+// connection returns to the pool afterwards, so leaving the probe's timeout on
+// it would silently shorten every unrelated statement that later borrows it.
+func (d *SQLiteDialect) useProbeBusyTimeout(ctx context.Context, conn *sql.Conn) (func(), error) {
+	var configured int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&configured); err != nil {
+		return nil, fmt.Errorf("read busy timeout for change-feed watermark probe: %w", err)
+	}
+	set := func(c context.Context, ms int64) error {
+		_, err := conn.ExecContext(c, fmt.Sprintf("PRAGMA busy_timeout = %d", ms))
+		return err
+	}
+	// Narrow, never widen: a store configured to give up on a busy database
+	// sooner than this means it, and the probe has a safe fallback either way.
+	if err := set(ctx, min(configured, sqliteQuiescentProbeTimeout.Milliseconds())); err != nil {
+		return nil, fmt.Errorf("set busy timeout for change-feed watermark probe: %w", err)
+	}
+	return func() {
+		// WithoutCancel: the connection must be handed back with its own
+		// timeout even when the caller's context has already expired.
+		_ = set(context.WithoutCancel(ctx), configured)
+	}, nil
+}
+
+// rollback releases a probe transaction that could not be committed. It runs on
+// an uncancellable context so a cancelled request cannot return a connection to
+// the pool with the write lock still held.
+func (d *SQLiteDialect) rollback(ctx context.Context, conn *sql.Conn) {
+	_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+}
+
+// readClock reads the database clock in exactly the format the triggers stamp,
+// so the reading and the watermarks it bounds are comparable.
+func (d *SQLiteDialect) readClock(ctx context.Context, conn *sql.Conn) (time.Time, error) {
+	var stamp nullableTimestamp
+	if err := conn.QueryRowContext(ctx, "SELECT "+d.ContentChangedNow()).Scan(&stamp); err != nil {
+		return time.Time{}, fmt.Errorf("read database clock: %w", err)
+	}
+	if !stamp.Valid {
+		return time.Time{}, errors.New("read database clock: no value returned")
+	}
+	return stamp.Time.UTC(), nil
+}
 
 // InsertOrIgnore is a no-op for SQLite — the syntax is native.
 func (d *SQLiteDialect) InsertOrIgnore(sql string) string { return sql }
@@ -259,10 +476,109 @@ func (d *SQLiteDialect) FTSRebuildSchema(q querier) error {
 // not a post-migration step (cr2-10).
 func (d *SQLiteDialect) EnsureFTSIndex(querier) error { return nil }
 
-// EnsureTriggers is a no-op for SQLite: the last_modified triggers are
-// `CREATE TRIGGER IF NOT EXISTS` in schema.sql, which InitSchema re-execs
-// idempotently on every open (fresh and existing DBs alike).
-func (d *SQLiteDialect) EnsureTriggers(querier) error { return nil }
+// EnsureTriggers creates the content_changed_at maintenance triggers.
+//
+// The last_modified triggers are NOT here: they are CREATE TRIGGER IF NOT
+// EXISTS in schema.sql, which InitSchema re-execs on every open, and their
+// definition is unchanged by this feature.
+//
+// content_changed_at's triggers are built here because their column list comes
+// from MessagesContentColumns, shared with the PostgreSQL dialect so the two
+// backends cannot drift, and because DROP + CREATE can replace a definition on
+// an existing archive where CREATE TRIGGER IF NOT EXISTS silently would not.
+func (d *SQLiteDialect) EnsureTriggers(q querier) error {
+	cols := ContentChangedTriggerColumnList()
+	guard := ContentChangedValueGuard("IS NOT")
+	now := d.ContentChangedNow()
+	insertStampedByDefault, err := d.contentChangedAtDefaultStamps(q)
+	if err != nil {
+		return err
+	}
+	stmts := []string{
+		`DROP TRIGGER IF EXISTS trg_messages_content_changed_ins`,
+	}
+	if !insertStampedByDefault {
+		// Every new row gets a watermark. On a database upgraded by ALTER TABLE
+		// ADD COLUMN this trigger is the only writer, because SQLite forbids a
+		// non-constant DEFAULT there. A fresh database has the DEFAULT
+		// (schema.sql) instead and this trigger is NOT created at all: SQLite
+		// triggers cannot assign to NEW, so the stamp has to be a second
+		// UPDATE of the row just inserted, and merely HAVING a row trigger on
+		// messages forces SQLite to open a statement journal for every INSERT
+		// -- measured at 6.4s versus 1.1s for a 100k-row bulk insert, with the
+		// trigger body never once executing. The WHEN guard yields to an
+		// explicit write in the INSERT rather than clobbering it.
+		stmts = append(stmts, fmt.Sprintf(`CREATE TRIGGER trg_messages_content_changed_ins
+		    AFTER INSERT ON messages FOR EACH ROW
+		    WHEN NEW.content_changed_at IS NULL
+		    BEGIN
+		        UPDATE messages SET content_changed_at = %s WHERE id = NEW.id;
+		    END`, now))
+	}
+	stmts = append(stmts,
+		`DROP TRIGGER IF EXISTS trg_messages_content_changed_at`,
+		// UPDATE OF scopes to the columns the statement names; the value guard
+		// then requires one of them to have actually changed. Recursion is
+		// impossible: the trigger's own UPDATE touches only content_changed_at,
+		// which is not in the column list. The IS guard is null-safe -- with
+		// `=`, a NULL watermark is never stamped (measured).
+		fmt.Sprintf(`CREATE TRIGGER trg_messages_content_changed_at
+		    AFTER UPDATE OF %s ON messages FOR EACH ROW
+		    WHEN OLD.content_changed_at IS NEW.content_changed_at AND %s
+		    BEGIN
+		        UPDATE messages SET content_changed_at = %s WHERE id = NEW.id;
+		    END`, cols, guard, now),
+		`DROP TRIGGER IF EXISTS trg_message_bodies_content_changed_ins`,
+		fmt.Sprintf(`CREATE TRIGGER trg_message_bodies_content_changed_ins
+		    AFTER INSERT ON message_bodies FOR EACH ROW
+		    BEGIN
+		        UPDATE messages SET content_changed_at = %s WHERE id = NEW.message_id;
+		    END`, now),
+		`DROP TRIGGER IF EXISTS trg_message_bodies_content_changed_upd`,
+		// Value-guarded like the messages trigger: upsertMessageBody always
+		// runs its ON CONFLICT DO UPDATE, even when messageBodyChanges reports
+		// nothing changed, and PersistMessage calls it for every persisted
+		// message. Unguarded, every resync would bump.
+		fmt.Sprintf(`CREATE TRIGGER trg_message_bodies_content_changed_upd
+		    AFTER UPDATE ON message_bodies FOR EACH ROW
+		    WHEN OLD.body_text IS NOT NEW.body_text OR OLD.body_html IS NOT NEW.body_html
+		    BEGIN
+		        UPDATE messages SET content_changed_at = %s WHERE id = NEW.message_id;
+		    END`, now),
+	)
+	for _, stmt := range stmts {
+		if _, err := q.Exec(stmt); err != nil {
+			return fmt.Errorf("ensure content_changed_at triggers: %w", err)
+		}
+	}
+	return nil
+}
+
+// contentChangedAtDefaultStamps reports whether messages.content_changed_at
+// carries exactly the DEFAULT that ContentChangedNow writes, which is the case
+// on a database created from schema.sql and impossible on one upgraded by
+// ALTER TABLE ADD COLUMN.
+//
+// The comparison is exact rather than "has some default" on purpose: the INSERT
+// trigger is only safe to omit when the DEFAULT produces the identical stamp
+// format, since the change feed's cursor comparison is lexical. A default that
+// has drifted from ContentChangedNow leaves the trigger in place, trading speed
+// for a watermark the feed can still sort.
+func (d *SQLiteDialect) contentChangedAtDefaultStamps(q querier) (bool, error) {
+	var dflt sql.NullString
+	err := q.QueryRow(
+		`SELECT dflt_value FROM pragma_table_info('messages') WHERE name = 'content_changed_at'`,
+	).Scan(&dflt)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The column migration has not run yet on this handle; the caller's
+		// trigger is then the only possible writer.
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read messages.content_changed_at default: %w", err)
+	}
+	return dflt.Valid && dflt.String == d.ContentChangedNow(), nil
+}
 
 // LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that
 // bring older SQLite databases up to the current schema. IsDuplicateColumnError
@@ -297,6 +613,14 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		// (NULL would never match `last_modified = ?`). Fresh DBs keep the
 		// CREATE TABLE default in schema.sql, which IS allowed.
 		{`ALTER TABLE messages ADD COLUMN last_modified DATETIME`, "last_modified"},
+		// content_changed_at: content-scoped change watermark. No default here,
+		// because SQLite rejects a non-constant DEFAULT in ADD COLUMN; fresh
+		// databases DO carry one (schema.sql), and on this upgrade path the
+		// INSERT trigger stamps new rows instead. InitSchema's backfill seeds
+		// pre-existing rows from last_modified, a better starting point than
+		// "now", which would make an existing archive look like every message
+		// changed at upgrade time.
+		{`ALTER TABLE messages ADD COLUMN content_changed_at DATETIME`, "content_changed_at"},
 	}
 }
 

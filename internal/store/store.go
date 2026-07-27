@@ -683,6 +683,17 @@ func (s *Store) SchemaStale() (bool, string, error) {
 	return false, "", nil
 }
 
+// initSchemaWindowHook is a test-only seam. It fires at the point in InitSchema
+// where a message inserted by another connection is at its most exposed: the
+// one-time content_changed_at backfill has already run AND recorded itself in
+// the migration ledger, so it will never look for NULL watermarks again, while
+// the remaining whole-table index builds still have minutes of work to do on a
+// large archive. A row that lands here has to be stamped by the INSERT trigger
+// or it never appears in the change feed at all, which is why the watermark
+// triggers are created before the backfill rather than after the indexes. Nil
+// in production.
+var initSchemaWindowHook func()
+
 // InitSchema initializes the database schema.
 // This creates all tables if they don't exist.
 func (s *Store) InitSchema() error {
@@ -769,6 +780,44 @@ func (s *Store) InitSchema() error {
 		} else if m.Desc == "last_modified" && !s.IsPostgreSQL() {
 			lastModifiedColumnAdded = true
 		}
+	}
+
+	// Create the message watermark maintenance triggers. Must run after the
+	// migration loop above, which adds last_modified and content_changed_at on
+	// legacy DBs — the triggers reference both columns.
+	//
+	// It runs HERE, immediately after the columns exist, rather than at the end
+	// of the upgrade: everything below is index builds and whole-table backfills
+	// that take minutes on a large archive, and until the INSERT trigger exists
+	// a message written by another connection lands with content_changed_at
+	// NULL. That is terminal — the feed's range predicate excludes NULL and the
+	// backfill's ledger sentinel means it never runs again — so the row would
+	// never appear in the change feed. Ordering the triggers first makes the
+	// INSERT trigger the writer for those rows and leaves the backfill's
+	// `WHERE content_changed_at IS NULL` correctly finding nothing to do for
+	// them.
+	//
+	// Safe with respect to the backfills below. Neither is re-stamped by the
+	// content_changed_at triggers: those are scoped to INSERT or to
+	// `UPDATE OF <content columns>`, and content_changed_at is not one of those
+	// columns, so a statement naming only the watermark never matches. The
+	// last_modified backfill writes a value that differs from the old NULL,
+	// which is what both dialects' last_modified triggers yield to. The one
+	// interaction that does exist is the reverse — the content_changed_at
+	// backfill trips the blanket last_modified trigger — and it is documented
+	// at that backfill. Creating the triggers here rather than at the end makes
+	// PostgreSQL match SQLite on that point, where the trigger has always come
+	// from schema.sql and has always fired.
+	//
+	// On SQLite this covers the content_changed_at triggers only (the
+	// last_modified ones ride schema.sql); on PostgreSQL it covers both sets.
+	// Both dialects drop and recreate, so a later change to the content-column
+	// list reaches an existing archive. Run under runMaintenance for consistency
+	// with EnsureFTSIndex (no statement_timeout cap on the DDL).
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		return s.dialect.EnsureTriggers(tx)
+	}); err != nil {
+		return fmt.Errorf("ensure message watermark triggers: %w", err)
 	}
 
 	// Partial expression indexes for live-message listing and date filtering.
@@ -920,6 +969,81 @@ func (s *Store) InitSchema() error {
 		}
 	}
 
+	// Backfill content_changed_at for rows that predate the column. Seeded from
+	// last_modified rather than "now": an existing archive's last_modified is a
+	// reasonable estimate of when the row last moved, so a consumer's first page
+	// returns recent changes instead of the whole archive. SQLite runs the seed
+	// through strftime so a legacy last_modified in any other textual form lands
+	// in the one format the triggers write -- its cursor comparison is lexical,
+	// and a single stray "2024-03-04T05:06:07Z" would sort into the wrong place
+	// and be skipped or repeated forever. PostgreSQL compares TIMESTAMPTZ
+	// natively and needs no normalisation. Gated on the ledger because the WHERE
+	// clause is a full scan and never finds work after the first run; no
+	// forced-rerun path is needed (unlike last_modified's) because the column
+	// and its sentinel ship in the same release. Under runMaintenance so a
+	// full-table UPDATE is not cut off by the pool-wide statement_timeout.
+	//
+	// This UPDATE bumps last_modified on every row it touches, once, at upgrade,
+	// on both backends. The pre-existing blanket last_modified trigger fires on
+	// any UPDATE that leaves last_modified alone, and this statement names only
+	// content_changed_at. It cannot be suppressed from here: the trigger yields
+	// only to a statement that writes a DIFFERENT last_modified, so preserving
+	// the old value is not expressible, and dropping the trigger around the
+	// backfill would leave the embed worker's CAS token unmaintained if the
+	// upgrade were interrupted. The consequence is bounded — embedding candidate
+	// selection keys off embed_gen, not last_modified, and the bump happens once
+	// per archive — so it is documented rather than worked around.
+	contentChangedMigrated, err := s.IsMigrationApplied(migrationMessagesContentChangedAtBackfill)
+	if err != nil {
+		return err
+	}
+	if !contentChangedMigrated {
+		// The outer COALESCE is load-bearing, not belt-and-braces. strftime
+		// returns NULL -- not an error -- for any input its parser rejects: a
+		// unix epoch integer, an empty string, free text. last_modified is an
+		// untyped SQLite DATETIME column, so such a value is storable, and the
+		// resulting NULL watermark is terminal: the feed's range predicate
+		// excludes NULL and the ledger gate below means this scan never runs
+		// again. Falling back to "now" keeps the row in the feed at the cost of
+		// one over-fresh watermark.
+		backfill := `UPDATE messages
+		             SET content_changed_at = COALESCE(
+		                     strftime('%Y-%m-%d %H:%M:%f', last_modified),
+		                     strftime('%Y-%m-%d %H:%M:%f', 'now'))
+		             WHERE content_changed_at IS NULL`
+		if s.IsPostgreSQL() {
+			backfill = `UPDATE messages SET content_changed_at = COALESCE(last_modified, clock_timestamp())
+			            WHERE content_changed_at IS NULL`
+		}
+		if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+			_, err := tx.ExecContext(ctx, backfill)
+			return err
+		}); err != nil {
+			return fmt.Errorf("backfill content_changed_at: %w", err)
+		}
+		if err := s.MarkMigrationApplied(migrationMessagesContentChangedAtBackfill); err != nil {
+			return err
+		}
+	}
+
+	if initSchemaWindowHook != nil {
+		initSchemaWindowHook()
+	}
+
+	// Keyset index for the content-change feed, on both backends. Composite
+	// (content_changed_at, id) because the feed's cursor is exactly that pair.
+	// Created here rather than in the schema files because those run before the
+	// ADD COLUMN migration above (cr2-10). Under runMaintenance: the one-time
+	// build over a large archive can exceed the pool-wide statement_timeout.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		_, err := tx.ExecContext(ctx,
+			`CREATE INDEX IF NOT EXISTS idx_messages_content_changed_at
+			     ON messages(content_changed_at, id)`)
+		return err
+	}); err != nil {
+		return fmt.Errorf("create content_changed_at index: %w", err)
+	}
+
 	// Create FTS indexes that depend on columns just added by the legacy
 	// migrations (PostgreSQL's GIN index on messages.search_fts). No-op on
 	// SQLite. Must run after the migration loop above. [cr2-10]
@@ -932,17 +1056,6 @@ func (s *Store) InitSchema() error {
 		return s.dialect.EnsureFTSIndex(tx)
 	}); err != nil {
 		return fmt.Errorf("ensure FTS index: %w", err)
-	}
-
-	// Create the last_modified maintenance triggers. Must run after the
-	// migration loop above adds the last_modified column on legacy DBs.
-	// SQLite is a no-op here (its triggers ride schema.sql); PostgreSQL
-	// creates them idempotently. Run under runMaintenance for consistency
-	// with EnsureFTSIndex (no statement_timeout cap on the DDL).
-	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
-		return s.dialect.EnsureTriggers(tx)
-	}); err != nil {
-		return fmt.Errorf("ensure last_modified triggers: %w", err)
 	}
 
 	// Drop the obsolete partial index over messages needing embedding. It was

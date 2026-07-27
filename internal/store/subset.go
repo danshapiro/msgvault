@@ -333,6 +333,29 @@ func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
 		return nil, fmt.Errorf("copy messages: %w", err)
 	}
 
+	// A positional copy supplies content_changed_at explicitly, which bypasses
+	// the column's DEFAULT, and on a database created from schema.sql there is
+	// no AFTER INSERT trigger behind it (the default is the whole INSERT-time
+	// writer there — see EnsureTriggers). So a NULL watermark in the source
+	// lands in the subset as a NULL watermark and nothing ever stamps it: the
+	// change feed's range predicate excludes NULL, and InitSchema's
+	// `WHERE content_changed_at IS NULL` backfill already ran on this database
+	// while it was empty and is recorded as applied, so it will not run again.
+	// The row would be invisible to the feed for the life of the archive.
+	//
+	// Normally this updates nothing — every write path stamps the column, and
+	// the source's own migration filled it. It is the copy that has to be
+	// closed, not the writers: this statement is the only thing standing
+	// between a single NULL anywhere upstream and a permanently unreportable
+	// message. It names only content_changed_at, so the content-change trigger
+	// (UPDATE OF the content columns) does not fire; the blanket last_modified
+	// trigger does, which is correct — the row did change.
+	if _, err := tx.Exec(fmt.Sprintf(
+		`UPDATE messages SET content_changed_at = %s WHERE content_changed_at IS NULL`,
+		(&SQLiteDialect{}).ContentChangedNow())); err != nil {
+		return nil, fmt.Errorf("stamp missing content_changed_at watermarks: %w", err)
+	}
+
 	// Null out reply_to_message_id when the parent message wasn't
 	// selected, to avoid FK violations from dangling references.
 	if _, err := tx.Exec(`

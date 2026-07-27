@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
@@ -959,4 +960,83 @@ func TestCopySubset_ControlCharInPath(t *testing.T) {
 		_, err := CopySubset(p, dstDir, 5)
 		assert.Error(t, err, "CopySubset(%q) should reject control chars", p)
 	}
+}
+
+// TestCopySubset_NullWatermarkIsRestamped covers what the positional copy can
+// carry through that no other write path can.
+//
+// `INSERT INTO messages SELECT * FROM src.messages` supplies content_changed_at
+// explicitly, which bypasses the column's DEFAULT, and a database created from
+// schema.sql has no AFTER INSERT trigger behind that default. So a NULL
+// watermark in the source arrives as a NULL watermark in the subset — and stays
+// one: the change feed's range predicate excludes NULL, and the migration that
+// would fill it in already ran on this database while it was empty and is
+// recorded as applied. The message would never appear in the feed again.
+//
+// The source's NULL is written the way one can now exist at all: an INSERT that
+// names content_changed_at and gives it NULL. That is the hole the DEFAULT
+// leaves open on a fresh database, so it is the shape worth copying badly.
+func TestCopySubset_NullWatermarkIsRestamped(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "dst")
+
+	srcPath := createTestSourceDB(t, srcDir, 4)
+	srcDB, err := sql.Open("sqlite3", srcPath+"?_foreign_keys=OFF")
+	require.NoError(err, "open source")
+	_, err = srcDB.Exec(`
+		INSERT INTO messages
+			(id, conversation_id, source_id, source_message_id, message_type,
+			 subject, content_changed_at)
+		VALUES (99, 1, 1, 'msg_unwatermarked', 'email', 'No watermark', NULL)`)
+	require.NoError(err, "insert a message with no watermark")
+	var srcWatermark sql.NullString
+	require.NoError(srcDB.QueryRow(
+		"SELECT content_changed_at FROM messages WHERE id = 99").Scan(&srcWatermark),
+		"read the source watermark")
+	require.False(srcWatermark.Valid,
+		"the source fixture is only meaningful if the NULL survived the insert: a "+
+			"DEFAULT does not apply to a column the statement names")
+	require.NoError(srcDB.Close(), "close source")
+
+	_, err = CopySubset(srcPath, dstDir, 100)
+	require.NoError(err, "CopySubset")
+
+	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination")
+	defer func() { _ = dstDB.Close() }()
+
+	var missing int64
+	require.NoError(dstDB.QueryRow(
+		"SELECT COUNT(*) FROM messages WHERE content_changed_at IS NULL").Scan(&missing),
+		"count unwatermarked messages")
+	assert.Zero(missing,
+		"the subset carried a NULL content_changed_at through. Nothing in the "+
+			"destination will ever stamp it — the INSERT trigger is absent on a "+
+			"fresh database and the backfill has already been recorded as applied — "+
+			"so the change feed can never report that message again")
+
+	// Read the stored text rather than the scanned value: go-sqlite3 converts a
+	// DATETIME column to time.Time on the way out, which would hide the width
+	// the feed actually compares. The feed's cursor comparison is lexical, so a
+	// substitute in any other shape sorts into the wrong place.
+	var copied string
+	require.NoError(dstDB.QueryRow(
+		"SELECT CAST(content_changed_at AS TEXT) FROM messages WHERE id = 99").Scan(&copied),
+		"read the copied watermark")
+	_, parseErr := time.Parse(SQLiteTimestampLayout, copied)
+	assert.NoErrorf(parseErr,
+		"the substituted watermark %q must be in the format SQLiteDialect."+
+			"ContentChangedNow writes", copied)
+
+	var oddlyShaped int64
+	require.NoError(dstDB.QueryRow(`
+		SELECT COUNT(*) FROM messages
+		WHERE CAST(content_changed_at AS TEXT) NOT GLOB
+			'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]'`,
+	).Scan(&oddlyShaped), "count oddly shaped watermarks")
+	assert.Zero(oddlyShaped,
+		"every watermark in the subset must share one textual shape: the feed "+
+			"orders them lexically, so a stamp of a different width sorts wrong")
 }
