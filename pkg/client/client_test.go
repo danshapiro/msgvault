@@ -117,6 +117,129 @@ func TestGeneratedFileMetadataRequiresPresenceButAcceptsEmptyLegacyStrings(t *te
 	})
 }
 
+// TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages holds the
+// content-change feed to the same "required means present, not non-empty"
+// distinction the file-metadata models above are held to.
+//
+// A row of that feed omits every column it has nothing to say about: a live
+// message carries no deletion timestamps, a chat message carries no subject,
+// snippet, or platform id, and the first poll of an empty archive has no cursor
+// to echo. Declaring any of those required in the OpenAPI document makes this
+// validator reject them — required here means non-nil AND non-empty — so the
+// published client would refuse the server's ordinary successful responses.
+func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
+	const liveEmail = `{
+		"messages":[{
+			"id":918,
+			"source_id":1,
+			"source_message_id":"18f2c9d0a1b3",
+			"conversation_id":44,
+			"message_type":"email",
+			"subject":"Q4 planning",
+			"snippet":"Here's the draft for Q4...",
+			"sent_at":"2026-03-01T10:00:00Z",
+			"size_estimate":8412,
+			"has_attachments":false,
+			"attachment_count":0,
+			"content_changed_at":"2026-07-26T10:00:00.731123Z"
+		}],
+		"count":1,
+		"has_more":false,
+		"next_since":"2026-07-26T10:00:00.731123Z",
+		"next_since_id":918,
+		"server_time":"2026-07-26T10:00:03.114500Z",
+		"complete_through":"2026-07-26T10:00:03.114488Z"
+	}`
+
+	t.Run("live message omits every unset timestamp", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(liveEmail), &page))
+		requirements.NoError(page.Validate(),
+			"a message that was never deleted and has no platform timestamps is the "+
+				"common case, not an error")
+		requirements.Len(page.Messages, 1)
+		row := page.Messages[0]
+		assertions.Nil(row.ReceivedAt, "received_at")
+		assertions.Nil(row.InternalDate, "internal_date")
+		assertions.Nil(row.DeletedAt, "deleted_at")
+		assertions.Nil(row.DeletedFromSourceAt, "deleted_from_source_at")
+	})
+
+	t.Run("chat message omits subject, snippet, and platform id", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(`{
+			"messages":[{
+				"id":7,
+				"source_id":2,
+				"conversation_id":9,
+				"message_type":"imessage",
+				"size_estimate":0,
+				"has_attachments":false,
+				"attachment_count":0,
+				"content_changed_at":"2026-07-26T10:00:00.731123Z"
+			}],
+			"count":1,
+			"has_more":false,
+			"next_since":"2026-07-26T10:00:00.731123Z",
+			"next_since_id":7,
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":"2026-07-26T10:00:03.114488Z"
+		}`), &page))
+		requirements.NoError(page.Validate(),
+			"chat platforms carry no subject and the store COALESCEs a missing "+
+				"platform id to the empty string")
+		requirements.Len(page.Messages, 1)
+		row := page.Messages[0]
+		assertions.Nil(row.Subject, "subject")
+		assertions.Nil(row.Snippet, "snippet")
+		assertions.Nil(row.SourceMessageID, "source_message_id")
+	})
+
+	t.Run("empty archive page carries no cursor", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(`{
+			"messages":[],
+			"count":0,
+			"has_more":false,
+			"next_since_id":0,
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":"2026-07-26T10:00:03.114488Z"
+		}`), &page))
+		requirements.NoError(page.Validate(),
+			"a first poll of an empty archive has no last row and no request cursor "+
+				"to echo, so next_since is absent")
+		assertions.Empty(page.Messages, "messages")
+		assertions.Nil(page.NextSince, "next_since")
+	})
+
+	t.Run("a missing watermark is still rejected", func(t *testing.T) {
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(liveEmail), &page))
+		requirements.Len(page.Messages, 1)
+		page.Messages[0].ContentChangedAt = ""
+		requirements.Error(page.Validate(),
+			"content_changed_at is the cursor: a row without it cannot be resumed "+
+				"from, so loosening the other fields must not loosen this one")
+		page.Messages[0].ContentChangedAt = "2026-07-26T10:00:00.731123Z"
+		page.ServerTime = ""
+		requirements.Error(page.Validate(),
+			"server_time is always a database clock reading")
+		page.ServerTime = "2026-07-26T10:00:03.114500Z"
+		page.CompleteThrough = ""
+		requirements.Error(page.Validate(),
+			"complete_through tells a consumer how far the feed is caught up; without "+
+				"it a feed held back by an open write transaction is indistinguishable "+
+				"from a caught-up one")
+	})
+}
+
 func TestGeneratedGetAttachmentContentReturnsBinaryBytes(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
