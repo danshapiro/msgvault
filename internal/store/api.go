@@ -1106,6 +1106,247 @@ func (s *Store) getRecipients(ctx context.Context, messageID int64, recipientTyp
 	return recipients, nil
 }
 
+// ChangedMessage is one row of the content-change feed. Every field is a column
+// of `messages`, so what the feed reports is exactly what the
+// content_changed_at watermark covers — see MessagesContentColumns. Labels and
+// recipients live in child tables the watermark does not cover and are
+// deliberately absent: a consumer handed them here would cache them stale
+// forever.
+type ChangedMessage struct {
+	ID                  int64
+	SourceID            int64
+	SourceMessageID     string
+	ConversationID      int64
+	MessageType         string
+	Subject             string
+	Snippet             string
+	SentAt              *time.Time
+	ReceivedAt          *time.Time
+	InternalDate        *time.Time
+	SizeEstimate        int64
+	HasAttachments      bool
+	AttachmentCount     int
+	DeletedAt           *time.Time
+	DeletedFromSourceAt *time.Time
+	ContentChangedAt    time.Time
+}
+
+// ChangedMessagePage is what the feed returns. ServerTime is the DATABASE's
+// clock at query time, for the caller's overlap arithmetic — read from the
+// database, not from the Go process: on PostgreSQL the watermarks come from the
+// database server, and comparing them against a possibly-skewed application
+// clock makes the overlap advice meaningless. It is populated on an empty page
+// too, which is why the feed cannot simply return a slice: a caught-up consumer
+// gets no rows, and there would be nothing left to derive it from.
+//
+// CompleteThrough is the instant the page is complete through: every change
+// committed strictly before it, at or after the requested cursor, is REACHABLE
+// — in this page, or in one of the pages that follow it from this page's
+// cursor. It is a bound on the feed, not a cursor, and the difference matters
+// whenever the page filled: a consumer that resumes from CompleteThrough
+// instead of from the last row's (ContentChangedAt, ID) skips everything
+// between the two. It is the page's upper bound
+// (Dialect.WatermarkBounds.CommitBound), never after ServerTime, and the gap
+// between the two is how long the oldest in-flight write transaction has been
+// open. An empty page carries it too, and that is the point: without it a feed
+// held back by a long transaction is indistinguishable from a caught-up one.
+//
+// A zero CompleteThrough means no bound has been established at all — the store
+// has never yet proved that anything has committed (see
+// SQLiteDialect.ReadWatermarkBounds). Such a page is empty by construction. It
+// is a state, not an instant: do not subtract it from ServerTime.
+type ChangedMessagePage struct {
+	Messages        []ChangedMessage
+	ServerTime      time.Time
+	CompleteThrough time.Time
+}
+
+// changedMessagesQuery is the content-change feed's page query.
+//
+// The lower bound is spelled `>= ? AND (> ? OR id > ?)` rather than the more
+// obvious `> ? OR (= ? AND id > ?)`. The two select identical rows. Measured on
+// SQLite 3.53.2, the OR form planned as a full index walk ("SCAN messages USING
+// INDEX") while the >= form seeked ("SEARCH messages USING INDEX
+// idx_messages_content_changed_at (content_changed_at>?)"); on SQLite 3.45.1
+// both forms seeked. Plans vary by version and by table statistics — the
+// small-table plan is the same either way, which is how the wrong predicate
+// nearly shipped — so this is the form that has never been observed to scan,
+// not a claim about every SQLite.
+//
+// The upper bound is not an optimisation, it is the correctness half: the page
+// stops strictly below the oldest write that could still commit
+// (WatermarkBounds.CommitBound), so the cursor cannot come to rest above a
+// change that is stamped but not yet published. Bounding at the database clock
+// instead — which is what this query used to do — leaves the loss window open,
+// because the clock says which instants have been REACHED and nothing about
+// which are still open for COMMITS. See ListChangedMessages.
+//
+// Single-table by design: no joins, no hydration. See ChangedMessage.
+//
+// No visibility filter (no LiveMessagesWhere): dedup-hidden and source-deleted
+// rows are returned with their timestamps set, because a consumer mirroring the
+// archive must learn about removals — and a row filtered out after the cursor
+// passed it is indistinguishable from the end of a page.
+const changedMessagesQuery = `
+	SELECT id, source_id, COALESCE(source_message_id,''), COALESCE(conversation_id,0),
+	       COALESCE(message_type,''), COALESCE(subject,''), COALESCE(snippet,''),
+	       sent_at, received_at, internal_date, COALESCE(size_estimate,0),
+	       has_attachments, COALESCE(attachment_count,0),
+	       deleted_at, deleted_from_source_at, content_changed_at
+	FROM messages
+	WHERE content_changed_at >= ? AND (content_changed_at > ? OR id > ?)
+	  AND content_changed_at < ?
+	ORDER BY content_changed_at, id
+	LIMIT ?`
+
+// ListChangedMessages returns messages whose content changed at or after the
+// given cursor, in (content_changed_at, id) order, along with the database's
+// current clock reading.
+//
+// The cursor is a composite of both, not a timestamp alone: stamps have
+// millisecond resolution on SQLite and rapid writes share one, so a plain `>`
+// drops rows written in the same instant as the cursor and a plain `>=` returns
+// that instant on every call. Comparing the pair walks the index once.
+//
+// The cursor is bound through Dialect.TimestampParam for both timestamp
+// placeholders. Binding a time.Time straight through is silently wrong on
+// SQLite: the driver serialises it as "2024-03-04 05:06:07+00:00" while the
+// column holds "2024-03-04 05:06:07.000", which sorts BELOW it, so every row
+// sharing the cursor's instant is skipped — only ever visible at page
+// boundaries.
+//
+// The page also stops strictly below the instant returned as CompleteThrough,
+// which is the oldest write that could still commit, NOT the database clock.
+// The distinction is the difference between a feed that loses rows and one that
+// does not. Both backends stamp the watermark when the statement runs and
+// publish the row when its transaction commits, so a change can be stamped in
+// an instant the clock has already left and become visible only later; a page
+// bounded at the clock parks the consumer's cursor above it, and it then fails
+// both arms of the lower bound on every future request. Measured before this
+// bound existed: MarkMessagesDeletedFromReader, which deliberately holds one
+// transaction across a streamed deletion run, lost all 40 of its tombstones on
+// PostgreSQL against a consumer polling the way the handler does; plain
+// autocommit writes lost rows in 3 runs out of 8; and on SQLite a
+// same-millisecond write on a lower id that committed after a page was read was
+// stranded permanently.
+//
+// Bounding below the oldest write that could still commit cannot lose a row,
+// because every uncommitted stamp is at or above the start of the transaction
+// that made it. Two costs come with it. The newest changes wait for the next
+// poll, as before. And the feed stops advancing for as long as any write
+// transaction stays open — a connection left idle in a transaction that has
+// written to the message table holds the bound still. That is why
+// CompleteThrough is on the page and published by the handler: a stalled feed
+// must not look like a caught-up one. A writer connected as a different
+// PostgreSQL role is inside the guarantee too, at the cost of a stall or a
+// refusal rather than a loss (see PostgreSQLDialect.visibilityFloor). What
+// remains outside it (a hard-deleted row, a change to a child table) is set out
+// in docs/api-server.md.
+//
+// A limit of zero or less asks for no rows; that is not an error.
+func (s *Store) ListChangedMessages(
+	ctx context.Context, since time.Time, sinceID int64, limit int,
+) (ChangedMessagePage, error) {
+	if limit <= 0 {
+		// No page was read, so there is nothing a server_time reading could
+		// honestly say about how far the consumer is caught up.
+		return ChangedMessagePage{}, nil
+	}
+
+	// Read the bounds BEFORE the page query, in their own statement (constant
+	// columns on the page query itself would vanish along with the rows on an
+	// empty page). Before, not after: a change committed while the page query
+	// runs may be invisible to that query's snapshot yet carry an earlier
+	// stamp, and a consumer resuming from a reading taken afterwards would skip
+	// it. A reading taken first is never later than the data it accompanies.
+	bounds, err := s.dialect.ReadWatermarkBounds(ctx, s.db.DB)
+	if err != nil {
+		return ChangedMessagePage{}, err
+	}
+
+	cursor := s.dialect.TimestampParam(since)
+	openInstant := s.dialect.TimestampParam(bounds.CommitBound)
+	rows, err := s.db.QueryContext(ctx,
+		changedMessagesQuery, cursor, cursor, sinceID, openInstant, limit)
+	if err != nil {
+		return ChangedMessagePage{}, fmt.Errorf("list changed messages: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	page := ChangedMessagePage{ServerTime: bounds.Now, CompleteThrough: bounds.CommitBound}
+	// The substitute for a watermark the scanner CANNOT read — a format
+	// parseSQLiteTime does not enumerate, which no write path here produces but
+	// direct SQL can. Such a value otherwise arrives as the year-1 zero time,
+	// and a consumer that derives its next cursor from it replays the whole
+	// archive on every poll for good. The row is still reported; its watermark
+	// becomes the newest value the raw column is known to be at least, which is
+	// the cursor the page was read from or the last readable watermark before
+	// it, whichever is later.
+	//
+	// It applies ONLY to the unreadable case. A watermark that scanned fine is
+	// published exactly as stored even when it sorts below the cursor, which is
+	// routine on SQLite: TimestampParam truncates the cursor to the millisecond
+	// the column stores, so a finer cursor selects rows below itself by design.
+	// content_changed_at is a property of the row; flooring it here would make
+	// the same row report different change times to different callers.
+	watermarkFloor := since
+	for rows.Next() {
+		var m ChangedMessage
+		// Every timestamp goes through nullableTimestamp: SQLite hands back
+		// TEXT for values the driver cannot coerce, and sql.NullTime rejects
+		// strings.
+		var sentAt, receivedAt, internalDate nullableTimestamp
+		var deletedAt, deletedFromSourceAt, contentChangedAt nullableTimestamp
+		if err := rows.Scan(
+			&m.ID,
+			&m.SourceID,
+			&m.SourceMessageID,
+			&m.ConversationID,
+			&m.MessageType,
+			&m.Subject,
+			&m.Snippet,
+			&sentAt,
+			&receivedAt,
+			&internalDate,
+			&m.SizeEstimate,
+			&m.HasAttachments,
+			&m.AttachmentCount,
+			&deletedAt,
+			&deletedFromSourceAt,
+			&contentChangedAt,
+		); err != nil {
+			return ChangedMessagePage{}, fmt.Errorf("scan changed message: %w", err)
+		}
+		m.SentAt = optionalTimestamp(sentAt)
+		m.ReceivedAt = optionalTimestamp(receivedAt)
+		m.InternalDate = optionalTimestamp(internalDate)
+		m.DeletedAt = optionalTimestamp(deletedAt)
+		m.DeletedFromSourceAt = optionalTimestamp(deletedFromSourceAt)
+		m.ContentChangedAt = contentChangedAt.Time
+		if !contentChangedAt.Valid {
+			m.ContentChangedAt = watermarkFloor
+		} else if m.ContentChangedAt.After(watermarkFloor) {
+			watermarkFloor = m.ContentChangedAt
+		}
+		page.Messages = append(page.Messages, m)
+	}
+	if err := rows.Err(); err != nil {
+		return ChangedMessagePage{}, fmt.Errorf("iterate changed messages: %w", err)
+	}
+	return page, nil
+}
+
+// optionalTimestamp converts a scanned nullableTimestamp to the pointer form the
+// API structs use, copying the value so the pointer does not alias the scanner
+// reused by the next row.
+func optionalTimestamp(ts nullableTimestamp) *time.Time {
+	if !ts.Valid {
+		return nil
+	}
+	t := ts.Time
+	return &t
+}
+
 func (s *Store) getLabels(ctx context.Context, messageID int64) ([]string, error) {
 	query := `
 		SELECT l.name
