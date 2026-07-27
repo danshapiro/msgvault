@@ -509,6 +509,60 @@ func (c CancelDeletionResponse) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(c))
 }
 
+type ChangedMessageJSON struct {
+	AttachmentCount     int64   `json:"attachment_count"`
+	ContentChangedAt    string  `json:"content_changed_at" validate:"required"`
+	ConversationID      int64   `json:"conversation_id"`
+	DeletedAt           *string `json:"deleted_at,omitempty"`
+	DeletedFromSourceAt *string `json:"deleted_from_source_at,omitempty"`
+	HasAttachments      bool    `json:"has_attachments"`
+	ID                  int64   `json:"id"`
+	InternalDate        *string `json:"internal_date,omitempty"`
+	MessageType         *string `json:"message_type,omitempty"`
+	ReceivedAt          *string `json:"received_at,omitempty"`
+	SentAt              *string `json:"sent_at,omitempty"`
+	SizeEstimate        int64   `json:"size_estimate"`
+	Snippet             *string `json:"snippet,omitempty"`
+	SourceID            int64   `json:"source_id"`
+	SourceMessageID     *string `json:"source_message_id,omitempty"`
+	Subject             *string `json:"subject,omitempty"`
+}
+
+func (c ChangedMessageJSON) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type ChangesResponse struct {
+	CompleteThrough string               `json:"complete_through" validate:"required"`
+	Count           int64                `json:"count"`
+	HasMore         bool                 `json:"has_more"`
+	Messages        []ChangedMessageJSON `json:"messages" validate:"required"`
+	NextSince       *string              `json:"next_since,omitempty"`
+	NextSinceID     int64                `json:"next_since_id"`
+	ServerTime      string               `json:"server_time" validate:"required"`
+}
+
+func (c ChangesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(c.CompleteThrough, "required"); err != nil {
+		errors = errors.Append("CompleteThrough", err)
+	}
+	for i, item := range c.Messages {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Messages[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(c.ServerTime, "required"); err != nil {
+		errors = errors.Append("ServerTime", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type CliAccountResponse struct {
 	DisplayName        string     `json:"display_name" validate:"required"`
 	Email              string     `json:"email" validate:"required"`

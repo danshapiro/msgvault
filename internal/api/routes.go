@@ -340,6 +340,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRoute[AggregateResponse](apiV1, "getAggregates", http.MethodGet, "/aggregates", "Get aggregate rows", s.handleAggregates)
 	registerAPIV1RawHumaJSONRoute[AggregateResponse](apiV1, "getSubAggregates", http.MethodGet, "/aggregates/sub", "Get nested aggregate rows", s.handleSubAggregates)
 	registerAPIV1RawHumaJSONRoute[FilteredMessagesResponse](apiV1, "filterMessages", http.MethodGet, "/messages/filter", "List filtered messages", s.handleFilteredMessages)
+	registerAPIV1RawHumaJSONRoute[ChangesResponse](apiV1, "listChangedMessages", http.MethodGet, "/messages/changes", "List messages whose content changed since a cursor", s.handleMessageChanges)
 	registerAPIV1RawHumaJSONRoute[GmailIDsResponse](apiV1, "getGmailIDsByFilter", http.MethodGet, "/messages/gmail-ids", "List Gmail message IDs matching a filter", s.handleGmailIDsByFilter)
 	registerAPIV1RawHumaJSONRoute[TotalStatsResponse](apiV1, "getTotalStats", http.MethodGet, "/stats/total", "Get aggregate totals", s.handleTotalStats)
 	registerAPIV1RawHumaJSONRoute[FilteredMessagesResponse](apiV1, "searchMessagesByDomains", http.MethodGet, "/search/domains", "Search messages by participant domains", s.handleSearchByDomains)
@@ -611,6 +612,8 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		}, mergeParams(aggregateOptionParams(), messageFilterParams())...)
 	case "filterMessages":
 		return messageFilterParams()
+	case "listChangedMessages":
+		return changesParams()
 	case "getGmailIDsByFilter":
 		return messageFilterParams()
 	case "searchMessagesByDomains":
@@ -746,6 +749,28 @@ func messageFilterParams() []*huma.Param {
 		queryIntegerParam("limit", "Maximum number of rows to return (default and max 500; larger values are clamped)"),
 		queryStringParam("sort", "Sort field: date, size, or subject", false),
 		queryStringParam("direction", "Sort direction: asc or desc", false),
+	}
+}
+
+// changesParams documents the content-change feed's cursor. since and since_id
+// are one composite cursor: rapid writes share a watermark, so the id breaks
+// ties within an instant and neither half is useful alone.
+func changesParams() []*huma.Param {
+	return []*huma.Param{
+		queryStringParam("since",
+			"Watermark cursor (RFC3339, or a plain YYYY-MM-DD date read as midnight UTC). "+
+				"Fractional seconds are significant and preserved; send back the next_since "+
+				"of the previous response verbatim. Omit, or send it empty, to start from "+
+				"the beginning of the archive", false),
+		queryIntegerParam("since_id",
+			"Message ID tiebreak within the same watermark instant; use the next_since_id of the previous response"),
+		// No published minimum/maximum: the handler clamps rather than rejects,
+		// so a range in the schema would make a generated client refuse
+		// requests the server answers with 200 and would contradict this
+		// description. Every other clamping limit in this API is unbounded in
+		// the schema for the same reason.
+		queryIntegerParam("limit",
+			"Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default)"),
 	}
 }
 

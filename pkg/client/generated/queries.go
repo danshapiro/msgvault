@@ -279,6 +279,17 @@ type ListMessagesQuery struct {
 	PageSize *int64 `json:"page_size,omitempty"`
 }
 
+type ListChangedMessagesQuery struct {
+	// Since Watermark cursor (RFC3339, or a plain YYYY-MM-DD date read as midnight UTC). Fractional seconds are significant and preserved; send back the next_since of the previous response verbatim. Omit, or send it empty, to start from the beginning of the archive
+	Since *string `json:"since,omitempty"`
+
+	// SinceID Message ID tiebreak within the same watermark instant; use the next_since_id of the previous response
+	SinceID *int64 `json:"since_id,omitempty"`
+
+	// Limit Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default)
+	Limit *int64 `json:"limit,omitempty"`
+}
+
 type FilterMessagesQuery struct {
 	// Sender Sender email/address filter
 	Sender *string `json:"sender,omitempty"`

@@ -2702,6 +2702,304 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// defaultChangesPageSize is the page size the content-change feed uses when the
+// caller does not ask for one. The hard cap is maxPageSize.
+const defaultChangesPageSize = 100
+
+// changesTimeLayout serialises every timestamp in the content-change feed.
+//
+// It is time.RFC3339Nano where the rest of this package uses time.RFC3339, and
+// the difference is load-bearing rather than stylistic. PostgreSQL stamps
+// content_changed_at with microsecond resolution. Emitting a next_since
+// truncated to whole seconds sends the consumer back with a cursor that sits
+// BELOW the watermark of the page it was just handed, so the same page comes
+// back on the next request, and the one after that: a polling consumer never
+// advances. The cursor a response hands out must round-trip exactly.
+const changesTimeLayout = time.RFC3339Nano
+
+// ChangedMessageJSON is one row of the content-change feed.
+//
+// Every field is a column of `messages` covered by the content_changed_at
+// triggers (see store.MessagesContentColumns), apart from the immutable
+// identity fields and the watermark itself. Labels, recipients, attachment
+// metadata and raw MIME live in child tables the watermark does not cover and
+// are deliberately absent: a consumer handed them here would cache them stale
+// forever.
+//
+// A row is a complete snapshot of the columns listed here, never a patch, so an
+// omitted field means "unset or empty", never "unchanged"; there is nothing for
+// a consumer to merge against. That is what makes `omitempty` safe on the
+// columns that are legitimately NULL (the lifecycle timestamps) or legitimately
+// empty (the strings the page query COALESCEs to ''), and the tag is not
+// cosmetic: a field without it is `required` in the published OpenAPI document,
+// and the generated client's validator reads `required` as present AND
+// non-empty. Declared required, an ordinary chat message with no subject and a
+// live message with no deletion timestamps would be rejected by our own client.
+// Only fields the handler always populates with a non-zero value stay required.
+type ChangedMessageJSON struct {
+	ID                  int64   `json:"id"`
+	SourceID            int64   `json:"source_id"`
+	SourceMessageID     string  `json:"source_message_id,omitempty"`
+	ConversationID      int64   `json:"conversation_id"`
+	MessageType         string  `json:"message_type,omitempty"`
+	Subject             string  `json:"subject,omitempty"`
+	Snippet             string  `json:"snippet,omitempty"`
+	SentAt              *string `json:"sent_at,omitempty"`
+	ReceivedAt          *string `json:"received_at,omitempty"`
+	InternalDate        *string `json:"internal_date,omitempty"`
+	SizeEstimate        int64   `json:"size_estimate"`
+	HasAttachments      bool    `json:"has_attachments"`
+	AttachmentCount     int     `json:"attachment_count"`
+	DeletedAt           *string `json:"deleted_at,omitempty"`
+	DeletedFromSourceAt *string `json:"deleted_from_source_at,omitempty"`
+	ContentChangedAt    string  `json:"content_changed_at"`
+}
+
+// ChangesResponse is one page of the content-change feed.
+//
+// NextSince and NextSinceID are the cursor for the following request. On an
+// empty page they echo the requested cursor unchanged, so a caught-up consumer
+// can send the response straight back as its next request; zero values would
+// restart it from the beginning of the archive on every poll. ServerTime is the
+// database's clock reading, for callers that re-read an overlapping window.
+//
+// NextSince carries `omitempty` because it is empty on the first poll of an
+// archive that has nothing in it — no request cursor to echo and no last row to
+// derive one from — and a `required` string is rejected when empty by the
+// generated client's validator. Messages is `nullable:"false"` because the
+// handler always allocates the slice: a contract that permits null would tell
+// every consumer to guard a case the server cannot produce.
+//
+// CompleteThrough is how far the feed is caught up, which is not the same
+// question as ServerTime and is the one a consumer has to ask. The page stops
+// below the oldest write that could still commit, so while any transaction
+// stays open the feed cannot advance past the instant that transaction began.
+// Without this field that state is byte-identical to being caught up — no rows,
+// has_more false — and a consumer would have no way to tell a quiet archive
+// from a blocked one. A CompleteThrough that stops tracking ServerTime means
+// something is holding a write transaction open. It is a bound, never a cursor:
+// while HasMore is true it stands above rows this response did not carry, and a
+// consumer that resumes from it rather than from NextSince skips them.
+type ChangesResponse struct {
+	Messages        []ChangedMessageJSON `json:"messages" nullable:"false"`
+	Count           int                  `json:"count"`
+	HasMore         bool                 `json:"has_more"`
+	NextSince       string               `json:"next_since,omitempty"`
+	NextSinceID     int64                `json:"next_since_id"`
+	ServerTime      string               `json:"server_time"`
+	CompleteThrough string               `json:"complete_through"`
+}
+
+// handleMessageChanges returns messages whose content changed at or after a
+// cursor, in (content_changed_at, id) order.
+// GET /api/v1/messages/changes?since=2026-07-26T10:00:00.731123Z&since_id=918&limit=100.
+func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
+	// Parameters are validated before the store capability check so a typo is
+	// reported as the 400 it is on every backend, instead of being masked by a
+	// 503 the client cannot act on.
+	since, _, err := queryDate(r, "since")
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	sinceID, _, err := queryInt64(r, "since_id")
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	limit, ok, err := queryInt(r, "limit")
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	// Clamp before the store call, not after: the store treats a non-positive
+	// limit as "no page wanted" and returns without reading the database clock,
+	// which would publish a zero server_time.
+	if !ok || limit <= 0 {
+		limit = defaultChangesPageSize
+	}
+	if limit > maxPageSize {
+		limit = maxPageSize
+	}
+
+	lister, ok := s.store.(ChangedMessageLister)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "feature_unavailable",
+			"The configured store cannot serve the message change feed")
+		return
+	}
+
+	// Fetch one extra row to determine has_more accurately. Comparing the row
+	// count against the limit instead would report a further page whenever a
+	// page happened to fill exactly, sending every caught-up consumer round
+	// again.
+	page, err := lister.ListChangedMessages(r.Context(), since, sinceID, limit+1)
+	if err != nil {
+		if s.writeIfContextError(w, err) {
+			return
+		}
+		s.logger.Error("changed messages query failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Message change query failed")
+		return
+	}
+
+	rows := page.Messages
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+
+	messages := make([]ChangedMessageJSON, len(rows))
+	for i, m := range rows {
+		messages[i] = toChangedMessageJSON(m)
+	}
+
+	cursor, nextSinceID := since, sinceID
+	switch {
+	case len(rows) > 0:
+		// The cursor is floored at the one the caller sent. A row whose stored
+		// watermark cannot be read comes back as the zero time, and publishing
+		// that would send the consumer back to year 1 — an archive replay on
+		// every poll, forever. The store floors it too; this is the layer that
+		// makes the published contract independent of any store's scan.
+		last := rows[len(rows)-1]
+		cursor = last.ContentChangedAt
+		if cursor.Before(since) {
+			cursor = since
+		}
+		nextSinceID = last.ID
+	case cursor.After(page.ServerTime):
+		// An empty page normally echoes the request's own cursor, so a consumer
+		// polling an idle feed holds its place instead of replaying the archive.
+		// Echoing a cursor ABOVE the database clock would instead wedge that
+		// consumer permanently: the page query stops strictly below the clock,
+		// so the request is unsatisfiable and answers 200 / count=0 /
+		// has_more=false — indistinguishable from "caught up" — on every poll
+		// while the archive changes underneath it, and the echo hands the same
+		// cursor back so it never heals. A clock stepped backwards (NTP, a
+		// resumed VM, a restore onto slower hardware) or a client that builds
+		// its own cursor gets there. Clamping to the clock reading returns the
+		// consumer to the normal regime on the next poll. The id tiebreak goes
+		// with it: it belonged to a different instant, and re-delivering the
+		// start of this one is allowed by the delivery contract while losing it
+		// is not.
+		cursor = page.ServerTime
+		nextSinceID = 0
+	}
+	nextSince := ""
+	if !cursor.IsZero() {
+		nextSince = cursor.UTC().Format(changesTimeLayout)
+	}
+
+	s.logIfChangeFeedStalled(page.ServerTime, page.CompleteThrough)
+
+	writeJSON(w, http.StatusOK, ChangesResponse{
+		Messages:        messages,
+		Count:           len(messages),
+		HasMore:         hasMore,
+		NextSince:       nextSince,
+		NextSinceID:     nextSinceID,
+		ServerTime:      page.ServerTime.UTC().Format(changesTimeLayout),
+		CompleteThrough: page.CompleteThrough.UTC().Format(changesTimeLayout),
+	})
+}
+
+// changesStallThreshold is how far complete_through may fall behind server_time
+// before the feed is reported as stalled rather than merely lagging. The gap is
+// the age of the oldest open write transaction, and a healthy one is
+// milliseconds; a minute means something is sitting idle inside a transaction
+// and the feed has stopped advancing for everyone.
+const changesStallThreshold = time.Minute
+
+// changesStallLogInterval throttles the stall WARN. Consumers poll, so the
+// condition is re-observed on every request for as long as it lasts.
+const changesStallLogInterval = time.Minute
+
+// logIfChangeFeedStalled reports a change feed that has stopped advancing. The
+// response says so too (complete_through), but a stalled feed is an operator
+// problem — some connection is holding a write transaction open — and the
+// operator is reading logs, not someone else's polling responses.
+//
+// A zero complete_through is a different condition wearing the same clothes:
+// the store has no bound at all yet, rather than one that stopped moving. On
+// SQLite that is a server whose every attempt to catch the database with its
+// write lock free has so far been beaten by a writer — a restart during a bulk
+// import. The page is honest (complete through nothing, so no rows and no
+// cursor movement), but the arithmetic is not: serverTime.Sub(zero) overflows
+// int64 nanoseconds and saturates, so the lag would be reported as
+// 2562047h47m16s, which reads as a broken clock rather than a young server. It
+// gets its own cause and no lag figure, because there is no lag to report.
+func (s *Server) logIfChangeFeedStalled(serverTime, completeThrough time.Time) {
+	if completeThrough.IsZero() {
+		if s.claimChangesStallLog() {
+			s.logger.Warn("message change feed is not advancing",
+				"lag", "unknown",
+				"complete_through", "none",
+				"server_time", serverTime.UTC().Format(changesTimeLayout),
+				"cause", "no commit bound has been established yet: a write transaction "+
+					"has been open on every attempt since this server started, so the "+
+					"feed cannot say that anything has committed")
+		}
+		return
+	}
+	lag := serverTime.Sub(completeThrough)
+	if lag < changesStallThreshold {
+		return
+	}
+	if !s.claimChangesStallLog() {
+		return
+	}
+	s.logger.Warn("message change feed is not advancing",
+		"lag", lag.Round(time.Second).String(),
+		"complete_through", completeThrough.UTC().Format(changesTimeLayout),
+		"server_time", serverTime.UTC().Format(changesTimeLayout),
+		"cause", "a write transaction has been open for at least that long; "+
+			"the feed cannot publish past the instant it began")
+}
+
+// claimChangesStallLog reports whether this observation of the stall is the one
+// that gets logged. Consumers poll, so the condition is re-observed on every
+// request for as long as it lasts.
+func (s *Server) claimChangesStallLog() bool {
+	now := time.Now()
+	last := s.changesStallLoggedAt.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < changesStallLogInterval {
+		return false
+	}
+	return s.changesStallLoggedAt.CompareAndSwap(last, now.UnixNano())
+}
+
+func toChangedMessageJSON(m store.ChangedMessage) ChangedMessageJSON {
+	return ChangedMessageJSON{
+		ID:                  m.ID,
+		SourceID:            m.SourceID,
+		SourceMessageID:     m.SourceMessageID,
+		ConversationID:      m.ConversationID,
+		MessageType:         m.MessageType,
+		Subject:             m.Subject,
+		Snippet:             m.Snippet,
+		SentAt:              changesTimePtr(m.SentAt),
+		ReceivedAt:          changesTimePtr(m.ReceivedAt),
+		InternalDate:        changesTimePtr(m.InternalDate),
+		SizeEstimate:        m.SizeEstimate,
+		HasAttachments:      m.HasAttachments,
+		AttachmentCount:     m.AttachmentCount,
+		DeletedAt:           changesTimePtr(m.DeletedAt),
+		DeletedFromSourceAt: changesTimePtr(m.DeletedFromSourceAt),
+		ContentChangedAt:    m.ContentChangedAt.UTC().Format(changesTimeLayout),
+	}
+}
+
+// changesTimePtr formats an optional timestamp for the change feed, preserving
+// the null so a consumer can distinguish an unset column from an epoch value.
+func changesTimePtr(value *time.Time) *string {
+	if value == nil {
+		return nil
+	}
+	formatted := value.UTC().Format(changesTimeLayout)
+	return &formatted
+}
+
 func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")

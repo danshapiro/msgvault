@@ -620,6 +620,82 @@ components:
         - id
         - status
       type: object
+    ChangedMessageJSON:
+      properties:
+        attachment_count:
+          format: int64
+          type: integer
+        content_changed_at:
+          type: string
+        conversation_id:
+          format: int64
+          type: integer
+        deleted_at:
+          type: string
+        deleted_from_source_at:
+          type: string
+        has_attachments:
+          type: boolean
+        id:
+          format: int64
+          type: integer
+        internal_date:
+          type: string
+        message_type:
+          type: string
+        received_at:
+          type: string
+        sent_at:
+          type: string
+        size_estimate:
+          format: int64
+          type: integer
+        snippet:
+          type: string
+        source_id:
+          format: int64
+          type: integer
+        source_message_id:
+          type: string
+        subject:
+          type: string
+      required:
+        - id
+        - source_id
+        - conversation_id
+        - size_estimate
+        - has_attachments
+        - attachment_count
+        - content_changed_at
+      type: object
+    ChangesResponse:
+      properties:
+        complete_through:
+          type: string
+        count:
+          format: int64
+          type: integer
+        has_more:
+          type: boolean
+        messages:
+          items:
+            $ref: "#/components/schemas/ChangedMessageJSON"
+          type: array
+        next_since:
+          type: string
+        next_since_id:
+          format: int64
+          type: integer
+        server_time:
+          type: string
+      required:
+        - messages
+        - count
+        - has_more
+        - next_since_id
+        - server_time
+        - complete_through
+      type: object
     CliAccountResponse:
       properties:
         display_name:
@@ -4272,7 +4348,7 @@ components:
       type: apiKey
 info:
   title: msgvault API
-  version: 1.31.0
+  version: 1.32.0
 openapi: 3.0.3
 paths:
   /api/ping:
@@ -7092,6 +7168,45 @@ paths:
       security:
         - apiKey: []
       summary: List messages
+      tags:
+        - API
+  /api/v1/messages/changes:
+    get:
+      operationId: listChangedMessages
+      parameters:
+        - description: Watermark cursor (RFC3339, or a plain YYYY-MM-DD date read as midnight UTC). Fractional seconds are significant and preserved; send back the next_since of the previous response verbatim. Omit, or send it empty, to start from the beginning of the archive
+          in: query
+          name: since
+          schema:
+            type: string
+        - description: Message ID tiebreak within the same watermark instant; use the next_since_id of the previous response
+          in: query
+          name: since_id
+          schema:
+            format: int64
+            type: integer
+        - description: Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangesResponse"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List messages whose content changed since a cursor
       tags:
         - API
   /api/v1/messages/filter:

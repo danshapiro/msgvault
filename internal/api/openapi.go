@@ -147,7 +147,14 @@ import (
 // (any rank), and total_count reports the matched-row count (0 or 1). Clients
 // use it to hydrate a selected group without paging the ranked listing.
 // Additive (minor bump): omitting the field preserves the ranked listing.
-const APISchemaVersion = "1.31.0"
+// 1.32.0 adds GET /api/v1/messages/changes: a keyset feed over the
+// content_changed_at watermark that lets a consumer re-read the messages whose
+// content changed since its last poll, including hidden and source-deleted
+// rows. The (since, since_id) cursor and the server_time reading are serialised
+// with full sub-second precision, and an empty page echoes the requested cursor
+// so an idle consumer holds its place. Stores that cannot answer the watermark
+// query report 503 feature_unavailable. Additive (minor bump): a new path only.
+const APISchemaVersion = "1.32.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.

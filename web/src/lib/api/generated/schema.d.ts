@@ -1100,6 +1100,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/messages/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List messages whose content changed since a cursor */
+        get: operations["listChangedMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/messages/filter": {
         parameters: {
             query?: never;
@@ -2008,6 +2025,44 @@ export interface components {
         CancelDeletionResponse: {
             id: string;
             status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ChangedMessageJSON: {
+            /** Format: int64 */
+            attachment_count: number;
+            content_changed_at: string;
+            /** Format: int64 */
+            conversation_id: number;
+            deleted_at?: string;
+            deleted_from_source_at?: string;
+            has_attachments: boolean;
+            /** Format: int64 */
+            id: number;
+            internal_date?: string;
+            message_type?: string;
+            received_at?: string;
+            sent_at?: string;
+            /** Format: int64 */
+            size_estimate: number;
+            snippet?: string;
+            /** Format: int64 */
+            source_id: number;
+            source_message_id?: string;
+            subject?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ChangesResponse: {
+            complete_through: string;
+            /** Format: int64 */
+            count: number;
+            has_more: boolean;
+            messages: components["schemas"]["ChangedMessageJSON"][];
+            next_since?: string;
+            /** Format: int64 */
+            next_since_id: number;
+            server_time: string;
         } & {
             [key: string]: unknown;
         };
@@ -6923,6 +6978,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MessageListResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listChangedMessages: {
+        parameters: {
+            query?: {
+                /** @description Watermark cursor (RFC3339, or a plain YYYY-MM-DD date read as midnight UTC). Fractional seconds are significant and preserved; send back the next_since of the previous response verbatim. Omit, or send it empty, to start from the beginning of the archive */
+                since?: string;
+                /** @description Message ID tiebreak within the same watermark instant; use the next_since_id of the previous response */
+                since_id?: number;
+                /** @description Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangesResponse"];
                 };
             };
             /** @description Error */
