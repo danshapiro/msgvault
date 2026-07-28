@@ -269,6 +269,13 @@ See "What this feed does not report" below for the full list.
 | `since_id` | int | `0` | Message ID tiebreak within the same watermark instant |
 | `limit` | int | `100` | Maximum rows to return; capped at 500. Values below 1 fall back to the default |
 
+> **Polling cost.** On the SQLite backend each request briefly takes the
+> database *write* lock to establish how far writes have committed, so unlike an
+> ordinary read it competes with an in-progress import. Poll on an interval —
+> once a second is a safe starting interval — and drain a backlog with `has_more` rather than a
+> tighter poll. A consumer polling flat-out alongside an active import measurably
+> slows the writer. PostgreSQL establishes the same bound without taking a lock.
+
 `since` and `since_id` are one composite cursor. Many messages can share a
 watermark — a sync writes them in the same instant — so the ID breaks ties
 within that instant and neither half is useful on its own. Always send back the

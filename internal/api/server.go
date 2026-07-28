@@ -115,9 +115,12 @@ type ChangedMessageLister interface {
 	ListChangedMessages(ctx context.Context, since time.Time, sinceID int64, limit int) (store.ChangedMessagePage, error)
 }
 
-// The production store must satisfy the optional interface. Without this
-// assertion a drifting signature would compile fine and the route would report
-// itself unavailable in production while every test using a real store passed.
+// The store implementation must satisfy the optional interface. This guards the
+// store side of the contract only: the daemon passes cmd.storeAPIAdapter, not
+// *store.Store, so the assertion that actually protects the production route is
+// the one beside that adapter in cmd/msgvault/cmd/serve.go, which is a non-test
+// file and so fails the build rather than a test run. An end-to-end test drives
+// the route through the adapter in cmd/msgvault/cmd/changes_api_e2e_test.go.
 var _ ChangedMessageLister = (*store.Store)(nil)
 
 // SourceStatusStore defines the source/sync read operations used by the
