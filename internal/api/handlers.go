@@ -2939,9 +2939,22 @@ func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
 
 // changesStallThreshold is how far complete_through may fall behind server_time
 // before the feed is reported as stalled rather than merely lagging. The gap is
-// the age of the oldest open write transaction, and a healthy one is
-// milliseconds; a minute means something is sitting idle inside a transaction
-// and the feed has stopped advancing for everyone.
+// how long ago the newest instant everything below which is proved committed
+// falls, and a healthy one is milliseconds; a minute means the feed has stopped
+// advancing for everyone.
+//
+// What the gap measures differs by backend, which matters when reading the
+// number rather than the threshold. On PostgreSQL the bound is the start of the
+// oldest write transaction still open on the message table, so the gap IS that
+// transaction's age (while another role's connection is hidden it is instead
+// the last reading taken with every writer visible — see
+// PostgreSQLDialect.visibilityFloor). On SQLite nothing exposes when another
+// connection's transaction began; the bound is the last instant the database was
+// caught with its write lock free, so the gap is the age of that proof. A writer
+// IS in flight whenever this fires — a probe that succeeds sets the bound to now
+// — but it may have started a moment ago and merely be the first writer to
+// collide with a probe since, and every stretch in which nothing polled this
+// endpoint counts toward the gap as well.
 const changesStallThreshold = time.Minute
 
 // changesStallLogInterval throttles the stall WARN. Consumers poll, so the
@@ -2986,8 +2999,12 @@ func (s *Server) logIfChangeFeedStalled(serverTime, completeThrough time.Time) {
 		"lag", lag.Round(time.Second).String(),
 		"complete_through", completeThrough.UTC().Format(changesTimeLayout),
 		"server_time", serverTime.UTC().Format(changesTimeLayout),
-		"cause", "a write transaction has been open for at least that long; "+
-			"the feed cannot publish past the instant it began")
+		"cause", "a write transaction on the message table is open and the feed "+
+			"cannot publish past the instant it began. On PostgreSQL the lag is "+
+			"that transaction's own age. On SQLite the transaction's start is "+
+			"unknowable, so the lag is the age of the last proof that the database "+
+			"was quiescent: a writer that started a moment ago reports the whole "+
+			"gap since that proof, including time in which nothing polled this feed")
 }
 
 // claimChangesStallLog reports whether this observation of the stall is the one

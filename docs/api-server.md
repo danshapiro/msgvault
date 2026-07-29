@@ -500,6 +500,19 @@ advancing`, with the lag) once a minute while the condition lasts. A normal batc
 write causes a gap for as long as the batch runs and then closes it; that is the
 mechanism working, not a fault.
 
+Read the gap as "how stale the bound is", not as "how long that transaction has
+been open" — the two are the same number only on PostgreSQL. There the bound is
+the open transaction's own start time, so the gap is its age. SQLite has no way
+to ask when another connection's transaction began; its bound is the last moment
+the server caught the database with the write lock free, so the gap measures the
+age of that observation. A writer is genuinely in flight whenever the gap is
+open — the server takes a fresh reading on every request, and one that succeeds
+closes the gap — but on SQLite that writer may have started seconds ago and
+still show a gap of hours, because time in which nothing polled the endpoint is
+time in which no reading was taken. So on SQLite the gap is an upper bound on
+the current writer's age, not a measurement of it; on PostgreSQL it is the
+measurement.
+
 **What is still best-effort.** This list is the canonical one: every exception to
 the guarantee above is here, and no other passage in this document or in the
 source enumerates them. The feed does not promise that a change reaches a

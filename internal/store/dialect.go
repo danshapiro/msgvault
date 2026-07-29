@@ -53,11 +53,18 @@ type ColumnMigration struct {
 // exception that bears on CommitBound and deliberately does not restate the
 // list, because a list kept in two places drifts.
 //
-// CommitBound is never after Now, and it lags Now by however long the oldest
-// in-flight write transaction has been open. That lag is the feature's cost:
-// while a connection sits idle inside a transaction, the feed stops advancing.
-// It is published (complete_through) so a stalled feed does not look like a
-// caught-up one.
+// CommitBound is never after Now, and while a write transaction is in flight it
+// lags Now. That lag is the feature's cost: while a connection sits idle inside
+// a transaction, the feed stops advancing. It is published (complete_through)
+// so a stalled feed does not look like a caught-up one.
+//
+// The lag is the oldest in-flight write transaction's own age on PostgreSQL,
+// which can read xact_start. SQLite cannot: its bound is the last instant the
+// database was caught with its write lock free, so the lag there is the age of
+// that proof, and a writer that started a moment ago inherits however long it
+// had been since a probe last succeeded — including any stretch in which
+// nothing read the bound at all. The two are not interchangeable when reading
+// the number; see each dialect's ReadWatermarkBounds.
 //
 // A ZERO CommitBound is not an instant and no lag can be derived from it: it
 // means no bound has been established at all, so nothing is known to have

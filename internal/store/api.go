@@ -1149,9 +1149,12 @@ type ChangedMessage struct {
 // instead of from the last row's (ContentChangedAt, ID) skips everything
 // between the two. It is the page's upper bound
 // (Dialect.WatermarkBounds.CommitBound), never after ServerTime, and the gap
-// between the two is how long the oldest in-flight write transaction has been
-// open. An empty page carries it too, and that is the point: without it a feed
-// held back by a long transaction is indistinguishable from a caught-up one.
+// between the two is how stale the bound is — the oldest in-flight write
+// transaction's own age on PostgreSQL, and on SQLite the age of the last proof
+// that the database was quiescent, which is an upper bound on that age rather
+// than a measurement of it (see WatermarkBounds). An empty page carries the
+// bound too, and that is the point: without it a feed held back by a long
+// transaction is indistinguishable from a caught-up one.
 //
 // A zero CompleteThrough means no bound has been established at all — the store
 // has never yet proved that anything has committed (see

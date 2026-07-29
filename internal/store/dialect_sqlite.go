@@ -100,6 +100,11 @@ const sqliteQuiescentProbeTimeout = 250 * time.Millisecond
 // and it is why the instant is remembered rather than recomputed: the fallback
 // is the whole liveness story on SQLite. The feed then stops advancing until
 // the writer finishes, and says so through the lag between CommitBound and Now.
+// That lag is the age of the last successful probe, NOT the age of the writer
+// in flight: probes run only when something reads the bound, so a writer that
+// started a moment ago inherits the whole gap since the last quiet reading. It
+// is an upper bound on the writer's age, which is the safe direction, but it is
+// not a measurement of it — unlike PostgreSQL's, which reads xact_start.
 //
 // A fresh dialect that has never completed a probe reports the zero time, so
 // the feed publishes nothing until it first sees the database idle. That is the
