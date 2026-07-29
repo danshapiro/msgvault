@@ -255,13 +255,22 @@ imported today with ten-year-old mail shows up in the very next page. Messages
 hidden by deduplication and messages deleted at the source are included, with
 their `deleted_at` and `deleted_from_source_at` timestamps set.
 
-**The fields in the feed's own rows are the whole of what it tracks.** The
-watermark moves for changes to those fields and for message-body edits; nothing
-else moves it. You may fetch `/api/v1/messages/{id}` for a message the feed
-names, but treat anything that comes back beyond the feed's own fields — labels,
-recipients, attachment metadata, raw MIME, storage paths, read state, threading
-pointers, conversation titles — as a snapshot the feed will never invalidate.
-See "What this feed does not report" below for the full list.
+**Every field in the feed's rows that can change moves the watermark, and two
+columns beyond them do too.** The watermark moves for changes to the mutable
+fields the feed returns; for message-body edits; and for two columns the feed
+does not return — the sender pointer (`messages.sender_id`; not the sender
+identity a consumer sees, which is resolved from `participants` — see the table
+below) and the platform metadata payload — because changing either means the
+message is worth re-reading. It never moves for anything else. Three fields in
+a feed row are outside it by nature rather than by omission: `id` and
+`source_id` are immutable identity, and `content_changed_at` is the watermark
+itself. The asymmetry is deliberate and errs in the safe direction: an extra
+wake-up costs a redundant re-read, while a missing one would leave a consumer
+stale without knowing it. You may fetch `/api/v1/messages/{id}` for a message
+the feed names, but treat anything that comes back beyond the feed's own fields
+— labels, recipients, attachment metadata, raw MIME, storage paths, read state,
+threading pointers, conversation titles — as a snapshot the feed will never
+invalidate. See "What this feed does not report" below for the full list.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -665,8 +674,9 @@ of a cursor the feed handed you, never out of `complete_through`.
 #### What this feed does not report {#what-this-feed-does-not-report}
 
 The watermark is maintained by triggers on the `messages` table and on message
-bodies, and the trigger on `messages` is scoped to the columns the feed itself
-returns. Everything else a message has — including other columns of `messages` —
+bodies. The trigger on `messages` covers every column the feed returns, plus the
+sender pointer and the platform metadata payload, which it does not return.
+Everything else a message has — including the remaining columns of `messages` —
 is outside it:
 
 | Surface | Where it lives | Does changing it move the message into the feed? |
@@ -678,7 +688,10 @@ is outside it:
 | Read state and platform flags (`is_read`, `read_at`, `is_edited`, `archived_at`) | `messages` | No |
 | Threading and identity pointers (`reply_to_message_id`, `rfc822_message_id`) | `messages` | No |
 | Conversation metadata (thread title) | `conversations` | No |
-| Message body | `message_bodies` | Yes — a body edit moves the watermark, but the feed reports only `snippet`; fetch the body from `/api/v1/messages/{id}` |
+| Message body | `message_bodies` | Yes for an added or edited body (see the deletion row below), but the feed reports only `snippet`; fetch the body from `/api/v1/messages/{id}` |
+| Message body deletion | `message_bodies` | No — the body triggers fire on INSERT and UPDATE only. Adding or editing a body moves the watermark; deleting one does not |
+| Sender *pointer* (`messages.sender_id`) | `messages` | Yes — but the feed does not return it, and only the pointer is tracked. Renaming or correcting the participant it points at changes `participants`, not `sender_id`, so it does **not** move the watermark |
+| Platform metadata payload (`metadata`) | `messages` | Yes — but no endpoint returns it, so the wake-up is all you get. It is tracked so that a metadata change still invalidates your cached copy of the fields that *are* returned |
 
 A consumer that caches any of the untracked surfaces has to refresh them on its
 own schedule; nothing in this feed will invalidate them. This is why the feed

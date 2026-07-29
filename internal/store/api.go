@@ -1107,11 +1107,13 @@ func (s *Store) getRecipients(ctx context.Context, messageID int64, recipientTyp
 }
 
 // ChangedMessage is one row of the content-change feed. Every field is a column
-// of `messages`, so what the feed reports is exactly what the
-// content_changed_at watermark covers — see MessagesContentColumns. Labels and
-// recipients live in child tables the watermark does not cover and are
-// deliberately absent: a consumer handed them here would cache them stale
-// forever.
+// of `messages`, but the feed's fields and the watermark's columns are not the
+// same set: sender_id and metadata move the watermark without appearing here,
+// and id, source_id and content_changed_at appear here without moving it — the
+// first two are immutable identity and the third is the watermark itself. See
+// MessagesContentColumns. Labels and recipients live in child tables the
+// watermark does not cover and are deliberately absent: a consumer handed them
+// here would cache them stale forever.
 type ChangedMessage struct {
 	ID                  int64
 	SourceID            int64
