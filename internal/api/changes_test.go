@@ -678,8 +678,9 @@ func TestChangesEndpoint_UnreadableWatermarkDoesNotRewindTheCursor(t *testing.T)
 		"next_since must be floored at the requested cursor, never rewound to the "+
 			"zero time")
 	assert.Equal(int64(42), resp.NextSinceID,
-		"next_since_id still comes from the last row, so the consumer advances "+
-			"past it instead of being handed its own request back")
+		"next_since_id still comes from the last row, so flooring next_since back "+
+			"to the requested cursor does not also hand back the requested "+
+			"since_id of 7")
 }
 
 // seedSparseChangedMessages inserts the two shapes whose JSON is mostly holes:

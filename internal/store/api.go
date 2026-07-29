@@ -1293,17 +1293,37 @@ func (s *Store) ListChangedMessages(
 	// instead.
 	//
 	// The fixpoint is NOT permanent, and the difference matters to anyone
-	// reading a report of one. Every later stamp sorts above the unreadable
-	// value — it had to sort below this page's bound to be selected at all, and
-	// the bound only moves forward — so the next change to a tracked column
-	// anywhere in the archive joins the repeating page as a readable last row
-	// and moves the cursor past the unreadable one for good. It lasts as long
-	// as the archive is otherwise quiet. Measured on SQLite: from a frozen
-	// cursor, one insert turned the page from [malformed] into
-	// [malformed, new], the cursor advanced to the new row, and the malformed
-	// row never came back. The exception is a page already full when it reaches
-	// the unreadable row, which has no room for the newer one — a limit of 1
-	// always is, and stays frozen (measured).
+	// reading a report of one. Every stamp written after this page's reading
+	// sorts above the unreadable value: the value had to sort below this page's
+	// bound to be selected at all, and the bound is never above the clock the
+	// next stamp is read from (ReadWatermarkBounds caps CommitBound at Now). So
+	// the next change to a tracked column anywhere in the archive joins the
+	// repeating page as a readable last row and moves the cursor past the
+	// unreadable one for good. It lasts as long as the archive is otherwise
+	// quiet. Measured on SQLite: from a frozen cursor, one insert turned the
+	// page from [malformed] into [malformed, new], the cursor advanced to the
+	// new row, and the malformed row never came back.
+	//
+	// What that argument deliberately does NOT rest on is the bound moving only
+	// forward. It does not, on SQLite — the only backend where an unreadable
+	// watermark can exist. SQLiteDialect.ReadWatermarkBounds keeps the most
+	// recent quiescent probe rather than the greatest (the greatest would stand
+	// above stamps taken after a backwards clock step), and caps the published
+	// bound at the current clock, so a clock that steps backwards steps the
+	// bound down with it. That cannot keep this row trapped either: a bound
+	// that has dropped below the unreadable value stops selecting the row at
+	// all, which is the second unparseable-watermark case in
+	// docs/api-server.md's delivery contract — a change hidden outright rather
+	// than a page that repeats. While the row is still returned, the bound is
+	// still above its stored value and the argument above holds.
+	//
+	// The exception is a page already full when it reaches the unreadable row,
+	// which has no room for the newer one. Above a limit of 1 that condition
+	// clears itself as soon as the page carries one readable row ahead of the
+	// unreadable one: the cursor moves up to that row's watermark, so the
+	// unreadable row returns at the head of the next page with room behind it.
+	// A limit of 1 has no room for a readable row ahead of it, is full at the
+	// unreadable row on every poll, and stays frozen (measured).
 	//
 	// Whether such a row is selected at all is decided by where its RAW stored
 	// value orders against this page's two bounds, not by whether Go can parse

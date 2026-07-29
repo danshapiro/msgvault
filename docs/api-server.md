@@ -553,10 +553,10 @@ there are surfaces it cannot see at all:
 * **A `NULL` watermark is invisible to the feed, on either backend.** The page
   compares `content_changed_at` against both of its bounds, and a `NULL`
   satisfies neither, so the row is not returned from any cursor. No write path
-  produces one — every writer stamps the column, the schema defaults it, and the
-  first-run backfill fills in a database that predates it — so this takes direct
-  SQL as well, and whatever content change the same statement made goes
-  unreported with it. The triggers are null-safe about this: the next ordinary
+  produces one — every writer stamps the column, a SQLite database created from
+  `schema.sql` also defaults it, and the first-run backfill fills in a database
+  that predates it — so this takes direct SQL as well, and whatever content
+  change the same statement made goes unreported with it. The triggers are null-safe about this: the next ordinary
   change to one of the row's tracked columns stamps a fresh watermark, and the
   row rejoins the feed carrying its current content. If no such change ever
   comes, it stays invisible.
@@ -581,11 +581,14 @@ there are surfaces it cannot see at all:
      a tracked column anywhere in the archive. That change is stamped above the
      malformed value, so it joins the very next page, and being readable and
      last it carries the cursor past the malformed row for good. So the stall
-     lasts exactly as long as the rest of the archive stays quiet. The one
-     exception is a page that is already full when it reaches the malformed row,
-     which has no room to carry the newer row alongside it: a consumer polling
-     with `limit=1` is always in that position and stays stuck however busy the
-     archive is.
+     lasts exactly as long as the rest of the archive stays quiet. A page that
+     is already full when it reaches the malformed row has no room to carry the
+     newer row alongside it — but above `limit=1` that is one poll's delay, not
+     a standing exception: the cursor moves up to the last readable row ahead of
+     the malformed one, so the malformed row comes back at the *head* of the
+     next page with room behind it. A consumer polling with `limit=1` has no
+     room for a readable row ahead of it, is in that position on every poll, and
+     stays stuck however busy the archive is.
   2. **Text or a blob ordering at or above the bound.** Not returned at all, for
      as long as the bound stays below it — see the bullet on a stamp at or above
      the bound. A blob sorts
