@@ -322,8 +322,12 @@ present are `id`, `source_id`, `conversation_id`, `size_estimate`,
 always an array, never `null`. `next_since` is absent when there is no cursor to
 publish: you sent none — or sent one that parsed to the zero time
 (`0001-01-01T00:00:00Z`), which means the same thing here — and the page did not
-produce one either, because it came back empty or because the last row's stored
-watermark could not be read (see [Delivery contract](#delivery-contract)).
+produce one either, because it came back empty or because not one row on it
+carried a readable stored watermark (see
+[Delivery contract](#delivery-contract)). A single unreadable watermark does not
+suppress the cursor by itself: the cursor is published from the highest readable
+watermark the page reached, so one readable row anywhere earlier on the page is
+enough to produce a `next_since`.
 
 `server_time` is the database server's clock at the moment the page was read,
 not the client's and not the daemon process's. `has_more` reports whether more
@@ -368,8 +372,10 @@ empty page the response normally echoes the cursor you sent, but a cursor above
 the database clock is clamped down to `complete_through` — the point the feed is
 provably caught up to — and its `next_since_id` reset to `0`. Clamping to the
 clock instead could place your cursor above a change that was stamped but had not
-yet committed, which would lose it; the bound cannot. Such a cursor matches
-nothing, and echoing it would leave you polling a feed that answers "caught up"
+yet committed, which would lose it; the bound cannot do that to any write it can
+see, and the writes it cannot see are named in the
+[delivery contract](#delivery-contract). Such a cursor matches nothing, and
+echoing it would leave you polling a feed that answers "caught up"
 forever while the archive changes; clamping puts you back in range on the next
 poll at the cost of re-delivering a little.
 
@@ -435,23 +441,24 @@ archive.
 
 #### Delivery contract {#delivery-contract}
 
-**What the feed guarantees.** Except in the two cases named below, every change
-to a tracked column that commits before a page's `complete_through` is delivered
-by following `next_since` from that page, in as many further pages as `has_more`
-calls for. A change written the ordinary way — through the application, with the
-watermark left to the database triggers — is not skipped over, however long its
-writing transaction took. The two exceptions are a PostgreSQL prepared
-transaction, which the bound cannot see, and a watermark written explicitly by
-direct SQL, which the triggers deliberately yield to and which the feed cannot
-order if it does not parse. Both are in the best-effort list below. That is what
-`complete_through` is for: the page stops below the oldest write that could
-still commit, not below the clock, so the cursor cannot come to rest above a
-change that has been stamped but not yet published — except one stamped inside a
-prepared transaction, whose start the bound cannot see. The guarantee is about
-the cursor, not about any single response: keep following `next_since` and
-nothing outside the best-effort list below is lost; substitute
-`complete_through` for it and the rows between it and `next_since` are lost as
-well.
+**What the feed guarantees.** A change to a tracked column, written the ordinary
+way — through the application, with the watermark left to the database triggers —
+is delivered by following `next_since`, in as many further pages as `has_more`
+calls for, however long its writing transaction took. Delivery is at least once:
+re-delivering a change is allowed, losing one is not.
+
+**Every exception to that sentence is in "What is still best-effort" below.**
+That list is the complete one and the only place that enumerates them; every
+other passage in this document and in the source points here instead of
+restating it. Read it rather than inferring the boundary from anywhere else.
+
+`complete_through` is what makes the guarantee hold: the page stops below the
+oldest write that could still commit, not below the clock, so — for every write
+the bound can see — the cursor cannot come to rest above a change that has been
+stamped but not yet published. The guarantee is about the cursor, not about any
+single response: keep following `next_since` and nothing outside the exception
+list is lost; substitute `complete_through` for it and the rows between it and
+`next_since` are lost as well.
 
 **What it costs.** The feed cannot advance past the start of any open
 transaction that has written to the message table. A batch import, a
@@ -472,8 +479,11 @@ advancing`, with the lag) once a minute while the condition lasts. A normal batc
 write causes a gap for as long as the batch runs and then closes it; that is the
 mechanism working, not a fault.
 
-**What is still best-effort.** The feed does not promise that a change reaches a
-consumer only once, and there are surfaces it cannot see at all:
+**What is still best-effort.** This list is the canonical one: every exception to
+the guarantee above is here, and no other passage in this document or in the
+source enumerates them. The feed does not promise that a change reaches a
+consumer only once, it does not promise that a change reaches one promptly, and
+there are surfaces it cannot see at all:
 
 * Rows may be delivered more than once. Resuming from an earlier cursor
   re-delivers rather than erroring or skipping.
@@ -505,58 +515,101 @@ consumer only once, and there are surfaces it cannot see at all:
   two-phase commit, so it arises only if another application runs prepared
   transactions against the same database. If yours does, reconcile independently
   rather than relying on the feed.
+* **A stamp at or above the current bound waits for the bound to reach it.** The
+  feed orders by the watermark stored on the row, not by the instant the write
+  committed, and a page stops strictly below `complete_through`. So a row
+  stamped at or above the bound is not returned, and while it is the only thing
+  outstanding the feed reports `has_more: false` — which reads exactly like being
+  caught up. **That is a delay, not a loss.** A cursor built the way this page
+  says to build it — from the last row a page returned, which is itself below
+  that page's bound — cannot get past the waiting stamp, so the row arrives on
+  the first page read after the bound clears it. You can reach this state through
+  no fault of your own: a clock stepped backwards under the server by an NTP
+  correction, a resumed VM, or a restore, in which case the wait is the length of
+  the skew. A watermark written by hand for a future instant waits until that
+  instant genuinely arrives. On SQLite the column can also hold a value no bound
+  will ever reach — text that is not date-shaped but sorts above every timestamp,
+  or a blob, which sorts above every text value — and there the wait never ends
+  and the change really is lost; that is case 2 of the unparseable-watermark
+  bullet below.
+* **A `NULL` watermark is invisible to the feed, on either backend.** The page
+  compares `content_changed_at` against both of its bounds, and a `NULL`
+  satisfies neither, so the row is not returned from any cursor. No write path
+  produces one — every writer stamps the column, the schema defaults it, and the
+  first-run backfill fills in a database that predates it — so this takes direct
+  SQL as well, and whatever content change the same statement made goes
+  unreported with it. The triggers are null-safe about this: the next ordinary
+  change to one of the row's tracked columns stamps a fresh watermark, and the
+  row rejoins the feed carrying its current content. If no such change ever
+  comes, it stays invisible.
 * **SQLite only:** a `content_changed_at` value the server cannot parse — which
-  no write path produces, but direct SQL against the archive can — is not
-  recoverable by polling, and which way it fails depends on where the value
-  orders against the feed's bounds. (On PostgreSQL the column is `timestamptz`,
-  so the database itself refuses a value that is not a timestamp.) One ordering
-  at or above the cursor and below the current bound, *and landing last on its
-  page*, is returned on every poll and the cursor stops advancing there; a
-  readable row after it on the same page moves the cursor past it instead. If
-  such a row is the only thing in the feed **and** you sent no cursor,
-  `next_since` is omitted from the response entirely, so watching the cursor will
-  not reveal it. One ordering at or above the bound is not returned at all for as
-  long as the bound stays below it — for values that are not date-shaped, that is
-  indefinitely. Either way the archive and a mirror diverge. The second case is
-  silent, and so is the no-cursor sub-case just described; otherwise the first
-  case shows on the wire — a page that keeps returning rows while `next_since`
-  comes back equal to the cursor you sent, poll after poll.
+  no write path produces, but direct SQL against the archive can, and which the
+  triggers deliberately yield to when a statement sets the column itself — is not
+  repaired by polling. (On PostgreSQL the column is `timestamptz`, so the
+  database itself refuses a value that is not a timestamp.) How it fails is
+  decided by where the raw stored value orders against the page's two bounds.
+  Text is compared lexically; `content_changed_at` is a non-`STRICT` `DATETIME`
+  column, so direct SQL can also leave a number or a blob there, and SQLite
+  orders those by storage class — every number sorts *below* every text value,
+  every blob *above*. That gives three distinct failures:
 
-  **Re-reading the feed from an empty cursor does not detect either case.** An
-  empty cursor drops the feed's *lower* bound to the empty string, which is below
-  every stored text value, but it is the upper bound that excludes the second,
-  and the first re-traps the walk exactly as before. Detecting them needs a check
-  that does not go through the feed at all, and comparing message ids is not
-  enough: the same statement that writes an unparseable watermark can also change
-  a tracked field, so the archive and the mirror can hold identical id sets while
-  the contents differ. What it takes is reading the rows themselves — including
-  dedup-hidden and source-deleted ones — and comparing content, or comparing a
-  digest per message. That means reading the database directly. This feed is the
-  only message listing that includes dedup-hidden rows, and it is exactly the
-  thing that cannot reach these ones; every other listing endpoint filters them
-  out with `deleted_at IS NULL`, and no parameter turns that off. So while
-  `/api/v1/messages/{id}` returns such a row if you already know its id, nothing
-  over HTTP hands you the id set to compare against. The repair is to correct the
-  stored watermark.
+  1. **Text ordering at or above your cursor and below the bound.** The row is
+     returned, but its reported `content_changed_at` is the highest readable
+     watermark the page had reached — the cursor you sent, or a readable row
+     earlier on the page — not the stored value. If it lands last on its page
+     the cursor stops there and the same row comes back on every poll; a
+     readable row after it on the same page moves the cursor past it instead,
+     after which that cursor never returns it again.
+  2. **Text or a blob ordering at or above the bound.** Not returned at all, for
+     as long as the bound stays below it — see the bullet on a stamp at or above
+     the bound. A blob sorts
+     above every text value, and text that is not date-shaped can sort above
+     every timestamp the server will ever stamp, so for those the bound never
+     reaches it and "for as long as" means forever.
+  3. **A number (`INTEGER` or `REAL`).** It sorts below every text value, so it
+     fails the feed's **lower** bound from every cursor — the empty one included,
+     which compares against the empty string — and is never returned at all.
 
-  This describes a malformed text value. `content_changed_at` is a non-`STRICT`
-  `DATETIME` column, so direct SQL can also leave a number or a blob there, and
-  SQLite then orders it by storage class rather than by string comparison. A blob
-  sorts above every text value, so it lands in the second case and stays there. A
-  number sorts *below* every text value, so it fails the feed's **lower** bound
-  instead — the empty cursor's included, since that compares against `''` — and
-  is never returned from any cursor at all. That is a third case, and re-reading
-  from an empty cursor does not reach it either.
+  In every case the archive and a mirror diverge on that row's tracked fields:
+  case 1 reports a watermark the row does not have and stalls the walk, and
+  cases 2 and 3 hide the change outright.
+
+  **Only case 1 is visible from the outside, and re-reading the feed from an
+  empty cursor repairs none of the three.** Case 1 shows on the wire as a page
+  that keeps returning rows while `next_since` comes back equal to the cursor you
+  sent, poll after poll — except when such a row is the only thing in the feed
+  **and** you sent no cursor, in which case `next_since` is omitted from the
+  response entirely and there is no cursor to compare. The omission is then the
+  signal instead: a page that returns rows and no `next_since` means no row on it
+  carried a readable watermark. Cases 2 and 3 are silent: no request reaches the
+  row, so nothing on the wire differs from a healthy feed. A re-read from an
+  empty cursor does not change that. It drops the feed's *lower* bound to the
+  empty string, which is below every stored text value but above
+  every stored number, so it does not reach case 3; it leaves the upper bound
+  alone, so it does not reach case 2; and it re-enters case 1 on the same
+  fixpoint, delivering the row again without ever advancing past it.
+
+  Finding cases 2 and 3 needs a check that does not go through the feed at all,
+  and comparing message ids is not enough: the same statement that writes an
+  unparseable watermark can also change a tracked field, so the archive and the
+  mirror can hold identical id sets while the contents differ. What it takes is
+  reading the rows themselves — including dedup-hidden and source-deleted ones —
+  and comparing content, or comparing a digest per message. That means reading
+  the database directly. This feed is the only message listing that includes
+  dedup-hidden rows, and it is exactly the thing that cannot reach these ones;
+  every other listing endpoint filters them out with `deleted_at IS NULL`, and no
+  parameter turns that off. So while `/api/v1/messages/{id}` returns such a row
+  if you already know its id, nothing over HTTP hands you the id set to compare
+  against. The repair is to correct the stored watermark.
 * A consumer that must not diverge from the archive should still reconcile
-  periodically — for example, a scheduled full re-read from an empty cursor. That
-  recovers every surface above except a stored watermark no feed request reaches
-  — on SQLite, one ordering at or above the bound, or a numeric one ordering
-  below the empty cursor. Catching those is the direct-database read described
-  above; comparing message ids will not do it, for the reason given there.
-* If a watermark is somehow *ahead* of the database clock — a stored value
-  written by hand, or a clock stepped backwards under the server — that row stays
-  invisible for as long as the skew lasts, and the feed reports `has_more: false`
-  the whole time.
+  periodically — for example, a scheduled full re-read from an empty cursor. It
+  re-delivers every row the feed can select, so it restores the tracked fields of
+  a case-1 row and lets you find a hard deletion by its absence from the walk.
+  What it does not do: it cannot reach cases 2 and 3 above, or a `NULL`
+  watermark — no cursor can — and it recovers nothing outside the tracked
+  columns, which no request to this feed ever carries. Catching a row no cursor
+  reaches is the direct-database read described above; comparing message ids
+  will not do it, for the reason given there.
 
 Re-reading an overlapping window is safe, so a consumer that wants extra margin
 can keep an older `next_since` of its own — the one from a few pages back — and

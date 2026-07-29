@@ -2889,11 +2889,12 @@ func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
 		// that writer's stamped-but-uncommitted row sits between them; a cursor
 		// placed at the clock is above that row, and when the write commits the
 		// row is below the cursor and is never delivered. The bound is by
-		// construction below every write the bound can see -- with the one documented
-		// exception of a PostgreSQL prepared transaction, which no cursor policy
-		// here can account for. Re-delivering what
-		// sits between the bound and the clock is allowed by the delivery
-		// contract; losing it is not.
+		// construction below every write it can see; the one write it cannot
+		// (a PostgreSQL prepared transaction) is in the exception list
+		// docs/api-server.md's delivery contract enumerates, and no cursor
+		// policy here can account for it. Re-delivering what sits between the
+		// bound and the clock is allowed by the delivery contract; losing it is
+		// not.
 		//
 		// A server that has never established a bound reports CompleteThrough as
 		// the zero time. There is no safe target then — the clock is the unsafe

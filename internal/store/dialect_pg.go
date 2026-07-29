@@ -153,7 +153,9 @@ func (d *PostgreSQLDialect) TimestampParam(t time.Time) any { return t.UTC() }
 // One residual is known and not covered: a PREPARED transaction holds its locks
 // with pg_locks.pid NULL, so the join drops it from both halves. It needs
 // max_prepared_transactions > 0, which is off by default and which msgvault
-// never uses.
+// never uses. What that costs a consumer, alongside every other exception to
+// what the feed delivers, is enumerated in one place: docs/api-server.md's
+// delivery contract.
 const pgWriteLockModes = `('RowExclusiveLock', 'ShareRowExclusiveLock', ` +
 	`'ExclusiveLock', 'AccessExclusiveLock')`
 

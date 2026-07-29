@@ -47,8 +47,11 @@ type ColumnMigration struct {
 // run. Paging up to the oldest write that could still commit cannot: every
 // uncommitted stamp is at or above that instant. The one write this cannot
 // cover is a PostgreSQL prepared transaction, which holds its locks with no
-// owning session and so exposes no start time to be the oldest; that residual
-// is documented in docs/api-server.md.
+// owning session and so exposes no start time to be the oldest. That residual
+// and every other exception to what the feed delivers are enumerated in one
+// place, docs/api-server.md's delivery contract; this comment names only the
+// exception that bears on CommitBound and deliberately does not restate the
+// list, because a list kept in two places drifts.
 //
 // CommitBound is never after Now, and it lags Now by however long the oldest
 // in-flight write transaction has been open. That lag is the feature's cost:

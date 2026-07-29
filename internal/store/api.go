@@ -1176,7 +1176,8 @@ type ChangedMessagePage struct {
 // The upper bound is not an optimisation, it is the correctness half: the page
 // stops strictly below the oldest write that could still commit
 // (WatermarkBounds.CommitBound), so the cursor cannot come to rest above a
-// change that is stamped but not yet published. Bounding at the database clock
+// change that is stamped but not yet published by any write the bound can see
+// (which writes those are: docs/api-server.md). Bounding at the database clock
 // instead — which is what this query used to do — leaves the loss window open,
 // because the clock says which instants have been REACHED and nothing about
 // which are still open for COMMITS. See ListChangedMessages.
@@ -1243,9 +1244,10 @@ const changedMessagesQuery = `
 // must not look like a caught-up one. A writer connected as a different
 // PostgreSQL role is inside the guarantee too, at the cost of a stall or a
 // refusal rather than a loss (see PostgreSQLDialect.visibilityFloor). What
-// remains outside it (a hard-deleted row, a change to a child table, a prepared
-// transaction's write, a watermark direct SQL wrote that the server cannot
-// parse) is set out in docs/api-server.md.
+// remains outside the guarantee is enumerated in exactly one place,
+// docs/api-server.md's delivery contract. This comment deliberately does not
+// restate that list: it has been corrected in one copy and left false in
+// another too many times.
 //
 // A limit of zero or less asks for no rows; that is not an error.
 func (s *Store) ListChangedMessages(
@@ -1278,35 +1280,30 @@ func (s *Store) ListChangedMessages(
 	defer func() { _ = rows.Close() }()
 
 	page := ChangedMessagePage{ServerTime: bounds.Now, CompleteThrough: bounds.CommitBound}
-	// Whether the row is reported at all depends on how its stored value orders
-	// against the page's bounds, which for a TEXT value is a lexical comparison.
-	// Within the page's bounds — at or above the cursor as well as below the
-	// upper bound; a value below the cursor is excluded like any other — the row
-	// IS reported, and its watermark becomes the newest value the raw column is
-	// known to be at least — the cursor the page was read from, or the last
-	// readable watermark before it, whichever is later. That floor is not
-	// advanced by this row. So if the row is also the LAST on its page the walk
-	// reaches a fixpoint: the handler publishes that floor as the next cursor
-	// and this row's id as the tiebreak, so the SECOND request onward repeats
-	// byte for byte and returns the row again, and again. (The first request
-	// differs from it in the tiebreak alone, unless the caller already sent this
-	// row's id.) A readable row after it on the same page advances the cursor
-	// past it instead. At or above the upper bound the row is excluded and not
-	// reported at all, for as long as the bound stays below it.
+	// A row whose stored watermark this scan cannot read is reported with
+	// watermarkFloor as its watermark: the newest value the raw column is known
+	// to be at least — the cursor the page was read from, or the last readable
+	// watermark before it, whichever is later. Such a row does not advance that
+	// floor. So if it is also the LAST on its page the walk reaches a fixpoint:
+	// the handler publishes that floor as the next cursor and this row's id as
+	// the tiebreak, so the SECOND request onward repeats byte for byte and
+	// returns the row again, and again. (The first request differs from it in
+	// the tiebreak alone, unless the caller already sent this row's id.) A
+	// readable row after it on the same page advances the cursor past it
+	// instead.
 	//
-	// This describes malformed TEXT. content_changed_at is a non-STRICT DATETIME
-	// column, so direct SQL can also store INTEGER, REAL or BLOB, which SQLite
-	// orders by storage class rather than lexically. A BLOB sorts above every
-	// TEXT value, so the upper bound excludes it, exactly as in the second case
-	// above. An INTEGER or REAL sorts BELOW every TEXT value, so it fails the
-	// LOWER bound instead — from every cursor, the empty one included, whose
-	// bound is the empty string — and is never reported at all. Neither case
-	// above describes that one.
+	// Whether such a row is selected at all is decided by where its RAW stored
+	// value orders against this page's two bounds, not by whether Go can parse
+	// it: content_changed_at is a non-STRICT DATETIME column, so direct SQL can
+	// leave TEXT, INTEGER, REAL or a BLOB there, and SQLite compares TEXT
+	// lexically and everything else by storage class. The ways that can fail,
+	// and what each one costs a consumer, are enumerated in exactly one place —
+	// docs/api-server.md's delivery contract — and deliberately not restated
+	// here, because a list kept in two places drifts.
 	//
-	// Documented in docs/api-server.md. There is no fix here that keeps the row
-	// reported, advances the walk, and leaves the meaning of the published cursor
-	// alone — publishing anything above the row's own stamp silently drops
-	// readable changes between the two.
+	// There is no fix here that keeps the row reported, advances the walk, and
+	// leaves the meaning of the published cursor alone — publishing anything
+	// above the row's own stamp silently drops readable changes between the two.
 	//
 	// The floor applies ONLY to the unreadable case. A watermark that scanned
 	// fine is published exactly as stored even when it sorts below the cursor,

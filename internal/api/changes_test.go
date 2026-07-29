@@ -1045,9 +1045,10 @@ func countMessagesStampedBelow(t *testing.T, st *store.Store, instant time.Time)
 // server_time and the in-flight row's watermark sits between them. Clamping to
 // server_time -- which this did -- places the cursor above that row, and when the
 // writer commits the row is below the cursor forever. The bound is by
-// construction below every write the bound can see (the prepared-transaction
-// residual in Task 3 is the one exception), so a cursor placed there
-// cannot skip one.
+// construction below every write it can see, so a cursor placed there cannot
+// skip one. The writes it cannot see, and every other exception to what the
+// feed delivers, are enumerated in one place: docs/api-server.md's delivery
+// contract.
 func TestChangesEndpoint_FutureCursorClampsToTheCommitBoundNotTheClock(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
