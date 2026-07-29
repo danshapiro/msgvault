@@ -2730,7 +2730,7 @@ const changesTimeLayout = time.RFC3339Nano
 // omitted field means "unset or empty", never "unchanged"; there is nothing for
 // a consumer to merge against. That is what makes `omitempty` safe on the
 // columns that are legitimately NULL (the lifecycle timestamps) or legitimately
-// empty (the strings the page query COALESCEs to ''), and the tag is not
+// empty (the strings the page query COALESCEs to the empty string), and the tag is not
 // cosmetic: a field without it is `required` in the published OpenAPI document,
 // and the generated client's validator reads `required` as present AND
 // non-empty. Declared required, an ordinary chat message with no subject and a
@@ -2760,8 +2760,11 @@ type ChangedMessageJSON struct {
 // NextSince and NextSinceID are the cursor for the following request. On an
 // empty page they echo the requested cursor unchanged, so a caught-up consumer
 // can send the response straight back as its next request; zero values would
-// restart it from the beginning of the archive on every poll. ServerTime is the
-// database's clock reading, for callers that re-read an overlapping window.
+// restart it from the beginning of the archive on every poll. The one exception
+// is a cursor above the database clock, which is clamped down to CompleteThrough
+// so recovery cannot step over a write that has not committed yet — see
+// handleMessageChanges. ServerTime is the database's clock reading, for callers
+// that re-read an overlapping window.
 //
 // NextSince carries `omitempty` because it is empty on the first poll of an
 // archive that has nothing in it — no request cursor to echo and no last row to
@@ -2868,7 +2871,7 @@ func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
 			cursor = since
 		}
 		nextSinceID = last.ID
-	case cursor.After(page.ServerTime):
+	case cursor.After(page.ServerTime) && !page.CompleteThrough.IsZero():
 		// An empty page normally echoes the request's own cursor, so a consumer
 		// polling an idle feed holds its place instead of replaying the archive.
 		// Echoing a cursor ABOVE the database clock would instead wedge that
@@ -2878,12 +2881,28 @@ func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
 		// while the archive changes underneath it, and the echo hands the same
 		// cursor back so it never heals. A clock stepped backwards (NTP, a
 		// resumed VM, a restore onto slower hardware) or a client that builds
-		// its own cursor gets there. Clamping to the clock reading returns the
-		// consumer to the normal regime on the next poll. The id tiebreak goes
-		// with it: it belonged to a different instant, and re-delivering the
-		// start of this one is allowed by the delivery contract while losing it
-		// is not.
-		cursor = page.ServerTime
+		// its own cursor gets there.
+		//
+		// Recovery lands on the COMMIT BOUND, not on the clock. While a writer
+		// holds an open transaction the bound sits strictly below the clock and
+		// that writer's stamped-but-uncommitted row sits between them; a cursor
+		// placed at the clock is above that row, and when the write commits the
+		// row is below the cursor and is never delivered. The bound is by
+		// construction below every write the bound can see -- with the one documented
+		// exception of a PostgreSQL prepared transaction, which no cursor policy
+		// here can account for. Re-delivering what
+		// sits between the bound and the clock is allowed by the delivery
+		// contract; losing it is not.
+		//
+		// A server that has never established a bound reports CompleteThrough as
+		// the zero time. There is no safe target then — the clock is the unsafe
+		// one and zero would replay the whole archive — so the guard above leaves
+		// such a cursor echoed. That state is transient and resolves on the first
+		// bound reading. It is the one case where next_since can exceed
+		// server_time, and docs/api-server.md says so.
+		//
+		// The id tiebreak goes with it: it belonged to a different instant.
+		cursor = page.CompleteThrough
 		nextSinceID = 0
 	}
 	nextSince := ""

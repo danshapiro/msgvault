@@ -152,8 +152,10 @@ import (
 // content changed since its last poll, including hidden and source-deleted
 // rows. The (since, since_id) cursor and the server_time reading are serialised
 // with full sub-second precision, and an empty page echoes the requested cursor
-// so an idle consumer holds its place. Stores that cannot answer the watermark
-// query report 503 feature_unavailable. Additive (minor bump): a new path only.
+// so an idle consumer holds its place, except that a cursor above the server
+// clock is clamped down to the commit bound. Stores that cannot answer the
+// watermark query report 503 feature_unavailable. Additive (minor bump): a new
+// path only.
 const APISchemaVersion = "1.32.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration

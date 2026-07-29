@@ -361,15 +361,24 @@ can still receive writes, and a cursor resting inside it would strand a change
 that lands there afterwards on a lower message ID. The cost is that the very
 newest changes arrive on the following poll instead of the current one.
 
-`next_since` is never above `server_time`. On an empty page the response
-normally echoes the cursor you sent, but a cursor above the database clock is
-clamped down to `server_time` (and its `next_since_id` reset to `0`) before it is
-returned. Such a cursor matches nothing, and echoing it would leave you polling
-a feed that answers "caught up" forever while the archive changes; clamping puts
-you back in range on the next poll at the cost of re-delivering a little. You
-can reach that state through no fault of your own — a clock stepped backwards by
-an NTP correction, a resumed VM, or a restore onto slower hardware — so treat a
-`next_since` that differs from the cursor you sent as normal, not as an error.
+`next_since` is never above `server_time`, with one exception noted below. On an
+empty page the response normally echoes the cursor you sent, but a cursor above
+the database clock is clamped down to `complete_through` — the point the feed is
+provably caught up to — and its `next_since_id` reset to `0`. Clamping to the
+clock instead could place your cursor above a change that was stamped but had not
+yet committed, which would lose it; the bound cannot. Such a cursor matches
+nothing, and echoing it would leave you polling a feed that answers "caught up"
+forever while the archive changes; clamping puts you back in range on the next
+poll at the cost of re-delivering a little.
+
+The exception is a server that has not yet established a bound, which reports
+`complete_through` as `0001-01-01T00:00:00Z`. There is no proven-safe point to
+move your cursor to then, so it is echoed unchanged — and in that one case
+`next_since` can be above `server_time`. It resolves once the bound is
+established. You can reach the future-cursor state through no fault of your own —
+a clock stepped backwards by an NTP correction, a resumed VM, or a restore onto
+slower hardware — so treat a `next_since` that differs from the cursor you sent
+as normal, not as an error.
 
 Timestamps carry full sub-second precision, and cursors must be sent back
 exactly as received. A cursor rounded to whole seconds sits below the watermark
@@ -416,8 +425,9 @@ curl -H "X-API-Key: $MSGVAULT_API_KEY" \
 ```
 
 When a page comes back empty there is no last row to build a cursor from, so
-the response echoes the cursor you sent (clamped down to `server_time` if it was
-above the clock, as described above). A caught-up consumer can therefore send
+the response echoes the cursor you sent (clamped down to `complete_through` if it
+was above the clock, as described above — or echoed unchanged if no bound has
+been established yet). A caught-up consumer can therefore send
 the response straight back as its next request, forever, without re-reading the
 archive.
 

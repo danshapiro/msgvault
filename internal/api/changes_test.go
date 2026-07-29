@@ -1036,3 +1036,95 @@ func countMessagesStampedBelow(t *testing.T, st *store.Store, instant time.Time)
 		"count the committed changes below the bound")
 	return n
 }
+
+// TestChangesEndpoint_FutureCursorClampsToTheCommitBoundNotTheClock pins that
+// recovering a consumer whose cursor is above the database clock never moves that
+// cursor above a change that is stamped but not yet committed.
+//
+// While a writer holds an open transaction, complete_through sits strictly below
+// server_time and the in-flight row's watermark sits between them. Clamping to
+// server_time -- which this did -- places the cursor above that row, and when the
+// writer commits the row is below the cursor forever. The bound is by
+// construction below every write the bound can see (the prepared-transaction
+// residual in Task 3 is the one exception), so a cursor placed there
+// cannot skip one.
+func TestChangesEndpoint_FutureCursorClampsToTheCommitBoundNotTheClock(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	serverTime := time.Date(2026, 7, 26, 10, 0, 30, 0, time.UTC)
+	// A writer has been open since :10, so the feed is complete only through :10
+	// even though the clock reads :30. That writer's row, stamped at :20, is
+	// still uncommitted.
+	completeThrough := time.Date(2026, 7, 26, 10, 0, 10, 0, time.UTC)
+	inFlightStamp := time.Date(2026, 7, 26, 10, 0, 20, 0, time.UTC)
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store: &stubChangedMessageLister{
+			mockStore: &mockStore{},
+			page: store.ChangedMessagePage{
+				Messages:        nil,
+				ServerTime:      serverTime,
+				CompleteThrough: completeThrough,
+			},
+		},
+		Logger: testLogger(),
+	})
+
+	future := serverTime.Add(time.Hour)
+	resp := getChangesPage(t, srv, changesTarget(future.Format(changesTimeLayout), 7, 10))
+
+	got, err := time.Parse(changesTimeLayout, resp.NextSince)
+	require.NoError(err, "next_since must parse")
+
+	// Equality, not "not after". A merely-lower cursor is satisfied by the zero
+	// time, and an implementation that rewound the consumer to the start of the
+	// archive on every future cursor -- which this plan explicitly rejects --
+	// would pass a `not after` assertion while being badly wrong.
+	assert.Truef(got.Equal(completeThrough),
+		"the recovered cursor must be exactly the commit bound (%s), got %s; "+
+			"anything above it skips the change stamped at %s by the still-open "+
+			"writer, and anything below it replays the archive",
+		completeThrough, got, inFlightStamp)
+	assert.Equal(int64(0), resp.NextSinceID,
+		"the id tiebreak belonged to a different instant and must be reset")
+}
+
+// TestChangesEndpoint_FutureCursorIsEchoedWhenNoBoundIsEstablished pins the one
+// case where the clamp must not fire. A server that has never taken a bound
+// reading reports complete_through as the zero time; clamping down to it would
+// replay the whole archive, and clamping to the clock would be the unsafe move
+// this fix removes. Echoing holds the consumer's place until the bound resolves.
+func TestChangesEndpoint_FutureCursorIsEchoedWhenNoBoundIsEstablished(t *testing.T) {
+	assert := assert.New(t)
+
+	serverTime := time.Date(2026, 7, 26, 10, 0, 30, 0, time.UTC)
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store: &stubChangedMessageLister{
+			mockStore: &mockStore{},
+			page: store.ChangedMessagePage{
+				Messages:        nil,
+				ServerTime:      serverTime,
+				CompleteThrough: time.Time{}, // no bound established yet
+			},
+		},
+		Logger: testLogger(),
+	})
+
+	future := serverTime.Add(time.Hour)
+	sent := future.Format(changesTimeLayout)
+	// A nonzero tiebreak, so the echo is checked as a whole composite cursor.
+	// Resetting the id here would re-deliver the start of that instant on every
+	// poll, which the clamp branch accepts deliberately but this branch must not:
+	// nothing has been clamped, so there is nothing to re-deliver.
+	resp := getChangesPage(t, srv, changesTarget(sent, 7, 10))
+
+	assert.Equal(sent, resp.NextSince,
+		"with no bound established the cursor must be echoed unchanged, not "+
+			"clamped to the clock and not reset to the zero time")
+	assert.Equal(int64(7), resp.NextSinceID,
+		"and its tiebreak must be echoed with it -- this branch clamps nothing, "+
+			"so resetting the id would re-deliver that instant on every poll")
+}
