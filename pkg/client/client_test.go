@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
@@ -238,6 +239,96 @@ func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
 				"it a feed held back by an open write transaction is indistinguishable "+
 				"from a caught-up one")
 	})
+}
+
+// TestListChangedMessagesRoundTripsASubSecondCursor covers the half of the
+// change feed's client contract the response-model test above cannot reach:
+// that the generated client builds the request the server accepts, and that a
+// cursor survives the trip out through the generated query parameters with its
+// sub-second precision intact.
+//
+// The feed's cursor carries the database's full sub-second resolution and the
+// consumer is told to send it back verbatim. A cursor truncated to whole
+// seconds on the way out sits below the watermark of the page it came from, so
+// the consumer is handed that same page on every poll, forever; one rounded the
+// other way steps over whatever was stamped in between. Neither shows up in the
+// response model — only in the query string. So this walks the loop a consumer
+// walks, taking next_since from one page and sending it as the next request,
+// and asserts on what the client actually put on the wire.
+func TestListChangedMessagesRoundTripsASubSecondCursor(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	const cursor = "2026-07-26T10:00:00.731123Z"
+	const cursorID = int64(918)
+
+	var gotMethod, gotPath string
+	var gotQuery url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{
+			"messages":[{
+				"id":%d,
+				"source_id":1,
+				"conversation_id":44,
+				"message_type":"email",
+				"subject":"Q4 planning",
+				"size_estimate":8412,
+				"has_attachments":false,
+				"attachment_count":0,
+				"content_changed_at":%q
+			}],
+			"count":1,
+			"has_more":false,
+			"next_since":%q,
+			"next_since_id":%d,
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":"2026-07-26T10:00:03.114488Z"
+		}`, cursorID, cursor, cursor, cursorID)
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(server.URL)
+	require.NoError(err, "New")
+
+	// First poll: a consumer with no cursor yet. Sending since= or since_id=0
+	// would be a different request than omitting them, so the client must omit.
+	limit := int64(100)
+	first, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
+		Query: &generated.ListChangedMessagesQuery{Limit: &limit},
+	})
+	require.NoError(err, "ListChangedMessages first poll")
+	assert.Equal(http.MethodGet, gotMethod, "method")
+	assert.Equal("/api/v1/messages/changes", gotPath, "path")
+	assert.Equal("100", gotQuery.Get("limit"), "limit query")
+	assert.NotContains(gotQuery, "since", "an absent cursor must not be sent as an empty one")
+	assert.NotContains(gotQuery, "since_id", "an absent tiebreak must not be sent as a zero one")
+
+	require.NotNil(first, "first page")
+	require.NotNil(first.NextSince, "next_since")
+	assert.Equal(cursor, *first.NextSince,
+		"the decoded cursor must keep every digit the server published")
+	assert.Equal(cursorID, first.NextSinceID, "next_since_id")
+	require.Len(first.Messages, 1, "messages")
+	assert.Equal(cursor, first.Messages[0].ContentChangedAt, "the row's watermark")
+
+	// Second poll: the response fed straight back, exactly as the docs tell a
+	// consumer to do it.
+	second, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
+		Query: &generated.ListChangedMessagesQuery{
+			Since:   first.NextSince,
+			SinceID: &first.NextSinceID,
+			Limit:   &limit,
+		},
+	})
+	require.NoError(err, "ListChangedMessages second poll")
+	assert.Equal(cursor, gotQuery.Get("since"),
+		"the cursor reached the wire truncated or reformatted: a consumer that "+
+			"sends it back no longer resumes where the page ended")
+	assert.Equal("918", gotQuery.Get("since_id"), "since_id query")
+	assert.Equal("100", gotQuery.Get("limit"), "limit query")
+	require.NotNil(second, "second page")
 }
 
 func TestGeneratedGetAttachmentContentReturnsBinaryBytes(t *testing.T) {
