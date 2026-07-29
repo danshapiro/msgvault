@@ -203,9 +203,13 @@ CREATE TABLE IF NOT EXISTS messages (
     -- trigger stays, guarded by WHEN NEW.content_changed_at IS NULL, and is a
     -- no-op on fresh databases.
     --
-    -- This column MUST stay last: subset.go copies messages positionally
-    -- ("INSERT INTO messages SELECT * FROM src.messages") and ALTER TABLE ADD
-    -- COLUMN always appends, so an upgraded database has it last too.
+    -- This column MUST stay last so that a fresh database and one upgraded by
+    -- the ALTER TABLE ADD COLUMN migration declare their columns in the same
+    -- order (ALTER TABLE always appends). subset.go no longer depends on that
+    -- -- it copies messages by the column list the source and destination share
+    -- -- but the two layouts do meet, and a divergence silently breaks anything
+    -- that reads a message row by position.
+    -- TestContentChangedAt_ColumnOrderMatchesAfterUpgrade pins it.
     content_changed_at DATETIME DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
 
     UNIQUE(source_id, source_message_id)

@@ -630,13 +630,18 @@ func TestContentChangedAt_MessageInsertedDuringUpgradeIsStamped(t *testing.T) {
 			"the change feed", concurrent)
 }
 
-// TestContentChangedAt_ColumnOrderMatchesAfterUpgrade guards the positional
-// copy in subset.go:331 ("INSERT INTO messages SELECT * FROM src.messages").
+// TestContentChangedAt_ColumnOrderMatchesAfterUpgrade guards against a fresh
+// database and an upgraded one declaring messages' columns in different orders.
 // ALTER TABLE always appends, so a column placed mid-table in schema.sql but
-// appended by the migration gives a fresh database and an upgraded one
-// different column orders, and a positional copy between them silently writes
-// values into the wrong columns. This asserts content_changed_at lands in the
-// same position either way.
+// appended by the migration diverges, and any read that goes by position writes
+// or interprets values in the wrong columns. This asserts content_changed_at
+// lands in the same position either way.
+//
+// subset.go's messages copy used to be exactly such a reader
+// ("INSERT INTO messages SELECT * FROM src.messages"); it now names the columns
+// the source and destination share, so it no longer relies on this. The two
+// layouts still meet — a subset's source and destination are routinely one
+// fresh and one upgraded — so the invariant is worth pinning on its own.
 //
 // Scoped to content_changed_at on purpose: last_modified and embed_gen already
 // disagree at this commit (a pre-existing upstream defect out of scope for this
@@ -666,7 +671,7 @@ func TestContentChangedAt_ColumnOrderMatchesAfterUpgrade(t *testing.T) {
 
 	assert.Equal(t, freshIdx, upgradedIdx,
 		"content_changed_at must occupy the same column position on fresh and upgraded databases; "+
-			"subset.go copies messages positionally")
+			"a divergence silently corrupts any read of a message row that goes by position")
 }
 
 // contentChangedStampShape is the fixed-width text layout SQLite watermarks
