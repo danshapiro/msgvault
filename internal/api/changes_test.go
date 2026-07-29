@@ -108,6 +108,25 @@ func setChangesWatermark(t *testing.T, st *store.Store, value string, ids ...int
 	}
 }
 
+// setChangesWatermarkAt forces content_changed_at to an exact INSTANT rather
+// than a fixed literal, binding it the way each backend compares it: SQLite
+// stores the trigger's textual format and compares lexically, PostgreSQL parses
+// a real timestamptz. Tests that have to place a watermark relative to the
+// database clock need this; tests that only need a known ordering can use a
+// literal through setChangesWatermark.
+func setChangesWatermarkAt(t *testing.T, st *store.Store, when time.Time, ids ...int64) {
+	t.Helper()
+	var value any = when.UTC()
+	if !st.IsPostgreSQL() {
+		value = when.UTC().Format(store.SQLiteTimestampLayout)
+	}
+	for _, id := range ids {
+		_, err := st.DB().Exec(
+			st.Rebind(`UPDATE messages SET content_changed_at = ? WHERE id = ?`), value, id)
+		require.NoErrorf(t, err, "set content_changed_at for message %d", id)
+	}
+}
+
 // setChangesMessageTimestamp writes a lifecycle timestamp column directly.
 // These are content columns, so the write also bumps the watermark.
 func setChangesMessageTimestamp(t *testing.T, st *store.Store, id int64, col string, value time.Time) {
@@ -391,6 +410,11 @@ func TestChangesEndpoint_EmptyPageEchoesRequestCursor(t *testing.T) {
 // while the archive changes. A backwards clock step (NTP correction, a resumed
 // VM, a restore onto slower hardware) or a client that builds its own cursor
 // gets there without doing anything wrong.
+//
+// What this proves is that the consumer starts moving again, not that it lost
+// nothing on the way: a backward step also strands changes below the recovered
+// cursor, which no cursor policy reaches. That is
+// TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor.
 func TestChangesEndpoint_CursorAboveTheDatabaseClockRecovers(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -418,6 +442,100 @@ func TestChangesEndpoint_CursorAboveTheDatabaseClockRecovers(t *testing.T) {
 	resumed := getChangesPage(t, srv, changesTarget(poisoned.NextSince, poisoned.NextSinceID, 100))
 	assert.NotZero(resumed.Count,
 		"the feed stalled: changes made after the cursor was clamped were never delivered")
+}
+
+// TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor holds the
+// documentation to what the feed actually does when the database clock steps
+// backwards, because the two readings differ by "delay" versus "loss".
+//
+// The feed orders by a wall-clock watermark and a consumer's cursor only moves
+// forward, so a step back means the writes that follow it are stamped in clock
+// time the walk has already passed. Everything stamped below the cursor the
+// consumer is holding fails the keyset lower bound on that poll and on every
+// poll afterwards. docs/api-server.md's delivery contract names this as a loss
+// bounded by the size of the step, and points at a full re-read from an empty
+// cursor as the repair; both halves are asserted here.
+//
+// The two subtests are the same failure on either side of the future-cursor
+// clamp, which is why the clamp cannot be blamed for it or fixed to prevent it.
+func TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor(t *testing.T) {
+	t.Run("the clamp does not recover what the step stranded", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		srv, st := newChangesServer(t)
+
+		ids := seedChangedMessages(t, st, 2)
+		delivered, afterStep := ids[0], ids[1]
+		now := changesServerTime(t, srv)
+		setChangesWatermarkAt(t, st, now.Add(-2*time.Hour), delivered)
+		// The clock stepped back minutes ago; this change committed after the
+		// step, so the database stamped it from the stepped-back clock — below
+		// the cursor the consumer has held since before the step.
+		setChangesWatermarkAt(t, st, now.Add(-5*time.Minute), afterStep)
+
+		preStep := now.Add(time.Hour).UTC().Format(changesTimeLayout)
+		poisoned := getChangesPage(t, srv, changesTarget(preStep, 4242, 100))
+		require.Zero(poisoned.Count, "a cursor above the stepped-back clock matches nothing")
+		require.NotEqual(preStep, poisoned.NextSince, "the future cursor must be clamped")
+
+		recovered := getChangesPage(t, srv, changesTarget(poisoned.NextSince, poisoned.NextSinceID, 100))
+		assert.NotContainsf(changedIDs(recovered), afterStep,
+			"message %d was stamped below the clamp target %s, so the clamp cannot "+
+				"return it", afterStep, poisoned.NextSince)
+
+		// And it never comes back: the clamped cursor only rises from here.
+		again := getChangesPage(t, srv, changesTarget(recovered.NextSince, recovered.NextSinceID, 100))
+		assert.NotContainsf(changedIDs(again), afterStep,
+			"message %d is below the cursor for good; a later poll cannot reach "+
+				"back under it", afterStep)
+
+		// The documented repair. Unlike an unparseable or NULL watermark, the
+		// row is perfectly selectable — it is only below the cursor — so a
+		// reconciling full re-read does return it.
+		reread := getChangesPage(t, srv, changesTarget("", 0, 100))
+		assert.Containsf(changedIDs(reread), afterStep,
+			"a full re-read from an empty cursor is the only thing that recovers "+
+				"message %d, and the delivery contract says so", afterStep)
+	})
+
+	t.Run("and the clamp is not what loses it", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		srv, st := newChangesServer(t)
+
+		ids := seedChangedMessages(t, st, 3)
+		delivered, afterStep, later := ids[0], ids[1], ids[2]
+		now := changesServerTime(t, srv)
+		setChangesWatermarkAt(t, st, now.Add(-30*time.Minute), delivered)
+		// Same shape as above, but this consumer polls late enough that the
+		// clock has already climbed back above its cursor. The future-cursor
+		// branch never runs, and the row the step stranded is lost regardless.
+		setChangesWatermarkAt(t, st, now.Add(-time.Hour), afterStep)
+		setChangesWatermarkAt(t, st, now.Add(-10*time.Minute), later)
+
+		cursor := now.Add(-30 * time.Minute).UTC().Format(changesTimeLayout)
+		page := getChangesPage(t, srv, changesTarget(cursor, delivered, 100))
+
+		serverTime, err := time.Parse(changesTimeLayout, page.ServerTime)
+		require.NoError(err, "server_time must parse")
+		sent, err := time.Parse(changesTimeLayout, cursor)
+		require.NoError(err, "the sent cursor must parse")
+		require.Truef(serverTime.After(sent),
+			"this cursor (%s) is below the clock (%s), so the future-cursor clamp "+
+				"cannot have fired", cursor, page.ServerTime)
+
+		assert.Containsf(changedIDs(page), later,
+			"message %d is above the cursor and must still be delivered: the feed "+
+				"looks entirely healthy while it drops the stranded row", later)
+		assert.NotContainsf(changedIDs(page), afterStep,
+			"message %d was stamped below the cursor by the stepped-back clock and "+
+				"is skipped with no clamp involved", afterStep)
+
+		reread := getChangesPage(t, srv, changesTarget("", 0, 100))
+		assert.Containsf(changedIDs(reread), afterStep,
+			"the repair is the same on this side of the clamp: only a full re-read "+
+				"from an empty cursor returns message %d", afterStep)
+	})
 }
 
 // TestChangesEndpoint_ClampsLimit pins the page-size rules a client can rely on

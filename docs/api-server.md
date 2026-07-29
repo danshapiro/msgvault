@@ -392,7 +392,10 @@ see, and the writes it cannot see are named in the
 [delivery contract](#delivery-contract). Such a cursor matches nothing, and
 echoing it would leave you polling a feed that answers "caught up"
 forever while the archive changes; clamping puts you back in range on the next
-poll at the cost of re-delivering a little.
+poll at the cost of re-delivering a little. It gets you moving again; it does
+not undo whatever put you above the clock. If that was a clock stepped
+backwards, the changes already stamped below the clamp are gone from your walk
+— see the [delivery contract](#delivery-contract).
 
 The exception is a server that has not yet established a bound, which reports
 `complete_through` as `0001-01-01T00:00:00Z`. There is no proven-safe point to
@@ -403,7 +406,8 @@ established; until then the feed returns no rows to any cursor, which the
 to reach it. You can reach the future-cursor state through no fault of your own —
 a clock stepped backwards by an NTP correction, a resumed VM, or a restore onto
 slower hardware — so treat a `next_since` that differs from the cursor you sent
-as normal, not as an error.
+as normal, not as an error. Treat it as a *signal*, though: a backward step
+costs changes, and the [delivery contract](#delivery-contract) says which.
 
 Timestamps carry full sub-second precision, and cursors must be sent back
 exactly as received. A cursor rounded to whole seconds sits below the watermark
@@ -547,12 +551,14 @@ there are surfaces it cannot see at all:
   bound rather than below it. That is still safe, because the clamp also resets
   `next_since_id` to `0` and every message id is greater than zero: the `id > 0`
   half of the cursor comparison selects every row stamped at that exact instant,
-  so nothing waiting there is stepped over. You can reach this state through
-  no fault of your own: a clock stepped backwards under the server by an NTP
-  correction, a resumed VM, or a restore, in which case the wait is the length of
-  the skew. A watermark written by hand for a future instant waits until that
-  instant genuinely arrives. A server that has not yet established a bound is
-  this case at its limit: it reports `complete_through` as
+  so nothing waiting there is stepped over. A watermark written by hand for a
+  future instant waits until that instant genuinely arrives. A clock stepped
+  backwards under the server leaves you holding a cursor above the clock too,
+  and the mechanics look identical, but the consequence is not: what a backward
+  step strands is stamped *below* your cursor, where no bound will ever bring it
+  back. That is the next bullet, and it is a loss rather than a wait. A server
+  that has not yet established a bound is this case at its limit: it reports
+  `complete_through` as
   `0001-01-01T00:00:00Z`, which is below every stamp in the archive, so no cursor
   selects anything until the first bound reading — see `complete_through` under
   the response fields above. On SQLite the column can also hold a value no bound
@@ -560,6 +566,29 @@ there are surfaces it cannot see at all:
   or a blob, which sorts above every text value — and there the wait never ends
   and the change really is lost; that is case 2 of the unparseable-watermark
   bullet below.
+* **A database clock that steps backwards loses the changes committed below your
+  cursor while it climbs back.** The feed orders by the wall-clock watermark
+  stored on the row, and your cursor only ever moves forward, so the two rely on
+  the database's clock being monotonic. When it is not — an NTP step, a resumed
+  or migrated VM, a restore onto a host whose clock is behind — the writes that
+  follow the step are stamped in clock time your walk has already passed, and
+  every one of them stamped below the cursor you are holding fails the keyset
+  comparison on that poll and on every poll after it. Both backends are
+  affected: both stamp from the database server's own wall clock. **This is a
+  loss, not a delay** — the row is not waiting for anything, and nothing on the
+  wire distinguishes it from a healthy feed. It is bounded: what is lost is the
+  changes committed during the stretch of clock time the step re-runs, so at
+  most the size of the step, and normal delivery resumes as soon as the clock
+  passes your cursor again. The `next_since` clamp described under the response
+  fields above narrows the window — a consumer that polls promptly after a step
+  is put back within microseconds of where the clock restarted — but it cannot
+  close it, and it does not fire at all for a consumer that polls late enough
+  for the clock to have climbed back above its cursor, which loses exactly the
+  same rows. No cursor the server can hand you reaches back below itself. What
+  does reach them is a full re-read from an empty cursor: unlike the
+  unparseable-watermark and `NULL` cases below, these rows are perfectly
+  selectable, so the periodic reconciliation described at the end of this list
+  restores them.
 * **A `NULL` watermark is invisible to the feed, on either backend.** The page
   compares `content_changed_at` against both of its bounds, and a `NULL`
   satisfies neither, so the row is not returned from any cursor. No write path

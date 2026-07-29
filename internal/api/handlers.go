@@ -2896,6 +2896,18 @@ func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
 		// bound and the clock is allowed by the delivery contract; losing it is
 		// not.
 		//
+		// What this clamp does NOT do is repair a backward clock step. It moves
+		// the cursor down to the lowest instant the server can prove is safe,
+		// which is as far as any cursor policy can go, but a step stamps new
+		// writes BELOW that instant and nothing here reaches back below itself.
+		// Clamping to the zero time would, at the price of replaying the archive
+		// on every skew — and it would still not help the consumer that polls
+		// late enough for the clock to climb back above its cursor, which loses
+		// the same rows with this branch never running. So the backward step is
+		// a property of a wall-clock watermark, not of this recovery, and it is
+		// in the exception list docs/api-server.md's delivery contract
+		// enumerates. This comment deliberately does not restate that list.
+		//
 		// A server that has never established a bound reports CompleteThrough as
 		// the zero time. There is no safe target then — the clock is the unsafe
 		// one and zero would replay the whole archive — so the guard above leaves
