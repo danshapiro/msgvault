@@ -358,7 +358,12 @@ happens when every attempt to read the bound so far has been beaten by a writer
 — a SQLite server restarted in the middle of a bulk import is the usual cause —
 and it resolves by itself on the first quiet moment. Such a page carries no rows
 and echoes your cursor back unchanged, so it is safe to keep polling; just do
-not compute a lag from it.
+not compute a lag from it. It carries no rows because a page stops strictly
+below `complete_through`, and nothing in an archive is stamped below that
+non-instant: it is the [delivery contract](#delivery-contract)'s "a stamp at or
+above the current bound waits" case applied to every row at once, and like that
+case it delays changes rather than losing them — the whole archive from your
+cursor onward is delivered once the bound is established.
 
 A page never reaches `complete_through`: rows stamped in that same instant are
 held back, so on a page that returned rows, `next_since` is strictly below it —
@@ -383,7 +388,9 @@ The exception is a server that has not yet established a bound, which reports
 `complete_through` as `0001-01-01T00:00:00Z`. There is no proven-safe point to
 move your cursor to then, so it is echoed unchanged — and in that one case
 `next_since` can be above `server_time`. It resolves once the bound is
-established. You can reach the future-cursor state through no fault of your own —
+established; until then the feed returns no rows to any cursor, which the
+[delivery contract](#delivery-contract) covers as a stamp waiting for the bound
+to reach it. You can reach the future-cursor state through no fault of your own —
 a clock stepped backwards by an NTP correction, a resumed VM, or a restore onto
 slower hardware — so treat a `next_since` that differs from the cursor you sent
 as normal, not as an error.
@@ -520,14 +527,25 @@ there are surfaces it cannot see at all:
   committed, and a page stops strictly below `complete_through`. So a row
   stamped at or above the bound is not returned, and while it is the only thing
   outstanding the feed reports `has_more: false` — which reads exactly like being
-  caught up. **That is a delay, not a loss.** A cursor built the way this page
-  says to build it — from the last row a page returned, which is itself below
-  that page's bound — cannot get past the waiting stamp, so the row arrives on
-  the first page read after the bound clears it. You can reach this state through
+  caught up. **That is a delay, not a loss.** Neither of the two cursors this
+  page tells you to build can get past the waiting stamp, so the row arrives on
+  the first page read after the bound clears it. One is the cursor a page with
+  rows hands you, taken from its last row, which is itself below that page's
+  bound. The other is what an empty page hands you: normally the cursor you sent,
+  echoed unchanged, and in the one case where it is not — a cursor above the
+  database clock, clamped down to `complete_through` — it lands exactly *on* the
+  bound rather than below it. That is still safe, because the clamp also resets
+  `next_since_id` to `0` and every message id is greater than zero: the `id > 0`
+  half of the cursor comparison selects every row stamped at that exact instant,
+  so nothing waiting there is stepped over. You can reach this state through
   no fault of your own: a clock stepped backwards under the server by an NTP
   correction, a resumed VM, or a restore, in which case the wait is the length of
   the skew. A watermark written by hand for a future instant waits until that
-  instant genuinely arrives. On SQLite the column can also hold a value no bound
+  instant genuinely arrives. A server that has not yet established a bound is
+  this case at its limit: it reports `complete_through` as
+  `0001-01-01T00:00:00Z`, which is below every stamp in the archive, so no cursor
+  selects anything until the first bound reading — see `complete_through` under
+  the response fields above. On SQLite the column can also hold a value no bound
   will ever reach — text that is not date-shaped but sorts above every timestamp,
   or a blob, which sorts above every text value — and there the wait never ends
   and the change really is lost; that is case 2 of the unparseable-watermark
@@ -556,10 +574,18 @@ there are surfaces it cannot see at all:
   1. **Text ordering at or above your cursor and below the bound.** The row is
      returned, but its reported `content_changed_at` is the highest readable
      watermark the page had reached — the cursor you sent, or a readable row
-     earlier on the page — not the stored value. If it lands last on its page
-     the cursor stops there and the same row comes back on every poll; a
-     readable row after it on the same page moves the cursor past it instead,
-     after which that cursor never returns it again.
+     earlier on the page — not the stored value. A readable row after it on the
+     same page moves the cursor past it, after which that cursor never returns
+     it again. If it lands last on its page the cursor stops there instead and
+     the same row comes back on every poll — but only until the next change to
+     a tracked column anywhere in the archive. That change is stamped above the
+     malformed value, so it joins the very next page, and being readable and
+     last it carries the cursor past the malformed row for good. So the stall
+     lasts exactly as long as the rest of the archive stays quiet. The one
+     exception is a page that is already full when it reaches the malformed row,
+     which has no room to carry the newer row alongside it: a consumer polling
+     with `limit=1` is always in that position and stays stuck however busy the
+     archive is.
   2. **Text or a blob ordering at or above the bound.** Not returned at all, for
      as long as the bound stays below it — see the bullet on a stamp at or above
      the bound. A blob sorts
@@ -571,23 +597,31 @@ there are surfaces it cannot see at all:
      which compares against the empty string — and is never returned at all.
 
   In every case the archive and a mirror diverge on that row's tracked fields:
-  case 1 reports a watermark the row does not have and stalls the walk, and
-  cases 2 and 3 hide the change outright.
+  case 1 reports a watermark the row does not have and stalls the walk until the
+  next change elsewhere in the archive frees it, and cases 2 and 3 hide the
+  change outright.
 
   **Only case 1 is visible from the outside, and re-reading the feed from an
   empty cursor repairs none of the three.** Case 1 shows on the wire as a page
   that keeps returning rows while `next_since` comes back equal to the cursor you
-  sent, poll after poll — except when such a row is the only thing in the feed
-  **and** you sent no cursor, in which case `next_since` is omitted from the
-  response entirely and there is no cursor to compare. The omission is then the
-  signal instead: a page that returns rows and no `next_since` means no row on it
-  carried a readable watermark. Cases 2 and 3 are silent: no request reaches the
-  row, so nothing on the wire differs from a healthy feed. A re-read from an
-  empty cursor does not change that. It drops the feed's *lower* bound to the
-  empty string, which is below every stored text value but above
+  sent. That signal lasts only as long as the stall does, so a quiet archive is
+  what makes it observable: on a busy one the next tracked-column change frees
+  the walk, and a consumer that polls once a minute may never see two such
+  responses in a row. It is also the reason the symptom can vanish before you go
+  looking for it — the wrong watermark stays wrong, silently, after the walk has
+  moved on. The comparison is also unavailable in one case: when such a row is
+  the only thing in the feed **and** you sent no cursor, `next_since` is omitted
+  from the response entirely and there is no cursor to compare. The omission is
+  then the signal instead: a page that returns rows and no `next_since` means no
+  row on it carried a readable watermark. Cases 2 and 3 are silent: no request
+  reaches the row, so nothing on the wire differs from a healthy feed. A re-read
+  from an empty cursor does not change that. It drops the feed's *lower* bound
+  to the empty string, which is below every stored text value but above
   every stored number, so it does not reach case 3; it leaves the upper bound
-  alone, so it does not reach case 2; and it re-enters case 1 on the same
-  fixpoint, delivering the row again without ever advancing past it.
+  alone, so it does not reach case 2; and it re-enters case 1, delivering the
+  row again with the same wrong watermark and stalling on it again if it lands
+  last on its page — until, again, a later change elsewhere in the archive
+  carries the walk past it. The stored value is never repaired by any of this.
 
   Finding cases 2 and 3 needs a check that does not go through the feed at all,
   and comparing message ids is not enough: the same statement that writes an
@@ -604,12 +638,21 @@ there are surfaces it cannot see at all:
 * A consumer that must not diverge from the archive should still reconcile
   periodically — for example, a scheduled full re-read from an empty cursor. It
   re-delivers every row the feed can select, so it restores the tracked fields of
-  a case-1 row and lets you find a hard deletion by its absence from the walk.
-  What it does not do: it cannot reach cases 2 and 3 above, or a `NULL`
-  watermark — no cursor can — and it recovers nothing outside the tracked
+  a case-1 row. What it does not do: it cannot reach cases 2 and 3 above, or a
+  `NULL` watermark — no cursor can — and it recovers nothing outside the tracked
   columns, which no request to this feed ever carries. Catching a row no cursor
   reaches is the direct-database read described above; comparing message ids
   will not do it, for the reason given there.
+
+  Nor does a full re-read identify a hard deletion. A row in your mirror that
+  the walk never returns is simply a row no cursor can reach, and that is what a
+  hard deletion, cases 2
+  and 3, and a `NULL` watermark all look like from outside — the difference is
+  that in the last three the row is still in the archive, changing, with your
+  copy of it going stale. Absence from the walk narrows it to those four
+  possibilities and no further. Separating them takes the same direct-database
+  read: a row absent from a direct `SELECT` over `messages` was hard-deleted,
+  and one still there has a watermark the feed cannot reach.
 
 Re-reading an overlapping window is safe, so a consumer that wants extra margin
 can keep an older `next_since` of its own — the one from a few pages back — and

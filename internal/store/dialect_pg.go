@@ -582,9 +582,12 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		// (CURRENT_TIMESTAMP at the time the column is added); the triggers
 		// created by EnsureTriggers keep it current thereafter.
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS last_modified TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP`, "last_modified"},
-		// content_changed_at: content-scoped change watermark. No default, so
-		// the INSERT trigger is the single writer on both backends and the
-		// backfill seeds pre-existing rows from last_modified.
+		// content_changed_at: content-scoped change watermark. No default here
+		// and none in schema_pg.sql, so on PostgreSQL the INSERT trigger is the
+		// single writer for new rows, and the backfill seeds pre-existing rows
+		// from last_modified. SQLite is not the same: a database created from
+		// schema.sql stamps inserts from a column DEFAULT and gets no INSERT
+		// trigger at all (SQLiteDialect.EnsureTriggers).
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_changed_at TIMESTAMPTZ`, "content_changed_at"},
 	}
 }
@@ -634,12 +637,24 @@ func (d *PostgreSQLDialect) EnsureFTSIndex(q querier) error {
 // VALUE-scoped, so an external consumer maintaining an incremental copy of the
 // archive is woken only when the message's own content, routing, or lifecycle
 // actually changed — never by bookkeeping such as embed_gen or
-// indexing_version. Four triggers feed it, built from MessagesContentColumns
-// so the SQLite and PostgreSQL definitions cannot drift:
+// indexing_version. Four triggers feed it here, built from
+// MessagesContentColumns so the SQLite and PostgreSQL definitions cannot drift
+// (a fresh SQLite database runs three of them — see the first entry):
 //
-//   - trg_messages_content_changed_ins (BEFORE INSERT on messages): the column
-//     carries no DEFAULT on either backend, so this is the single writer for
-//     new rows. Its WHEN guard yields to an explicit write in the INSERT.
+//   - trg_messages_content_changed_ins (BEFORE INSERT on messages): stamps new
+//     rows. PostgreSQL's column carries no DEFAULT — neither in schema_pg.sql
+//     nor on the ALTER TABLE upgrade path — so on this backend the trigger is
+//     the single writer for new rows. SQLite is where that stops being true: a
+//     database created from schema.sql gives the column a DEFAULT
+//     byte-identical to SQLiteDialect.ContentChangedNow, and EnsureTriggers
+//     there detects it (contentChangedAtDefaultStamps) and creates no INSERT
+//     trigger at all, because a SQLite trigger cannot assign to NEW and merely
+//     having a row trigger on messages costs every INSERT a statement journal.
+//     So the single writer for new rows is this trigger on PostgreSQL, the
+//     column DEFAULT on a fresh SQLite database, and SQLite's AFTER INSERT
+//     trigger of the same name on a SQLite database upgraded by ALTER TABLE ADD
+//     COLUMN, which cannot carry a non-constant DEFAULT. The WHEN guard yields
+//     to an explicit write in the INSERT in every version.
 //   - trg_messages_content_changed_at (BEFORE UPDATE OF <content columns> on
 //     messages): UPDATE OF scopes it to the columns a statement NAMES, which
 //     is not enough on its own — UpsertMessage's ON CONFLICT DO UPDATE

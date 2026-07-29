@@ -360,9 +360,12 @@ func TestContentChangedAt_BodyWriteBumpsParent(t *testing.T) {
 		"a message_bodies UPDATE must bump the parent's content_changed_at")
 }
 
-// TestContentChangedAt_NewRowIsStamped proves the INSERT trigger stamps every
-// new message non-NULL. A NULL watermark drops the row out of the range query
-// permanently.
+// TestContentChangedAt_NewRowIsStamped proves every new message is stamped
+// non-NULL, whichever writer this backend uses for inserts: the BEFORE INSERT
+// trigger on PostgreSQL, the column DEFAULT on a SQLite database created from
+// schema.sql (which then gets no INSERT trigger at all), the INSERT trigger on
+// a SQLite database upgraded by ALTER TABLE. A NULL watermark drops the row out
+// of the range query permanently.
 func TestContentChangedAt_NewRowIsStamped(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	id := seedMessage(t, st, 1)
@@ -373,8 +376,8 @@ func TestContentChangedAt_NewRowIsStamped(t *testing.T) {
 		id).Scan(&nulls), "count NULL content_changed_at")
 
 	assert.Equal(t, 0, nulls,
-		"the INSERT trigger must stamp every new message: the column carries no DEFAULT "+
-			"on either backend, so a NULL watermark would hide the row from the feed forever")
+		"every new message must be stamped by whichever writer this backend uses for "+
+			"inserts, since a NULL watermark would hide the row from the feed forever")
 	assert.NotEqual(t, contentChangedPast, readContentChangedAt(t, st, id),
 		"a freshly inserted message must be stamped with the current time")
 }
@@ -419,11 +422,14 @@ func stampLastModified(t *testing.T, st *store.Store, id int64, value string) {
 	require.NoError(t, err, "stamp last_modified")
 }
 
-// contentChangedAtTriggerNames are the four triggers EnsureTriggers creates on
-// both backends (dialect_sqlite.go, dialect_pg.go): two on messages (INSERT,
-// UPDATE) and two on message_bodies (INSERT, UPDATE), all of which reference
-// content_changed_at and must be dropped before SQLite will allow the column
-// itself to be dropped.
+// contentChangedAtTriggerNames are the four triggers EnsureTriggers can create
+// (dialect_sqlite.go, dialect_pg.go): two on messages (INSERT, UPDATE) and two
+// on message_bodies (INSERT, UPDATE), all of which reference content_changed_at
+// and must be dropped before SQLite will allow the column itself to be dropped.
+// Only three of them exist on a SQLite database created from schema.sql, whose
+// column DEFAULT stamps inserts and where EnsureTriggers therefore skips
+// trg_messages_content_changed_ins; the drops below are IF EXISTS for that
+// reason.
 var contentChangedAtTriggerNames = []struct {
 	name  string
 	table string
@@ -480,12 +486,13 @@ func clearContentChangedBackfillLedger(t *testing.T, st *store.Store) {
 // Without an INSERT trigger those rows would be NULL forever, because neither
 // ADD COLUMN carries a default, and they would never appear in the feed.
 //
-// A store from testutil.NewTestStore already has the column, its index, all
-// four triggers, and the backfill's ledger row, so the naive version of this
-// test would find nothing to upgrade: InitSchema would skip the backfill
-// (ledger already marked applied) and the ADD COLUMN migration would be a
-// silent no-op (IsDuplicateColumnError). dropContentChangedAtColumn and
-// clearContentChangedBackfillLedger reconstruct the pre-upgrade shape first.
+// A store from testutil.NewTestStore already has the column, its index, the
+// triggers this backend creates for it, and the backfill's ledger row, so the
+// naive version of this test would find nothing to upgrade: InitSchema would
+// skip the backfill (ledger already marked applied) and the ADD COLUMN
+// migration would be a silent no-op (IsDuplicateColumnError).
+// dropContentChangedAtColumn and clearContentChangedBackfillLedger reconstruct
+// the pre-upgrade shape first.
 func TestContentChangedAt_UpgradeFromDatabaseWithoutColumn(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)

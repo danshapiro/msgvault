@@ -1292,6 +1292,19 @@ func (s *Store) ListChangedMessages(
 	// readable row after it on the same page advances the cursor past it
 	// instead.
 	//
+	// The fixpoint is NOT permanent, and the difference matters to anyone
+	// reading a report of one. Every later stamp sorts above the unreadable
+	// value — it had to sort below this page's bound to be selected at all, and
+	// the bound only moves forward — so the next change to a tracked column
+	// anywhere in the archive joins the repeating page as a readable last row
+	// and moves the cursor past the unreadable one for good. It lasts as long
+	// as the archive is otherwise quiet. Measured on SQLite: from a frozen
+	// cursor, one insert turned the page from [malformed] into
+	// [malformed, new], the cursor advanced to the new row, and the malformed
+	// row never came back. The exception is a page already full when it reaches
+	// the unreadable row, which has no room for the newer one — a limit of 1
+	// always is, and stays frozen (measured).
+	//
 	// Whether such a row is selected at all is decided by where its RAW stored
 	// value orders against this page's two bounds, not by whether Go can parse
 	// it: content_changed_at is a non-STRICT DATETIME column, so direct SQL can
