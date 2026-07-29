@@ -37,15 +37,18 @@ type ColumnMigration struct {
 // server_time.
 //
 // CommitBound is the instant strictly below which every content_changed_at
-// stamp in the database is already COMMITTED, and it is the page's upper bound.
-// The distinction is the whole point: both backends stamp the watermark when
-// the statement runs and publish the row when its transaction commits, so a row
-// can carry a stamp the clock has already passed and still be invisible. Paging
-// up to the clock parks the consumer's cursor above such a row, which then
-// fails both arms of the keyset lower bound forever — measured at 40 of 40
-// tombstones lost from one PostgreSQL deletion run. Paging up to the oldest
-// write that could still commit cannot: every uncommitted stamp is at or above
-// that instant.
+// stamp made by a write the bound can see is already COMMITTED, and it is the
+// page's upper bound. The distinction is the whole point: both backends stamp
+// the watermark when the statement runs and publish the row when its
+// transaction commits, so a row can carry a stamp the clock has already passed
+// and still be invisible. Paging up to the clock parks the consumer's cursor
+// above such a row, which then fails both arms of the keyset lower bound
+// forever — measured at 40 of 40 tombstones lost from one PostgreSQL deletion
+// run. Paging up to the oldest write that could still commit cannot: every
+// uncommitted stamp is at or above that instant. The one write this cannot
+// cover is a PostgreSQL prepared transaction, which holds its locks with no
+// owning session and so exposes no start time to be the oldest; that residual
+// is documented in docs/api-server.md.
 //
 // CommitBound is never after Now, and it lags Now by however long the oldest
 // in-flight write transaction has been open. That lag is the feature's cost:
