@@ -10,9 +10,11 @@ import (
 // content_changed_at triggers on both backends.
 //
 // The invariant tying this list to the change feed is one-directional: every
-// field the feed returns must appear here, because a field the endpoint reports
-// but the trigger ignores would be cached stale by a consumer forever. The
-// converse does not hold. This list also covers columns the feed does not
+// field the feed returns must appear here, EXCEPT id, source_id, and
+// content_changed_at (immutable identity and the watermark itself — see
+// TestChangesResponseFieldsAreAllTracked's exempt list). Any other field the
+// endpoint reports but the trigger ignores would be cached stale by a
+// consumer forever. The converse does not hold. This list also covers columns the feed does not
 // return — sender_id and metadata are tracked because changing either means
 // "re-read this message", yet neither is in the response — and that is correct:
 // tracking a column the feed omits costs a redundant re-read, while omitting a

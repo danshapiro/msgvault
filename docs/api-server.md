@@ -255,12 +255,13 @@ imported today with ten-year-old mail shows up in the very next page. Messages
 hidden by deduplication and messages deleted at the source are included, with
 their `deleted_at` and `deleted_from_source_at` timestamps set.
 
-**Every field in the feed's rows that can change moves the watermark, and two
-columns beyond them do too.** The watermark moves for changes to the mutable
-fields the feed returns; for message-body edits; and for two columns the feed
-does not return — the sender pointer (`messages.sender_id`; not the sender
-identity a consumer sees, which is resolved from `participants` — see the table
-below) and the platform metadata payload — because changing either means the
+**Every field in the feed's rows that can change moves the watermark — except
+the watermark column itself — and two columns beyond them do too.** The
+watermark moves for changes to the mutable fields the feed returns; for
+message-body edits; and for two columns the feed does not return — the sender
+pointer (`messages.sender_id`; not the sender identity a consumer sees, which
+is resolved from a join of `participants` and `message_recipients` — see the
+table below) and the platform metadata payload — because changing either means the
 message is worth re-reading. It never moves for anything else. Three fields in
 a feed row are outside it by nature rather than by omission: `id` and
 `source_id` are immutable identity, and `content_changed_at` is the watermark
