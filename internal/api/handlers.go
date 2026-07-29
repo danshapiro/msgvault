@@ -2762,7 +2762,8 @@ type ChangedMessageJSON struct {
 // can send the response straight back as its next request; zero values would
 // restart it from the beginning of the archive on every poll. The one exception
 // is a cursor above the database clock, which is clamped down to CompleteThrough
-// so recovery cannot step over a write that has not committed yet — see
+// so recovery cannot step over a write that has not committed yet; on a server
+// that has not yet established a bound, it is echoed unchanged instead — see
 // handleMessageChanges. ServerTime is the database's clock reading, for callers
 // that re-read an overlapping window.
 //

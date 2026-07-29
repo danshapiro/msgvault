@@ -1274,14 +1274,28 @@ func (s *Store) ListChangedMessages(
 	defer func() { _ = rows.Close() }()
 
 	page := ChangedMessagePage{ServerTime: bounds.Now, CompleteThrough: bounds.CommitBound}
-	// The substitute for a watermark the scanner CANNOT read — a format
-	// parseSQLiteTime does not enumerate, which no write path here produces but
-	// direct SQL can. Such a value otherwise arrives as the year-1 zero time,
-	// and a consumer that derives its next cursor from it replays the whole
-	// archive on every poll for good. The row is still reported; its watermark
-	// becomes the newest value the raw column is known to be at least, which is
-	// the cursor the page was read from or the last readable watermark before
-	// it, whichever is later.
+	// Whether the row is reported at all depends on how its stored value orders
+	// against the page's bounds, which for a TEXT value is a lexical comparison.
+	// Within the page's bounds — at or above the cursor as well as below the
+	// upper bound; a value below the cursor is excluded like any other — the row
+	// IS reported, and its watermark becomes the
+	// newest value the raw column is known to be at least — the cursor the page
+	// was read from, or the last readable watermark before it, whichever is
+	// later. That floor is not advanced by this row. So if the row is also the
+	// LAST on its page, the next request repeats byte for byte and returns it
+	// again, and again; a readable row after it on the same page advances the
+	// cursor past it instead. At or above the upper bound the row is excluded and
+	// not reported at all, for as long as the bound stays below it.
+	//
+	// This describes malformed TEXT. content_changed_at is a non-STRICT DATETIME
+	// column, so direct SQL can also store INTEGER, REAL or BLOB, which order by
+	// SQLite's type rules rather than lexically; the failure is the same shape
+	// but the ordering that decides which case applies is not.
+	//
+	// Documented in docs/api-server.md. There is no fix here that keeps the row
+	// reported, advances the walk, and leaves the meaning of the published cursor
+	// alone — publishing anything above the row's own stamp silently drops
+	// readable changes between the two.
 	//
 	// It applies ONLY to the unreadable case. A watermark that scanned fine is
 	// published exactly as stored even when it sorts below the cursor, which is

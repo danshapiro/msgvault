@@ -435,8 +435,13 @@ archive.
 
 **What the feed guarantees.** Every change to a tracked column that commits
 before a page's `complete_through` is delivered by following `next_since` from
-that page, in as many further pages as `has_more` calls for. Nothing that
-commits is skipped over, however long the writing transaction took. That is what
+that page, in as many further pages as `has_more` calls for. A change written
+the ordinary way — through the application, with the watermark left to the
+database triggers — is not skipped over, however long its writing transaction
+took. Two things fall outside that: a PostgreSQL prepared transaction, which
+the bound cannot see, and a watermark written explicitly by direct SQL, which
+the triggers deliberately yield to and which the feed cannot order if it does
+not parse. Both are in the best-effort list below. That is what
 `complete_through` is for: the page stops below the oldest write that could
 still commit, not below the clock, so the cursor can never come to rest above a
 change that has been stamped but not yet published. The guarantee is about the
@@ -487,13 +492,50 @@ consumer only once, and there are surfaces it cannot see at all:
   reading with every writer visible — the endpoint returns `500` rather than a
   page, and the server log names the grant. It clears by itself when that
   transaction ends.
+* **PostgreSQL only:** a *prepared* transaction (two-phase commit) holds its
+  locks without an owning session, so the feed cannot see when it began. A
+  prepared transaction that wrote to the message table and then committed could
+  publish its change behind a cursor that had already moved past it. This needs
+  `max_prepared_transactions > 0`, which is off by default; msgvault never uses
+  two-phase commit, so it arises only if another application runs prepared
+  transactions against the same database. If yours does, reconcile independently
+  rather than relying on the feed.
+* A `content_changed_at` value the server cannot parse — which no write path
+  produces, but direct SQL against the archive can — is not recoverable by
+  polling, and which way it fails depends on where the value orders against the
+  feed's bounds. One ordering below the current bound, *and landing last on its
+  page*, is returned on every poll and the cursor stops advancing there; a
+  readable row after it on the same page moves the cursor past it instead. If
+  such a row is the only thing in the feed **and** you sent no cursor,
+  `next_since` is omitted from the response entirely, so watching the cursor will
+  not reveal it. One ordering at or above the bound is not returned at all for as
+  long as the bound stays below it — for values that are not date-shaped, that is
+  indefinitely. Either way the archive and a mirror diverge silently.
+
+  **Re-reading the feed from an empty cursor does not detect either case.** An
+  empty cursor removes the feed's *lower* bound, but it is the upper bound that
+  excludes the second, and the first re-traps the walk exactly as before.
+  Detecting them needs a check that does not go through the feed at all, and
+  comparing message ids is not enough: the same statement that writes an
+  unparseable watermark can also change a tracked field, so the archive and the
+  mirror can hold identical id sets while the contents differ. What it takes is
+  reading the rows themselves — including dedup-hidden and source-deleted ones,
+  which ordinary listing endpoints omit — and comparing content, or comparing a
+  digest per message. The repair is to correct the stored watermark.
+
+  This describes a malformed text value. `content_changed_at` is a non-`STRICT`
+  `DATETIME` column, so direct SQL can also leave a number or a blob there; the
+  divergence is the same, but which of the two cases applies is decided by
+  SQLite's type ordering rather than by string comparison.
+* A consumer that must not diverge from the archive should still reconcile
+  periodically — for example, a scheduled full re-read from an empty cursor. That
+  recovers every surface above except an unparseable watermark ordering at or
+  above the bound, which no feed request reaches; catching that one means
+  comparing your mirror's message ids against the archive's own list.
 * If a watermark is somehow *ahead* of the database clock — a stored value
   written by hand, or a clock stepped backwards under the server — that row stays
   invisible for as long as the skew lasts, and the feed reports `has_more: false`
   the whole time.
-* A consumer that must not diverge from the archive should still reconcile
-  periodically — for example, a scheduled full re-read from an empty cursor. It
-  is the only thing that recovers the surfaces above.
 
 Re-reading an overlapping window is safe, so a consumer that wants extra margin
 can keep an older `next_since` of its own — the one from a few pages back — and
