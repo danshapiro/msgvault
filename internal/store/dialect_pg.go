@@ -44,10 +44,17 @@ func (d *PostgreSQLDialect) Rebind(query string) string {
 func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 
 // ContentChangedNow returns the PostgreSQL expression that stamps
-// content_changed_at. clock_timestamp() (unlike NOW(), which is fixed for
-// the duration of a transaction) advances within a transaction, giving
-// microsecond-resolution, monotonically distinct stamps for the
-// (content_changed_at, id) change-feed cursor.
+// content_changed_at. clock_timestamp() reads the wall clock at the moment of
+// the call, so — unlike NOW(), which is fixed for the duration of a transaction
+// — rows written by one transaction get microsecond-resolution stamps that can
+// be told apart, rather than one shared instant.
+//
+// It is a clock, not a sequence: PostgreSQL guarantees neither that successive
+// readings differ nor that they only move forward. Ties the
+// (content_changed_at, id) cursor breaks by id. Backward movement it cannot
+// repair — a cursor only advances — and what that costs a consumer is
+// enumerated, with every other exception to what the feed delivers, in one
+// place: docs/api-server.md's delivery contract.
 func (d *PostgreSQLDialect) ContentChangedNow() string { return "clock_timestamp()" }
 
 // TimestampParam returns t unchanged (as UTC): PostgreSQL's TIMESTAMPTZ
