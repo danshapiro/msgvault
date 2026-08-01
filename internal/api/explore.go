@@ -237,7 +237,7 @@ func registerExploreRoute[Req any, Resp any](api huma.API, operationID, path, su
 	op.Responses[httpStatusKey(http.StatusServiceUnavailable)] = &huma.Response{
 		Description: http.StatusText(http.StatusServiceUnavailable),
 		Content: map[string]*huma.MediaType{
-			"application/json": {Schema: &huma.Schema{AnyOf: []*huma.Schema{
+			applicationJSONMediaType: {Schema: &huma.Schema{AnyOf: []*huma.Schema{
 				schemaFor[ExploreCacheUnavailableResponse](api),
 				schemaFor[ErrorResponse](api),
 			}}},
@@ -1619,7 +1619,7 @@ func (s *Server) writeExploreError(w http.ResponseWriter, err error) {
 		return
 	}
 	s.logger.Error("exploration failed", "error", err)
-	writeError(w, http.StatusInternalServerError, "explore_failed", "Analytical exploration failed")
+	writeError(w, http.StatusInternalServerError, "explore_failed", "Couldn't load results")
 }
 
 type ExploreCacheUnavailableResponse struct {

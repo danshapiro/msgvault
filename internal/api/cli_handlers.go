@@ -386,13 +386,15 @@ type CLICacheBuildEvent struct {
 }
 
 type CLISyncRequest struct {
-	Full     bool
-	Email    string
-	Query    string
-	NoResume bool
-	Before   string
-	After    string
-	Limit    int
+	Full        bool
+	Email       string
+	Query       string
+	NoResume    bool
+	Before      string
+	After       string
+	Limit       int
+	Folders     []string
+	SkipFolders []string
 }
 
 type CLISyncEvent struct {
@@ -982,6 +984,16 @@ func parseCLISyncRequest(r *http.Request, full bool) (CLISyncRequest, *apiHTTPEr
 		Before: values.Get("before"),
 		After:  values.Get("after"),
 	}
+	for _, v := range values["folder"] {
+		if v != "" {
+			req.Folders = append(req.Folders, v)
+		}
+	}
+	for _, v := range values["skip-folder"] {
+		if v != "" {
+			req.SkipFolders = append(req.SkipFolders, v)
+		}
+	}
 	if rawNoResume := values.Get("noresume"); rawNoResume != "" {
 		noResume, err := strconv.ParseBool(rawNoResume)
 		if err != nil {
@@ -1293,10 +1305,12 @@ func cliRunCommandAllowed(args []string) bool {
 		"add-granola",
 		"add-imap",
 		"add-o365",
+		"add-slack",
 		"add-synctech-sms-drive",
 		"add-teams",
 		"backfill-beeper-media",
 		"backfill-discord-media",
+		"backfill-slack-media",
 		"backfill-teams-media",
 		"build-embeddings",
 		"cancel-deletion",
@@ -1316,6 +1330,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"import-synctech-sms",
 		"import-whatsapp",
 		"list-deletions",
+		"list-folders",
 		"logs",
 		"pack-attachments",
 		"repair-dates",
@@ -1327,6 +1342,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"sync-circleback",
 		"sync-discord",
 		"sync-granola",
+		"sync-slack",
 		"sync-synctech-sms",
 		"sync-teams":
 		return true
@@ -2178,20 +2194,21 @@ func (s *Server) addCLIIdentity(ctx context.Context, req identityops.AddRequest)
 			"Failed to add identity",
 		)
 	}
-	// AddAccountIdentity bumps the identity revision when it confirms a
-	// brand new (source_id, address) pair, changing owner_participants; the
-	// refresh is attempted unconditionally since it is an idempotent
-	// full re-export and the mutation already committed either way.
-	result.CacheState = s.refreshIdentityCacheState(ctx)
-	// Confirming a brand new pair also changes the is_from_me flag baked
-	// into the message Parquet shards, which the identity-only refresh
-	// above never re-derives — only a full cache rebuild does. Merging a
-	// signal into an already-confirmed address does not change ownership,
-	// so only the "added" outcome schedules one and reports the cache as
-	// stale until it lands.
+	// Confirming a brand new (source_id, address) pair bumps the store's
+	// account-identity revision and invalidates the is_from_me flag baked
+	// into the message Parquet shards, which only a full cache rebuild
+	// re-derives. A synchronous derived refresh would be wasted work here:
+	// the revision bump makes the derived-only child refuse its
+	// precondition and escalate to a full rebuild inside this request,
+	// duplicating the background build scheduled below. Skip it, report
+	// the cache stale, and let that single background build repair
+	// everything. Non-mutating outcomes leave the revision untouched, so
+	// the cheap synchronous derived refresh succeeds and is sufficient.
 	if result.Outcome == identityops.AddOutcomeAdded {
 		s.scheduleAccountIdentityCacheRebuild(ctx)
 		result.CacheState = identityCacheStateStale
+	} else {
+		result.CacheState = s.refreshIdentityCacheState(ctx)
 	}
 	return result, nil
 }
@@ -2211,18 +2228,16 @@ func (s *Server) removeCLIIdentity(ctx context.Context, req identityops.RemoveRe
 			"Failed to remove identity",
 		)
 	}
-	// RemoveAccountIdentity only bumps the identity revision on an actual
-	// deletion, but the refresh is attempted unconditionally for the same
-	// reason as addCLIIdentity: it is an idempotent full re-export and the
-	// mutation already committed either way.
-	result.CacheState = s.refreshIdentityCacheState(ctx)
 	// An actual deletion (Removed > 0 — the only way Remove succeeds)
-	// also invalidates the message-baked is_from_me flag, so it needs the
-	// same full-rebuild scheduling as addCLIIdentity and the same stale
-	// cache report until that rebuild lands.
+	// bumps the account-identity revision and invalidates the
+	// message-baked is_from_me flag, so it takes the same
+	// skip-synchronous-refresh path as addCLIIdentity: one scheduled
+	// background full rebuild and a stale cache report until it lands.
 	if result.Removed > 0 {
 		s.scheduleAccountIdentityCacheRebuild(ctx)
 		result.CacheState = identityCacheStateStale
+	} else {
+		result.CacheState = s.refreshIdentityCacheState(ctx)
 	}
 	return result, nil
 }

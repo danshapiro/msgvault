@@ -37,6 +37,14 @@ func TestGeneratedSavedViewStateRoundTripsCanonicalDefinition(t *testing.T) {
 	assert.JSONEq(t, want, string(got))
 }
 
+func TestGeneratedPatchPersonCanClearDisplayName(t *testing.T) {
+	body := generated.PatchPersonBody{DisplayName: nil}
+	require.NoError(t, body.Validate())
+	encoded, err := json.Marshal(body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"display_name":null}`, string(encoded))
+}
+
 func TestGeneratedEnumNamesPreserveSavedViewCompatibilityAndQualifyExploration(t *testing.T) {
 	assertions := assert.New(t)
 	assertions.Equal(generated.Asc, generated.SavedViewSortDirection("asc"))
@@ -509,6 +517,72 @@ func TestAddAccountAcceptsIdempotentOK(t *testing.T) {
 
 	assert.Equal("ok", got.Status, "status")
 	assert.Equal("account already exists", got.Message, "message")
+}
+
+func TestCreatePersonAcceptsIdempotentOK(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodPost, r.Method, "method")
+		assert.Equal("/api/v1/persons", r.URL.Path, "path")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": 7,
+			"vcard_uid": "17b0c43a-3feb-4a2d-bc47-3a87578a9abe",
+			"revision": 2,
+			"participant_ids": [42],
+			"created_at": "2026-07-29T12:00:00Z",
+			"updated_at": "2026-07-29T12:00:00Z"
+		}`))
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(server.URL)
+	require.NoError(err, "New")
+
+	got, err := c.CreatePerson(context.Background(), &generated.CreatePersonRequestOptions{
+		Body: &generated.CreatePersonBody{ParticipantID: 42},
+	})
+	require.NoError(err, "CreatePerson")
+
+	assert.Equal(int64(7), got.ID, "id")
+	assert.Equal(int64(2), got.Revision, "revision")
+}
+
+func TestImportMeetingAcceptsIdempotentOK(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodPost, r.Method, "method")
+		assert.Equal("/api/v1/import/meeting", r.URL.Path, "path")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(
+			`{"status":"updated","source_id":3,"message_id":901,"source_message_id":"meeting:synthetic-meeting-42"}`,
+		))
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(server.URL)
+	require.NoError(err, "New")
+
+	got, err := c.ImportMeeting(context.Background(), &generated.ImportMeetingRequestOptions{
+		Body: &generated.ImportMeetingBody{
+			Source: generated.Source{
+				Identifier:   "local-meetings",
+				AccountEmail: "user@example.com",
+			},
+			Meeting: generated.Meeting{
+				ExternalID: "synthetic-meeting-42",
+				StartedAt:  "2026-07-23T18:00:00Z",
+			},
+		},
+	})
+	require.NoError(err, "ImportMeeting update")
+
+	assert.Equal(generated.MeetingImportResponseStatusUpdated, got.Status, "status")
+	assert.Equal(int64(901), got.MessageID, "message id")
 }
 
 func TestStageDeletionAcceptsDryRunOK(t *testing.T) {

@@ -515,10 +515,19 @@ func (s *Store) withTxContext(ctx context.Context, fn func(tx *loggedTx) error) 
 		}
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Warn("sql tx commit failed",
 			"error", err.Error(),
 			"duration_ms", time.Since(start).Milliseconds())
+		if errors.Is(err, sql.ErrTxDone) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+		}
 		return err
 	}
 	// A tx crossing the slow threshold is a diagnostic, not a problem —
@@ -603,12 +612,21 @@ func (s *Store) runMaintenance(ctx context.Context, fn func(ctx context.Context,
 // so streaming-query timing reflects scan-close, not just prepare.
 type chunkQuerier interface {
 	Query(query string, args ...any) (*loggedRows, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*loggedRows, error)
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
 func queryInChunks[T any](db chunkQuerier, ids []T, prefixArgs []any, queryTemplate string, fn func(*loggedRows) error) error {
+	return queryInChunksContext(context.Background(), db, ids, prefixArgs, queryTemplate, fn)
+}
+
+func queryInChunksContext[T any](ctx context.Context, db chunkQuerier, ids []T, prefixArgs []any, queryTemplate string, fn func(*loggedRows) error) error {
 	const chunkSize = 500
 	for i := 0; i < len(ids); i += chunkSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		end := min(i+chunkSize, len(ids))
 		chunk := ids[i:end]
 
@@ -620,7 +638,7 @@ func queryInChunks[T any](db chunkQuerier, ids []T, prefixArgs []any, queryTempl
 		}
 
 		query := fmt.Sprintf(queryTemplate, strings.Join(placeholders, ","))
-		rows, err := db.Query(query, args...)
+		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -655,7 +673,9 @@ type chunkInsert struct {
 // parameter limit (999). valueBuilder generates the VALUES placeholders and
 // args for each chunk of row indices. Rebinding to the dialect's placeholder
 // form happens inside tx.Exec (loggedTx wraps the dialect's Rebind).
-func insertInChunks(tx *loggedTx, c chunkInsert, valueBuilder func(start, end int) ([]string, []any)) error {
+func insertInChunks(tx interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, c chunkInsert, valueBuilder func(start, end int) ([]string, []any)) error {
 	// SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999
 	// Leave some margin for safety
 	const maxParams = 900
@@ -875,6 +895,53 @@ func (s *Store) InitSchema() error {
 		return fmt.Errorf("ensure message watermark triggers: %w", err)
 	}
 
+	// Initialize explicit attribution provenance for every legacy message once
+	// under the maintenance timeout escape hatch. Granola and Circleback
+	// historically derived is_from_me from confirmed organizer identities.
+	// Google Calendar combined that signal with Organizer.Self, so its archived
+	// event payload separates source-native ownership from identity-derived
+	// ownership. Other providers' existing values are source-native. Runtime
+	// identity mutations can then update only rows whose derived attribution
+	// actually changes instead of rewriting an entire source to initialize NULL
+	// provenance.
+	attributionMigrated, err := s.IsMigrationApplied(migrationMessageAttributionProvenance)
+	if err != nil {
+		return err
+	}
+	if !attributionMigrated {
+		if err := s.runMaintenance(
+			context.Background(),
+			func(ctx context.Context, tx *loggedTx) error {
+				if err := backfillLegacyMessageAttributionProvenance(ctx, tx); err != nil {
+					return err
+				}
+
+				// Published message shards used to trust the effective
+				// is_from_me value. The provenance migration changes cache
+				// inputs even when no identity is added or removed, so advance
+				// the account-identity revision in the same transaction as the
+				// repaired rows. Empty archives have no stale shards to
+				// invalidate.
+				var hasMessages bool
+				if err := tx.QueryRowContext(
+					ctx,
+					`SELECT EXISTS (SELECT 1 FROM messages)`,
+				).Scan(&hasMessages); err != nil {
+					return fmt.Errorf("check attribution migration cache impact: %w", err)
+				}
+				if !hasMessages {
+					return nil
+				}
+				return s.bumpAccountIdentityRevisionContext(ctx, tx)
+			},
+		); err != nil {
+			return err
+		}
+		if err := s.MarkMigrationApplied(migrationMessageAttributionProvenance); err != nil {
+			return err
+		}
+	}
+
 	// Partial expression indexes for live-message listing and date filtering.
 	// The first is a covering index for the ListMessages page
 	// (GET /api/v1/messages).
@@ -990,6 +1057,30 @@ func (s *Store) InitSchema() error {
 		}); err != nil {
 			return fmt.Errorf("create attachment lookup indexes: %w", err)
 		}
+	}
+
+	// Index over rfc822_message_id serves dedup's per-group message lookup
+	// (GetDuplicateGroupMessages / GetDuplicateGroupMessagesBatch). Without
+	// it, each lookup was a full scan of the messages table — measured at
+	// ~190ms/lookup, with one lookup per duplicate group, so a scan with
+	// 22k groups burned the entire 30-minute CLI plan-request timeout
+	// before content-hash comparison even started (kenn-io/msgvault#510).
+	// Plain (non-partial) index: a partial WHERE rfc822_message_id IS NOT
+	// NULL AND != '' form is not usable by the planner for this table's
+	// bound `= ?` / `IN (...)` lookups — SQLite can't prove col = ? implies
+	// col != '' since ? could bind to '' — so it would silently fall back
+	// to SCAN (verified via EXPLAIN QUERY PLAN before writing this).
+	// Identical DDL on both backends; runMaintenance already handles the
+	// PostgreSQL statement_timeout exemption internally (finding S1). IF
+	// NOT EXISTS is idempotent per start.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		_, err := tx.ExecContext(ctx, `
+			CREATE INDEX IF NOT EXISTS idx_messages_rfc822_message_id
+			    ON messages(rfc822_message_id)
+		`)
+		return err
+	}); err != nil {
+		return fmt.Errorf("create rfc822 message id index: %w", err)
 	}
 
 	// Backfill last_modified for rows that predate the column. SQLite cannot

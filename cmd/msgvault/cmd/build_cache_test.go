@@ -19,6 +19,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
 )
 
@@ -144,6 +145,22 @@ func setupTestSQLite(t *testing.T) string {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (participant_a, participant_b),
 			CHECK (participant_a < participant_b)
+		);
+
+		CREATE TABLE persons (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vcard_uid TEXT NOT NULL UNIQUE,
+			display_name TEXT,
+			revision INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE person_participants (
+			person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+			participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+			PRIMARY KEY (person_id, participant_id),
+			UNIQUE(participant_id)
 		);
 	`
 
@@ -405,7 +422,7 @@ func TestBuildCacheStagingCleanupRemovesAbandonedBuild(t *testing.T) {
 	assert.Empty(cacheStagingPaths(t, analyticsDir))
 }
 
-func TestBuildCachePublishInterruptionRejectsReaders(t *testing.T) {
+func TestBuildCachePublishInterruptionKeepsCommittedCacheReadable(t *testing.T) {
 	require := require.New(t)
 	tmpDir := setupTestSQLite(t)
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -419,16 +436,16 @@ func TestBuildCachePublishInterruptionRejectsReaders(t *testing.T) {
 	insertSixthMessage(t, dbPath)
 
 	publishErr := errors.New("simulated publish interruption")
-	buildCacheAfterStateInvalidationHook = func() error { return publishErr }
-	t.Cleanup(func() { buildCacheAfterStateInvalidationHook = nil })
+	buildCacheBeforePublicationMovesHook = func() error { return publishErr }
+	t.Cleanup(func() { buildCacheBeforePublicationMovesHook = nil })
 	_, err = buildCache(dbPath, analyticsDir, false)
 	require.ErrorIs(err, publishErr)
 
 	readiness, inspectErr := query.InspectCacheReadiness(analyticsDir)
 	require.NoError(inspectErr)
-	assert.Equal(t, query.CacheInterrupted, readiness)
+	assert.Equal(t, query.CacheReady, readiness)
 	_, err = engine.Aggregate(context.Background(), query.ViewSenders, query.DefaultAggregateOptions())
-	require.ErrorIs(err, query.ErrCacheUnavailable)
+	require.NoError(err)
 }
 
 func TestBuildCacheEmptyStatelessReplacesStaleShards(t *testing.T) {
@@ -564,10 +581,10 @@ func insertSixthMessage(t *testing.T, dbPath string) {
 	require.NoError(t, err, "insert new message")
 }
 
-// TestBuildCacheFailedStateWriteForcesFullRebuild pins that a failed
-// _last_sync.json write fails inside the publication window and leaves the
-// cache stateless, forcing the next build to replace all live datasets.
-func TestBuildCacheFailedStateWriteForcesFullRebuild(t *testing.T) {
+// TestBuildCacheFailedStateWriteLeavesIncrementalDrift pins marker-last
+// publication: a failed marker write leaves the prior marker in place, and the
+// already-moved append is rejected as drift until the next rebuild.
+func TestBuildCacheFailedStateWriteLeavesIncrementalDrift(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := setupTestSQLite(t)
@@ -576,6 +593,8 @@ func TestBuildCacheFailedStateWriteForcesFullRebuild(t *testing.T) {
 
 	_, err := buildCache(dbPath, analyticsDir, false)
 	require.NoError(err, "initial build")
+	stateBefore, err := os.ReadFile(query.CacheStatePath(analyticsDir))
+	require.NoError(err)
 	insertSixthMessage(t, dbPath)
 
 	buildCacheWriteStateFile = func(string, []byte, os.FileMode) error {
@@ -583,12 +602,15 @@ func TestBuildCacheFailedStateWriteForcesFullRebuild(t *testing.T) {
 	}
 	_, err = buildCache(dbPath, analyticsDir, false)
 	buildCacheWriteStateFile = os.WriteFile
-	require.ErrorContains(err, "save cache sync state",
+	require.ErrorContains(err, "simulated state write failure",
 		"incremental build must fail when the sync state cannot be persisted")
 
-	_, err = os.Stat(filepath.Join(analyticsDir, "_last_sync.json"))
-	assert.True(os.IsNotExist(err),
-		"a build with unpersisted sync state must leave no stale state behind")
+	stateAfter, err := os.ReadFile(query.CacheStatePath(analyticsDir))
+	require.NoError(err)
+	assert.Equal(stateBefore, stateAfter)
+	assert.Equal(1, countCachedMessages(t, analyticsDir, 6),
+		"dataset moves precede the marker commit")
+	assert.Equal(query.CacheDrifted, mustInspectCacheReadiness(t, analyticsDir))
 
 	_, err = buildCache(dbPath, analyticsDir, false)
 	require.NoError(err, "retry build")
@@ -596,10 +618,9 @@ func TestBuildCacheFailedStateWriteForcesFullRebuild(t *testing.T) {
 		"retry after a failed state write must not duplicate message rows")
 }
 
-// TestBuildCacheFailedStateWriteFullRebuildLeavesNoStaleState pins that a
-// full rebuild state write failure leaves no commit marker, so the published
-// replacement files cannot be mistaken for a committed cache.
-func TestBuildCacheFailedStateWriteFullRebuildLeavesNoStaleState(t *testing.T) {
+// TestBuildCacheFailedStateWriteLeavesFullRebuildDrift pins that a full
+// replacement is also marker-last and recovered by rebuilding, not rollback.
+func TestBuildCacheFailedStateWriteLeavesFullRebuildDrift(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := setupTestSQLite(t)
@@ -608,6 +629,8 @@ func TestBuildCacheFailedStateWriteFullRebuildLeavesNoStaleState(t *testing.T) {
 
 	_, err := buildCache(dbPath, analyticsDir, false)
 	require.NoError(err, "initial build")
+	stateBefore, err := os.ReadFile(query.CacheStatePath(analyticsDir))
+	require.NoError(err)
 	insertSixthMessage(t, dbPath)
 
 	buildCacheWriteStateFile = func(string, []byte, os.FileMode) error {
@@ -615,12 +638,15 @@ func TestBuildCacheFailedStateWriteFullRebuildLeavesNoStaleState(t *testing.T) {
 	}
 	_, err = buildCache(dbPath, analyticsDir, true)
 	buildCacheWriteStateFile = os.WriteFile
-	require.ErrorContains(err, "save cache sync state",
+	require.ErrorContains(err, "simulated state write failure",
 		"full rebuild must fail when the sync state cannot be persisted")
 
-	_, err = os.Stat(filepath.Join(analyticsDir, "_last_sync.json"))
-	require.True(os.IsNotExist(err),
-		"a failed full rebuild must not leave the pre-rebuild sync state behind")
+	stateAfter, err := os.ReadFile(query.CacheStatePath(analyticsDir))
+	require.NoError(err)
+	assert.Equal(stateBefore, stateAfter)
+	assert.Equal(1, countCachedMessages(t, analyticsDir, 6),
+		"dataset replacement precedes the marker commit")
+	assert.Equal(query.CacheDrifted, mustInspectCacheReadiness(t, analyticsDir))
 
 	_, err = buildCache(dbPath, analyticsDir, false)
 	require.NoError(err, "retry build")
@@ -842,19 +868,7 @@ func TestBuildCache_BasicExport(t *testing.T) {
 	assert.Equal(int64(5), result.ExportedCount, "exported messages")
 
 	// Verify all Parquet directories/files were created
-	expectedDirs := []string{
-		"messages",
-		"sources",
-		"participants",
-		"participant_identifiers",
-		"message_recipients",
-		"labels",
-		"message_labels",
-		"attachments",
-		"conversations",
-	}
-
-	for _, dir := range expectedDirs {
+	for _, dir := range query.RequiredParquetDirs {
 		path := filepath.Join(analyticsDir, dir)
 		_, err := os.Stat(path)
 		assert.False(os.IsNotExist(err), "expected directory %s to exist", dir)
@@ -870,6 +884,9 @@ func TestBuildCache_BasicExport(t *testing.T) {
 	require.NoError(json.Unmarshal(data, &state), "parse sync state")
 
 	assert.Equal(int64(5), state.LastMessageID)
+	assert.Equal(int64(5), state.Stats.TotalMessages)
+	assert.Equal(int64(1), state.Stats.Sources)
+	assert.NotEmpty(state.ConversationParticipantsFingerprint)
 }
 
 func TestBuildCache_PublishesConversationParticipants(t *testing.T) {
@@ -1034,6 +1051,17 @@ func TestBuildCache_IncrementalExport(t *testing.T) {
 	// Attachments: 4 total (3 original + 1 new)
 	assert.Equal(int64(4), countRows(filepath.Join(analyticsDir, "attachments", "*.parquet")), "attachments")
 
+	// Relationship activity appends at the same message watermark. Its
+	// participant grain has multiple rows per message, so verify coverage by
+	// distinct message ID.
+	activityPattern := filepath.ToSlash(filepath.Join(
+		analyticsDir, identityindex.DatasetActivity, "**", "*.parquet"))
+	var activityMessages int64
+	require.NoError(duckdb.QueryRow(
+		"SELECT COUNT(DISTINCT message_id) FROM read_parquet('" + activityPattern + "')",
+	).Scan(&activityMessages))
+	assert.Equal(int64(7), activityMessages, "relationship activity messages")
+
 	// Participants: 4 (overwritten each run, not appended)
 	assert.Equal(int64(4), countRows(filepath.Join(analyticsDir, "participants", "*.parquet")), "participants")
 
@@ -1060,6 +1088,8 @@ func TestBuildCache_IncrementalExport(t *testing.T) {
 	_ = json.Unmarshal(data, &state)
 
 	assert.Equal(int64(7), state.LastMessageID)
+	assert.Equal(int64(7), state.Stats.TotalMessages)
+	assert.Equal(int64(35500), state.Stats.AttachmentSizeBytes)
 }
 
 func hasPublishedBuildIDPrefix(paths []string, stagedBase string) bool {
@@ -2387,6 +2417,22 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 			PRIMARY KEY (participant_a, participant_b),
 			CHECK (participant_a < participant_b)
 		);
+
+		CREATE TABLE persons (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vcard_uid TEXT NOT NULL UNIQUE,
+			display_name TEXT,
+			revision INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE person_participants (
+			person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+			participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+			PRIMARY KEY (person_id, participant_id),
+			UNIQUE(participant_id)
+		);
 	`
 	_, err = db.Exec(schema)
 	require.NoError(t, err, "create schema")
@@ -2445,6 +2491,42 @@ func TestBuildCacheCSVSnapshotFallback(t *testing.T) {
 		assert.Positive(t, result.ExportedCount)
 	})
 
+	t.Run("message attribution provenance", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		tmpDir := setupTestSQLite(t)
+		dbPath := filepath.Join(tmpDir, "test.db")
+		analyticsDir := filepath.Join(tmpDir, "analytics")
+
+		db, err := sql.Open("sqlite3", dbPath)
+		require.NoError(err)
+		_, err = db.Exec(`
+			ALTER TABLE messages ADD COLUMN source_is_from_me BOOLEAN DEFAULT FALSE;
+			UPDATE messages
+			SET is_from_me = FALSE, source_is_from_me = TRUE
+			WHERE id = 1;
+		`)
+		require.NoError(err)
+		require.NoError(db.Close())
+
+		result, err := buildCache(dbPath, analyticsDir, true)
+		require.NoError(err)
+		assert.Positive(result.ExportedCount)
+
+		duckDB, err := sql.Open("duckdb", "")
+		require.NoError(err)
+		defer func() { require.NoError(duckDB.Close()) }()
+
+		var isFromMe bool
+		require.NoError(duckDB.QueryRow(
+			`SELECT is_from_me
+			 FROM read_parquet(?, hive_partitioning=true)
+			 WHERE id = 1`,
+			filepath.Join(analyticsDir, "messages", "**", "*.parquet"),
+		).Scan(&isFromMe))
+		assert.True(isFromMe, "CSV fallback must export source-native attribution")
+	})
+
 	t.Run("empty", func(t *testing.T) {
 		tmpDir := setupTestSQLiteEmpty(t)
 		result, err := buildCache(filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics"), true)
@@ -2485,6 +2567,10 @@ func writeSyncStateAt(t *testing.T, analyticsDir string, lastMessageID int64, sy
 		LastMessageID: lastMessageID,
 		LastSyncAt:    syncAt,
 		SchemaVersion: cacheSchemaVersion,
+		// Both fingerprints hash zero rows in these fixtures, so both are
+		// the empty-input sha256 digest.
+		ConversationParticipantsFingerprint: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		ConversationTypesFingerprint:        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 	}
 	data, err := json.Marshal(state)
 	require.NoError(t, err, "marshal sync state")
@@ -2495,25 +2581,30 @@ func writeSyncStateAt(t *testing.T, analyticsDir string, lastMessageID int64, sy
 // to simulate a complete existing cache.
 func createFakeParquet(t *testing.T, analyticsDir string) {
 	t.Helper()
+	requirementsForTest := require.New(t)
+
 	// Messages use hive-partitioned layout
 	msgDir := filepath.Join(analyticsDir, "messages", "year=2024")
-	require.NoError(t, os.MkdirAll(msgDir, 0755), "MkdirAll messages")
-	require.NoError(t, os.WriteFile(filepath.Join(msgDir, "data.parquet"), []byte("fake"), 0644), "write messages parquet")
-	// Other required tables use flat layout
-	for _, dir := range []string{"sources", "participants", "participant_identifiers", "message_recipients", "labels", "message_labels", "attachments", "conversations", "conversation_participants", tableOwnerParticipants, tableParticipantClusters} {
+	requirementsForTest.NoError(os.MkdirAll(msgDir, 0755), "MkdirAll messages")
+	requirementsForTest.NoError(os.WriteFile(filepath.Join(msgDir, "data.parquet"), []byte("fake"), 0644), "write messages parquet")
+	// Other required tables use flat layout.
+	for _, dir := range query.RequiredParquetDirs {
+		if dir == tableMessages {
+			continue
+		}
 		d := filepath.Join(analyticsDir, dir)
-		require.NoError(t, os.MkdirAll(d, 0755), "MkdirAll %s", dir)
-		require.NoError(t, os.WriteFile(filepath.Join(d, "data.parquet"), []byte("fake"), 0644), "write %s parquet", dir)
+		requirementsForTest.NoError(os.MkdirAll(d, 0755), "MkdirAll %s", dir)
+		requirementsForTest.NoError(os.WriteFile(filepath.Join(d, "data.parquet"), []byte("fake"), 0644), "write %s parquet", dir)
 	}
 	state, err := query.ReadCacheSyncState(analyticsDir)
 	if err == nil {
 		fingerprint, fingerprintErr := query.CacheDatasetFingerprint(analyticsDir)
-		require.NoError(t, fingerprintErr)
+		requirementsForTest.NoError(fingerprintErr)
 		state.PublishedAt = time.Now().UTC()
 		state.DatasetFingerprint = fingerprint
 		data, marshalErr := json.Marshal(state)
-		require.NoError(t, marshalErr)
-		require.NoError(t, os.WriteFile(query.CacheStatePath(analyticsDir), data, 0o600))
+		requirementsForTest.NoError(marshalErr)
+		requirementsForTest.NoError(os.WriteFile(query.CacheStatePath(analyticsDir), data, 0o600))
 	}
 }
 
@@ -2684,17 +2775,19 @@ func TestCacheNeedsBuild(t *testing.T) {
 			name: "MissingRequiredParquetTables_NeedsBuild",
 			setup: func(t *testing.T, dbPath, analyticsDir string) {
 				t.Helper()
+				requirementsForTest := require.New(t)
+
 				// Only messages parquet exists, missing other required tables
 				db, err := sql.Open("sqlite3", dbPath)
-				require.NoError(t, err, "open db")
+				requirementsForTest.NoError(err, "open db")
 				defer func() { _ = db.Close() }()
 				_, err = db.Exec(`INSERT INTO messages (id, source_id, source_message_id, sent_at) VALUES (5, 1, 'msg5', datetime('now'))`)
-				require.NoError(t, err, "insert message")
+				requirementsForTest.NoError(err, "insert message")
 				writeSyncState(t, analyticsDir, 5)
 				// Only create messages parquet — other required dirs missing
 				msgDir := filepath.Join(analyticsDir, "messages", "year=2024")
-				require.NoError(t, os.MkdirAll(msgDir, 0755), "MkdirAll")
-				require.NoError(t, os.WriteFile(filepath.Join(msgDir, "data.parquet"), []byte("fake"), 0644), "write parquet")
+				requirementsForTest.NoError(os.MkdirAll(msgDir, 0755), "MkdirAll")
+				requirementsForTest.NoError(os.WriteFile(filepath.Join(msgDir, "data.parquet"), []byte("fake"), 0644), "write parquet")
 			},
 			wantBuild:  true,
 			wantReason: "analytics cache publication interrupted",
@@ -2804,7 +2897,7 @@ func TestCacheNeedsBuild_AccountIdentityRevisionChangeForcesFullRebuild(t *testi
 }
 
 // TestCacheNeedsBuild_AccountIdentityDriftIsNotIdentityDriftOnly verifies
-// that identityDriftOnly (the gate that picks the cheap identity-only
+// that derivedDriftOnly (the gate that picks the cheap derived-only
 // refresh path) rejects staleness reports with HasAccountIdentityDrift set,
 // even though AddAccountIdentity/RemoveAccountIdentity also bump
 // identity_revision and therefore set HasIdentityDrift on the same report.
@@ -2816,12 +2909,16 @@ func TestCacheNeedsBuild_AccountIdentityDriftIsNotIdentityDriftOnly(t *testing.T
 		HasAccountIdentityDrift: true,
 		FullRebuild:             true,
 	}
-	assert.False(identityDriftOnly(staleness),
+	assert.False(derivedDriftOnly(staleness),
 		"account identity drift must never be satisfied by the identity-only refresh path")
 
 	linkOnly := cacheStaleness{HasIdentityDrift: true}
-	assert.True(identityDriftOnly(linkOnly),
+	assert.True(derivedDriftOnly(linkOnly),
 		"plain participant-link drift alone must still take the identity-only refresh path")
+
+	conversationOnly := cacheStaleness{HasConversationParticipantDrift: true}
+	assert.True(derivedDriftOnly(conversationOnly),
+		"conversation participant drift alone must take the derived-only refresh path")
 }
 
 func TestCacheNeedsBuild_LabelOnlySyncRequiresFullRebuild(t *testing.T) {
@@ -3036,11 +3133,13 @@ func TestCacheNeedsBuild_IgnoresAlreadyProcessedUpdatedSyncRun(t *testing.T) {
 	stateTime := time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC)
 	require.NoError(os.MkdirAll(analyticsDir, 0755), "MkdirAll analytics")
 	state := syncState{
-		LastMessageID:          5,
-		LastSyncAt:             stateTime,
-		LastCompletedSyncRunID: 7,
-		LastCacheUpdateCount:   2,
-		SchemaVersion:          cacheSchemaVersion,
+		LastMessageID:                       5,
+		LastSyncAt:                          stateTime,
+		LastCompletedSyncRunID:              7,
+		LastCacheUpdateCount:                2,
+		SchemaVersion:                       cacheSchemaVersion,
+		ConversationParticipantsFingerprint: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		ConversationTypesFingerprint:        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 	}
 	data, err := json.Marshal(state)
 	require.NoError(err, "marshal sync state")
@@ -3090,7 +3189,7 @@ func TestCacheNeedsBuild_IgnoresAlreadyProcessedUpdatedSyncRun(t *testing.T) {
 // schema version other than the current one now forces a full rebuild.
 func TestCacheNeedsBuild_SchemaVersionMismatch(t *testing.T) {
 	require := require.New(t)
-	require.Equal(14, cacheSchemaVersion, "identifier-type-aware is_from_me derivation requires cache v14")
+	require.Equal(16, cacheSchemaVersion, "relationship activity has_attachments requires cache v16")
 	tmpDir := setupTestSQLiteEmpty(t)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -3125,7 +3224,7 @@ func TestCacheNeedsBuild_SchemaVersionMismatch(t *testing.T) {
 	require.False(result.Skipped, "schema mismatch must execute a full rebuild")
 	upgraded, err := query.ReadCacheSyncState(analyticsDir)
 	require.NoError(err, "read upgraded cache state")
-	require.Equal(14, upgraded.SchemaVersion)
+	require.Equal(16, upgraded.SchemaVersion)
 	require.NoFileExists(filepath.Join(analyticsDir, tableParticipantIdentifiers, "data.parquet"),
 		"full rebuild must replace rather than extend the v11 identifier dataset")
 	identifierParquet := filepath.Join(analyticsDir, tableParticipantIdentifiers, "participant_identifiers.parquet")

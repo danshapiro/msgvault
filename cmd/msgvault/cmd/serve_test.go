@@ -446,6 +446,35 @@ func TestOpenDaemonAnalyticsEngineAutoBuildsCacheAtStartup(t *testing.T) {
 		"the daemon must serve DuckDB over the fresh cache, not live-SQL fallback")
 }
 
+func TestDaemonDuckDBEnginesUseIsolatedSpillDirectories(t *testing.T) {
+	requirements := require.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	requirements.NoError(err)
+
+	longLived, err := openDaemonDuckDBEngine(c, s)
+	requirements.NoError(err)
+	defer func() { _ = longLived.Close() }()
+	temporary, err := openDaemonDuckDBEngine(c, s)
+	requirements.NoError(err)
+
+	spillParent := filepath.Join(c.HomeDir, "tmp",
+		fmt.Sprintf("duckdb-query-%d", os.Getpid()))
+	entries, err := os.ReadDir(spillParent)
+	requirements.NoError(err)
+	requirements.Len(entries, 2, "each engine owns its own spill subdirectory")
+
+	requirements.NoError(temporary.Close())
+	_, err = longLived.QuerySQL(context.Background(), "SELECT 1")
+	requirements.NoError(err,
+		"closing a temporary engine must not disturb the live engine")
+	entries, err = os.ReadDir(spillParent)
+	requirements.NoError(err)
+	assert.Len(t, entries, 1,
+		"a closing engine removes only its own spill subdirectory")
+	requirements.NoError(longLived.Close())
+}
+
 func TestOpenDaemonAnalyticsEngineAutoFallsBackWhenStartupBuildFails(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -610,6 +639,32 @@ func TestStoreAPIAdapterRunCLISyncPacksOnlyAfterSubprocessSuccess(t *testing.T) 
 			assert.Empty(events, "successful automatic maintenance writes no normal CLI output")
 		})
 	}
+}
+
+func TestCLISyncSubprocessArgsIncrementalIncludesFolderFilters(t *testing.T) {
+	assert.Equal(t,
+		[]string{"sync", "--folders", "INBOX", "--folders", "Archive", "--skip-folders", "Trash", "alice@example.com"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{
+			Email:       "alice@example.com",
+			Folders:     []string{"INBOX", "Archive"},
+			SkipFolders: []string{"Trash"},
+		}),
+	)
+	assert.Equal(t,
+		[]string{"sync", "--folders", "Folder,With,Comma", "alice@example.com"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{
+			Email:   "alice@example.com",
+			Folders: []string{"Folder,With,Comma"},
+		}),
+	)
+	assert.Equal(t,
+		[]string{"sync", "--folders", "Path\\To\\File", "--skip-folders", "Fold,er", "alice@example.com"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{
+			Email:       "alice@example.com",
+			Folders:     []string{"Path\\To\\File"},
+			SkipFolders: []string{"Fold,er"},
+		}),
+	)
 }
 
 func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {

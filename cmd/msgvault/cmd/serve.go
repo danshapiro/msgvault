@@ -16,16 +16,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/api"
-	"go.kenn.io/msgvault/internal/cacheops"
 	"go.kenn.io/msgvault/internal/circleback"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/discord"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/granola"
+	"go.kenn.io/msgvault/internal/meetingimport"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/query"
@@ -74,6 +73,28 @@ const daemonIdleTimeoutEnv = "MSGVAULT_DAEMON_IDLE_TIMEOUT"
 // not redo (or erase) its work.
 var buildCacheSubprocessForRun = func(ctx context.Context, fullRebuild bool) error {
 	return buildCacheSubprocess(ctx, fullRebuild, true)
+}
+
+var executeBuildCacheSubprocessMode = buildCacheSubprocessMode
+
+var runDerivedCacheSubprocess = func(ctx context.Context, analyticsDir string) error {
+	err := executeBuildCacheSubprocessMode(ctx, buildCacheModeDerived)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrDerivedRefreshRequiresFullBuild) ||
+		strings.Contains(err.Error(), ErrDerivedRefreshRequiresFullBuild.Error()) {
+		// Escalate only to repair an existing cache. A derived refresh must
+		// never create a cache that configuration (engine="sql",
+		// auto_build_cache=false, PostgreSQL) deliberately leaves absent;
+		// the caller reports the cache stale instead.
+		readiness, inspectErr := query.InspectCacheReadiness(analyticsDir)
+		if inspectErr != nil || readiness == query.CacheAbsent {
+			return err
+		}
+		return executeBuildCacheSubprocessMode(ctx, buildCacheModeFull)
+	}
+	return err
 }
 
 var (
@@ -154,9 +175,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 			logger.Warn("release daemon ownership failed", "error", err)
 		}
 	}()
+	setStartupPhase := func(phase string) {
+		if err := ownership.SetStartupPhase(phase); err != nil {
+			logger.Warn("update daemon startup phase failed", "error", err)
+		}
+	}
 
 	// Open database
 	dbPath := cfg.DatabaseDSN()
+	setStartupPhase("opening archive database")
 	logger.Info("daemon startup step", "step", "open_archive_database", "database", daemonStartupDatabaseLabel(dbPath))
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -165,6 +192,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer func() { _ = s.Close() }()
 	logger.Info("daemon startup step complete", "step", "open_archive_database")
 
+	setStartupPhase("migrating archive schema")
 	logger.Info("daemon startup step", "step", "init_archive_schema")
 	if err := s.InitSchema(); err != nil {
 		return fmt.Errorf("init schema: %w", err)
@@ -203,6 +231,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		logger.Info("daemon startup step", "step", "skip_vector_backend", "enabled", false)
 	}
 
+	setStartupPhase("building analytics cache")
 	logger.Info("daemon startup step", "step", "init_analytics_engine")
 	engine, analyticsMode, err := openDaemonAnalyticsEngine(cmd.Context(), cfg, s)
 	if err != nil {
@@ -316,6 +345,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if cfg.Slack.Enabled && cfg.Slack.Schedule == "" {
+		logger.Warn("slack is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+			"hint", `set a cron schedule (e.g. "*/30 * * * *") on the [slack] entry`)
+	}
+	if cfg.Slack.Enabled && cfg.Slack.Schedule != "" {
+		if err := sched.AddJob(scheduler.Job{
+			Name:     api.SlackJobName,
+			Schedule: cfg.Slack.Schedule,
+			Run: func(ctx context.Context) error {
+				return runScheduledSource(ctx, attachmentMaint, true, func(ctx context.Context) error {
+					return runConfiguredSlackSync(ctx, s)
+				})
+			},
+		}); err != nil {
+			logger.Error("failed to schedule slack sync", "error", err)
+		} else {
+			logger.Info("scheduled slack sync", "schedule", cfg.Slack.Schedule)
+		}
+	}
+
 	// Meeting sources (Granola/Circleback) mirror the gcal treatment: warn
 	// when enabled but unscheduled, then register the scheduled ones.
 	for _, src := range cfg.Granola {
@@ -384,7 +433,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	sched.Start()
 
 	// Create adapters for the API interfaces
-	storeAdapter := &storeAPIAdapter{store: s, attachmentMaintenance: attachmentMaint, analyticsDir: cfg.AnalyticsDir()}
+	meetingImporter := meetingimport.NewImporter(s, meetingimport.Hooks{
+		AfterSourceSetup: func() error {
+			return runPostSourceCreateMigrations(s)
+		},
+		RefreshCache: rebuildCacheAfterScheduledSync,
+	})
+	storeAdapter := &storeAPIAdapter{
+		store:                 s,
+		attachmentMaintenance: attachmentMaint,
+		meetingImporter:       meetingImporter,
+		analyticsDir:          cfg.AnalyticsDir(),
+	}
 	schedAdapter := &schedulerAdapter{scheduler: sched}
 
 	// Create and start API server
@@ -414,6 +474,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Start API server in goroutine
 	apiAddr := apiListener.Addr().String()
+	setStartupPhase("")
 	logger.Info("daemon startup step", "step", "start_api_server", "bind", apiAddr)
 	serverErr := make(chan error, 1)
 	listenerReserved = false
@@ -717,6 +778,20 @@ func openDaemonDuckDBEngine(c *config.Config, s *store.Store) (*query.DuckDBEngi
 	if c == nil || s == nil {
 		return nil, errors.New("daemon DuckDB engine unavailable")
 	}
+	spillParent, err := query.PrepareDaemonSpillDir(c.HomeDir)
+	if err != nil {
+		return nil, err
+	}
+	// Each engine spills into its own subdirectory: the daemon opens both a
+	// long-lived engine and short-lived per-query engines (runDaemonSQLQuery),
+	// and OwnTempDirectory deletes the directory on Close — sharing one
+	// directory would let a temporary engine remove the live engine's spill
+	// files. The pid-owned parent is reaped by PrepareDaemonSpillDir once
+	// this process exits.
+	tempDirectory, err := os.MkdirTemp(spillParent, "engine-")
+	if err != nil {
+		return nil, fmt.Errorf("create engine spill directory: %w", err)
+	}
 	// DisableSQLiteScanner keeps DuckDB's bundled SQLite library from
 	// ATTACHing the live database for the daemon's lifetime, which can
 	// interfere with the daemon's own go-sqlite3 WAL/lock state. Detail
@@ -726,7 +801,11 @@ func openDaemonDuckDBEngine(c *config.Config, s *store.Store) (*query.DuckDBEngi
 		c.AnalyticsDir(),
 		c.DatabaseDSN(),
 		s.DB(),
-		query.DuckDBOptions{DisableSQLiteScanner: true},
+		query.DuckDBOptions{
+			DisableSQLiteScanner: true,
+			TempDirectory:        tempDirectory,
+			OwnTempDirectory:     true,
+		},
 	)
 }
 
@@ -768,14 +847,15 @@ func newDaemonIdleTracker(c *config.Config, stop context.CancelFunc) *api.IdleTr
 type storeAPIAdapter struct {
 	store                 *store.Store
 	attachmentMaintenance *attachmentMaintenance
+	meetingImporter       *meetingimport.Importer
 	// analyticsDir is the daemon's Parquet analytics cache directory, used
-	// by RefreshIdentityDatasets to locate both the cache build lock and
-	// the identity dataset files it re-exports.
+	// to read the revision committed by the derived-refresh child.
 	analyticsDir string
 }
 
 var _ api.MessageStore = (*storeAPIAdapter)(nil)
 var _ api.CtxMessageStore = (*storeAPIAdapter)(nil)
+var _ api.MeetingImporter = (*storeAPIAdapter)(nil)
 var _ api.SourceStatusStore = (*storeAPIAdapter)(nil)
 var _ api.CLIStore = (*storeAPIAdapter)(nil)
 var _ api.ContextCLIStore = (*storeAPIAdapter)(nil)
@@ -795,6 +875,7 @@ var _ api.CLIEmbeddingsPlanner = (*storeAPIAdapter)(nil)
 var _ api.CLIDedupDeleteStore = (*storeAPIAdapter)(nil)
 var _ api.ContextCLIDedupDeleteStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityLinkStore = (*storeAPIAdapter)(nil)
+var _ api.PersonProfileStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityCacheRefresher = (*storeAPIAdapter)(nil)
 var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
@@ -825,6 +906,16 @@ func (a *storeAPIAdapter) ListChangedMessages(
 
 func (a *storeAPIAdapter) GetStats() (*api.StoreStats, error) {
 	return a.store.GetStats()
+}
+
+func (a *storeAPIAdapter) ImportMeeting(
+	ctx context.Context,
+	req meetingimport.Request,
+) (meetingimport.Result, error) {
+	if a == nil || a.meetingImporter == nil {
+		return meetingimport.Result{}, meetingimport.ErrUnavailable
+	}
+	return a.meetingImporter.Import(ctx, req)
 }
 
 func (a *storeAPIAdapter) GetStatsContext(ctx context.Context) (*api.StoreStats, error) {
@@ -980,6 +1071,15 @@ func (a *storeAPIAdapter) runCLISyncWithRunner(
 	}, emitWarning)
 }
 
+// emitFolderArgs appends a --folders/<--skip-folders> flag for each
+// element in values, e.g. "--folders Inbox --folders Archive".
+func emitFolderArgs(args []string, flag string, values []string) []string {
+	for _, v := range values {
+		args = append(args, flag, v)
+	}
+	return args
+}
+
 func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 	if req.Full {
 		args := []string{"sync-full"}
@@ -998,12 +1098,16 @@ func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 		if req.Limit > 0 {
 			args = append(args, "--limit", strconv.Itoa(req.Limit))
 		}
+		args = emitFolderArgs(args, "--folders", req.Folders)
+		args = emitFolderArgs(args, "--skip-folders", req.SkipFolders)
 		if req.Email != "" {
 			args = append(args, req.Email)
 		}
 		return args
 	}
-	args := []string{"sync"}
+	args := []string{syncIncrementalCmd.Name()}
+	args = emitFolderArgs(args, "--folders", req.Folders)
+	args = emitFolderArgs(args, "--skip-folders", req.SkipFolders)
 	if req.Email != "" {
 		args = append(args, req.Email)
 	}
@@ -1474,6 +1578,36 @@ func (a *storeAPIAdapter) UnlinkParticipants(participantA, participantB int64) (
 	return a.store.UnlinkParticipants(participantA, participantB)
 }
 
+func (a *storeAPIAdapter) CreatePersonFromParticipantContext(
+	ctx context.Context, participantID int64,
+) (*store.Person, bool, error) {
+	return a.store.CreatePersonFromParticipantContext(ctx, participantID)
+}
+
+func (a *storeAPIAdapter) GetPersonContext(ctx context.Context, id int64) (*store.Person, error) {
+	return a.store.GetPersonContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) ListPersonsContext(ctx context.Context) ([]store.Person, error) {
+	return a.store.ListPersonsContext(ctx)
+}
+
+func (a *storeAPIAdapter) UpdatePersonDisplayNameContext(
+	ctx context.Context, id, expectedRevision int64, displayName *string,
+) (*store.Person, error) {
+	return a.store.UpdatePersonDisplayNameContext(ctx, id, expectedRevision, displayName)
+}
+
+func (a *storeAPIAdapter) DeletePersonContext(ctx context.Context, id, expectedRevision int64) error {
+	return a.store.DeletePersonContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) PersonForParticipantsContext(
+	ctx context.Context, participantIDs []int64,
+) (*store.Person, error) {
+	return a.store.PersonForParticipantsContext(ctx, participantIDs)
+}
+
 func (a *storeAPIAdapter) ClusterMembers(id int64) ([]int64, error) {
 	return a.store.ClusterMembers(id)
 }
@@ -1482,26 +1616,18 @@ func (a *storeAPIAdapter) ClusterEdges(id int64) ([]store.LinkEdge, error) {
 	return a.store.ClusterEdges(id)
 }
 
-// RefreshIdentityDatasets re-exports the owner_participants and
-// participant_clusters Parquet datasets after an identity mutation (a
-// participant link/unlink or an account identity add/remove) commits.
-// cacheops.RefreshIdentityDatasets requires its caller to hold the
-// cross-process analytics cache build lock exclusively; this acquires it
-// non-blocking, so a build already in progress makes the refresh fail fast
-// rather than stalling the HTTP request. The API layer treats any error,
-// including lock contention, as cache_state "stale" — the identity mutation
-// itself already committed and is not affected.
+// RefreshIdentityDatasets rebuilds identity-derived Parquet in a short-lived,
+// resource-bounded child. The child owns the cache lock and its DuckDB
+// allocator exits with the process; the long-lived daemon does neither.
 func (a *storeAPIAdapter) RefreshIdentityDatasets(ctx context.Context) (int64, error) {
-	lock := flock.New(query.CacheBuildLockPath(a.analyticsDir))
-	locked, err := lock.TryLock()
+	if err := runDerivedCacheSubprocess(ctx, a.analyticsDir); err != nil {
+		return 0, err
+	}
+	state, err := query.ReadCacheSyncState(a.analyticsDir)
 	if err != nil {
-		return 0, fmt.Errorf("acquire analytics cache build lock for identity refresh: %w", err)
+		return 0, fmt.Errorf("read refreshed cache revision: %w", err)
 	}
-	if !locked {
-		return 0, errors.New("analytics cache build lock is held by another process")
-	}
-	defer func() { _ = lock.Unlock() }()
-	return cacheops.RefreshIdentityDatasets(ctx, a.store, a.analyticsDir)
+	return state.IdentityRevision, nil
 }
 
 func (a *storeAPIAdapter) GetActiveSync(sourceID int64) (*store.SyncRun, error) {

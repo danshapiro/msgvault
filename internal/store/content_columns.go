@@ -56,12 +56,20 @@ var MessagesContentColumns = []string{
 // one does not move content_changed_at. Each carries its reason: the cost of a
 // wrong call here is a consumer that silently misses updates.
 var MessagesNonContentColumns = []string{
-	"id",                  // immutable identity
-	"source_id",           // immutable: which account this came from
-	"rfc822_message_id",   // not reported by the feed (dedup.go rewrites it)
-	"read_at",             // local read state, not archive content
-	"delivered_at",        // platform delivery receipt
-	"is_from_me",          // not reported by the feed
+	"id",                // immutable identity
+	"source_id",         // immutable: which account this came from
+	"rfc822_message_id", // not reported by the feed (dedup.go rewrites it)
+	"read_at",           // local read state, not archive content
+	"delivered_at",      // platform delivery receipt
+	"is_from_me",        // not reported by the feed
+	// The two provenance inputs behind is_from_me: source-native ownership as
+	// the provider stated it, and ownership derived from the account's own
+	// identities. The feed reports neither, and it does not report the
+	// is_from_me they resolve to, so a change in either is invisible to a
+	// consumer. Tracking them would stamp every message in an archive on the
+	// attribution provenance migration for no reader-visible difference.
+	"source_is_from_me",
+	"identity_is_from_me",
 	"reply_to_message_id", // threading pointer; conversation_id is the routing key
 	"thread_position",     // ordering within a thread, derived
 	"is_read",             // local read state

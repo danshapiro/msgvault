@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -145,6 +146,146 @@ func TestExclusiveLockTablesCoverCascade(t *testing.T) {
 // TestMaintenanceTimeoutResetSQL pins the exact statement the PG dialect uses
 // to lift the per-statement timeout — the mechanism finding S1's hatch relies
 // on. SQLite returns "" so runMaintenance issues no reset.
+// TestRemoveSourceSerializedDoesNotDeadlockWithPersonMerge pins the lock
+// ordering documented on BeginExclusive: MergeParticipants writes person
+// tables BEFORE participants/messages, the opposite of exclusiveLockTables'
+// LOCK TABLE order, so without BeginExclusive first taking the
+// identity-mutation row lock a serialized source removal racing an
+// importer-driven merge could deadlock (LOCK TABLE holds participants and
+// waits on persons; the merge holds persons and waits on participants).
+// PostgreSQL surfaces such a deadlock as an error on one transaction after
+// deadlock_timeout, so the loop requires every racing pair to succeed.
+func TestRemoveSourceSerializedDoesNotDeadlockWithPersonMerge(t *testing.T) {
+	require := require.New(t)
+	dbURL := skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t, dbURL)
+	ctx := context.Background()
+
+	for i := range 15 {
+		source, err := st.GetOrCreateSource("gmail", fmt.Sprintf("race%d@example.com", i))
+		require.NoError(err, "iteration %d: create source", i)
+		winner, err := st.EnsureParticipant(fmt.Sprintf("winner%d@example.com", i), "Winner", "example.com")
+		require.NoError(err, "iteration %d: winner", i)
+		loser, err := st.EnsureParticipant(fmt.Sprintf("loser%d@example.com", i), "Loser", "example.com")
+		require.NoError(err, "iteration %d: loser", i)
+		_, _, err = st.CreatePersonFromParticipant(loser)
+		require.NoError(err, "iteration %d: promote", i)
+
+		var wg sync.WaitGroup
+		var removeErr, mergeErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _, removeErr = st.RemoveSourceSerialized(ctx, source.ID)
+		}()
+		go func() {
+			defer wg.Done()
+			mergeErr = st.MergeParticipants(loser, winner)
+		}()
+		wg.Wait()
+
+		require.NoError(removeErr, "iteration %d: remove source", i)
+		require.NoError(mergeErr, "iteration %d: merge participants", i)
+	}
+}
+
+// TestRemoveSourceSerializedDoesNotDeadlockWithLegacyIdentityMigration pins
+// the other half of the BeginExclusive ordering contract: the legacy
+// identity-config migration writes account_identities and only then bumps
+// the identity revision, so without taking the identity-mutation row lock
+// at the start of its transaction it could deadlock against BeginExclusive
+// (row lock held, waiting on LOCK TABLE account_identities). The
+// applied_migrations marker is cleared each iteration so the migration
+// re-runs with a fresh address and actually reaches the revision bump. The
+// removed sources are non-email (imessage) so the migration never writes
+// identities for a source that is concurrently deleted.
+func TestRemoveSourceSerializedDoesNotDeadlockWithLegacyIdentityMigration(t *testing.T) {
+	require := require.New(t)
+	dbURL := skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t, dbURL)
+	ctx := context.Background()
+
+	_, err := st.GetOrCreateSource("gmail", "stable@example.com")
+	require.NoError(err, "create eligible source")
+
+	for i := range 15 {
+		source, err := st.GetOrCreateSource("imessage", fmt.Sprintf("+1555010%04d", i))
+		require.NoError(err, "iteration %d: create removable source", i)
+		_, err = st.DB().Exec(st.Rebind(
+			`DELETE FROM applied_migrations WHERE name = ?`), migrationLegacyIdentity)
+		require.NoError(err, "iteration %d: clear migration marker", i)
+		address := fmt.Sprintf("me%d@example.com", i)
+
+		var wg sync.WaitGroup
+		var removeErr, migrateErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _, removeErr = st.RemoveSourceSerialized(ctx, source.ID)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _, _, _, migrateErr = st.MigrateLegacyIdentityConfig([]string{address})
+		}()
+		wg.Wait()
+
+		require.NoError(removeErr, "iteration %d: remove source", i)
+		require.NoError(migrateErr, "iteration %d: migrate identity config", i)
+	}
+}
+
+// TestRemoveSourceSerializedDoesNotDeadlockWithSetParticipantIdentifier pins
+// the ordering contract for SetParticipantIdentifier: when the written
+// identifier matches a confirmed account identity (owner evidence), the call
+// bumps the identity revision, so it must take the identity-mutation row
+// lock before writing participant_identifiers — the reverse order deadlocks
+// against BeginExclusive (row held, waiting on LOCK TABLE
+// participant_identifiers). The identifier alternates between two
+// participants each iteration so every call takes the write path.
+func TestRemoveSourceSerializedDoesNotDeadlockWithSetParticipantIdentifier(t *testing.T) {
+	require := require.New(t)
+	dbURL := skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t, dbURL)
+	ctx := context.Background()
+
+	stable, err := st.GetOrCreateSource("gmail", "stable@example.com")
+	require.NoError(err, "create stable source")
+	_, err = st.DB().Exec(
+		`INSERT INTO account_identities (source_id, address, source_signal)
+		 VALUES ($1, $2, $3)`,
+		stable.ID, "me@example.com", "test")
+	require.NoError(err, "seed owner evidence")
+	alice, err := st.EnsureParticipant("alice@example.com", "Alice", "example.com")
+	require.NoError(err, "alice")
+	bob, err := st.EnsureParticipant("bob@example.com", "Bob", "example.com")
+	require.NoError(err, "bob")
+
+	for i := range 15 {
+		source, err := st.GetOrCreateSource("imessage", fmt.Sprintf("+1555020%04d", i))
+		require.NoError(err, "iteration %d: create removable source", i)
+		target := alice
+		if i%2 == 1 {
+			target = bob
+		}
+
+		var wg sync.WaitGroup
+		var removeErr, setErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _, removeErr = st.RemoveSourceSerialized(ctx, source.ID)
+		}()
+		go func() {
+			defer wg.Done()
+			setErr = st.SetParticipantIdentifier(target, "email", "me@example.com")
+		}()
+		wg.Wait()
+
+		require.NoError(removeErr, "iteration %d: remove source", i)
+		require.NoError(setErr, "iteration %d: set participant identifier", i)
+	}
+}
+
 func TestMaintenanceTimeoutResetSQL(t *testing.T) {
 	assert.Equal(t, "SET LOCAL statement_timeout = 0", (&PostgreSQLDialect{}).MaintenanceTimeoutResetSQL())
 	assert.Empty(t, (&SQLiteDialect{}).MaintenanceTimeoutResetSQL())

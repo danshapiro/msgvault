@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/beeper"
 	"go.kenn.io/msgvault/internal/circleback"
@@ -18,6 +17,7 @@ import (
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/slack"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -179,9 +179,9 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 	}
 
 	isSQLite := !store.IsPostgresURL(cfg.DatabaseDSN())
-	var cacheLock *flock.Flock
+	var unlockCache func() error
 	if isSQLite {
-		cacheLock, err = lockCacheAndInvalidateSyncState(cfg.AnalyticsDir())
+		unlockCache, err = lockCacheAndInvalidateSyncState(cfg.AnalyticsDir())
 		if err != nil {
 			return fmt.Errorf("protect analytics cache for account removal: %w", err)
 		}
@@ -233,10 +233,10 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 			removeAccountAfterCascadeHook()
 		}
 		fmt.Println("\nRebuilding analytics cache...")
-		_, cacheRefreshErr = buildCacheLocked(cfg.DatabaseDSN(), cfg.AnalyticsDir(), true, false)
+		_, cacheRefreshErr = buildCacheLocked(cfg.DatabaseDSN(), cfg.AnalyticsDir(), true, false, publishLockHeld)
 		cacheRefreshErr = errors.Join(
 			cacheRefreshErr,
-			wrapError(cacheLock.Unlock(), "release analytics cache lock"),
+			wrapError(unlockCache(), "release analytics cache lock"),
 		)
 	}
 	if removeErr != nil {
@@ -304,6 +304,14 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 			if err := beeper.DeleteToken(cfg.TokensDir()); err != nil {
 				fmt.Fprintf(os.Stderr,
 					"Warning: could not remove Beeper token: %v\n", err,
+				)
+			}
+		}
+	case sourceTypeSlack:
+		if teamID, userID, ok := splitSlackIdentifier(source.Identifier); ok {
+			if err := slack.DeleteToken(cfg.TokensDir(), teamID, userID); err != nil {
+				fmt.Fprintf(os.Stderr,
+					"Warning: could not remove Slack token: %v\n", err,
 				)
 			}
 		}

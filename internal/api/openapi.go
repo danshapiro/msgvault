@@ -147,7 +147,14 @@ import (
 // (any rank), and total_count reports the matched-row count (0 or 1). Clients
 // use it to hydrate a selected group without paging the ranked listing.
 // Additive (minor bump): omitting the field preserves the ranked listing.
-// 1.32.0 adds GET /api/v1/messages/changes: a keyset feed over the
+// 1.32.0 adds durable person profiles: promote an observed participant
+// cluster (201 on creation, 200 on idempotent re-promotion), list/get stable
+// profiles, update the display-name override and delete a profile with
+// revision-tag optimistic concurrency, and surface the covering profile on
+// the /people/{id} analytical detail.
+// 1.33.0 adds provider-neutral single-meeting ingestion with strict request
+// schemas and idempotent create/update responses.
+// 1.34.0 adds GET /api/v1/messages/changes: a keyset feed over the
 // content_changed_at watermark that lets a consumer re-read the messages whose
 // content changed since its last poll, including hidden and source-deleted
 // rows. The (since, since_id) cursor and the server_time reading are serialised
@@ -157,7 +164,7 @@ import (
 // has not yet established one. Stores that cannot answer the
 // watermark query report 503 feature_unavailable. Additive (minor bump): a new
 // path only.
-const APISchemaVersion = "1.32.0"
+const APISchemaVersion = "1.34.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
@@ -439,12 +446,53 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		return
 	}
 	schemas := doc.Components.Schemas.Map()
+	const emailProperty = "email"
+	if meeting := schemas["Meeting"]; meeting != nil {
+		// The Go client generator treats composed object schemas as union
+		// wrappers. Runtime validation and the public schema retain these
+		// cross-field rules; the generated request keeps its useful struct shape.
+		meeting.AllOf = nil
+		for _, property := range []string{"started_at", "ended_at"} {
+			if timestamp := meeting.Properties[property]; timestamp != nil {
+				setCodegenGoType(timestamp, "string")
+			}
+		}
+	}
+	for schemaName, property := range map[string]string{
+		"MeetingPerson": emailProperty,
+		"Source":        "account_email",
+	} {
+		if schema := schemas[schemaName]; schema != nil {
+			if email := schema.Properties[property]; email != nil {
+				setCodegenGoType(email, "string")
+			}
+		}
+	}
+	queryResult := schemas["QueryResult"]
+	if queryResult != nil && queryResult.Properties != nil {
+		rows := queryResult.Properties["rows"]
+		if rows != nil && rows.Items != nil && rows.Items.Items != nil {
+			setCodegenGoType(rows.Items.Items, "any")
+		}
+	}
+
 	for _, schemaName := range []string{"FileSearchRow", "FileMetadataResponse"} {
 		if schema := schemas[schemaName]; schema != nil {
 			for _, property := range []string{"filename", "mime_type"} {
 				if schema.Properties[property] != nil {
 					schema.Properties[property].Nullable = true
 				}
+			}
+		}
+	}
+	if patch := schemas["PatchPersonRequest"]; patch != nil {
+		if displayName := patch.Properties["display_name"]; displayName != nil {
+			if displayName.Extensions == nil {
+				displayName.Extensions = map[string]any{}
+			}
+			displayName.Extensions["x-omitempty"] = false
+			displayName.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+				"validate": "omitempty",
 			}
 		}
 	}
@@ -472,6 +520,12 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		"ExploreGroupDimensionSource", "ExploreGroupDimensionParticipant", "ExploreGroupDimensionDomain",
 		"ExploreGroupDimensionMessageType", "ExploreGroupDimensionKind", "ExploreGroupDimensionYear", "ExploreGroupDimensionMonth",
 	})
+	if response := schemas["MeetingImportResponse"]; response != nil {
+		setEnumNames(response.Properties["status"], []any{
+			"MeetingImportResponseStatusCreated",
+			"MeetingImportResponseStatusUpdated",
+		})
+	}
 	for schemaName, properties := range map[string]map[string][]any{
 		"ExploreCacheUnavailableResponse": {
 			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
@@ -511,19 +565,26 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			setEnumNames(schema.Properties[propertyName], enumNames)
 		}
 	}
-	queryResult := schemas["QueryResult"]
-	if queryResult == nil || queryResult.Properties == nil {
+	meeting := schemas["Meeting"]
+	if meeting == nil || meeting.Properties == nil {
 		return
 	}
-	rows := queryResult.Properties["rows"]
-	if rows == nil || rows.Items == nil || rows.Items.Items == nil {
+	metadata := meeting.Properties["metadata"]
+	if metadata == nil {
 		return
 	}
-	cell := rows.Items.Items
-	if cell.Extensions == nil {
-		cell.Extensions = map[string]any{}
+	values, ok := metadata.AdditionalProperties.(*huma.Schema)
+	if !ok {
+		return
 	}
-	cell.Extensions["x-go-type"] = "any"
+	setCodegenGoType(values, "any")
+}
+
+func setCodegenGoType(schema *huma.Schema, goType string) {
+	if schema.Extensions == nil {
+		schema.Extensions = map[string]any{}
+	}
+	schema.Extensions["x-go-type"] = goType
 }
 
 func replaceStrictResponseAdditionalProperties(doc *huma.OpenAPI, replacement any) {

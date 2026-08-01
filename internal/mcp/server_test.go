@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -3652,7 +3655,7 @@ func TestServeHTTPWithOptions_ContextCancellation(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- ServeHTTPWithOptions(ctx, opts, "127.0.0.1:0")
+		done <- ServeHTTPWithOptions(ctx, opts, "127.0.0.1:0", "test-api-key")
 	}()
 
 	// Give the goroutine a moment to start the listener.
@@ -3665,4 +3668,217 @@ func TestServeHTTPWithOptions_ContextCancellation(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		require.Fail(t, "ServeHTTPWithOptions did not return after context cancellation")
 	}
+}
+
+func TestServeHTTPWithOptionsLiveListenerRequiresBearerAuth(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(err)
+	addr := probe.Addr().String()
+	require.NoError(probe.Close())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	stopped := make(chan struct{})
+	attachmentsDir := t.TempDir()
+	dataDir := t.TempDir()
+	go func() {
+		defer close(stopped)
+		done <- ServeHTTPWithOptions(ctx, ServeOptions{
+			Engine:         &querytest.MockEngine{},
+			AttachmentsDir: attachmentsDir,
+			DataDir:        dataDir,
+		}, addr, "test-api-key")
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-stopped:
+		case <-time.After(15 * time.Second):
+			assert.Fail("ServeHTTPWithOptions did not stop during test cleanup")
+		}
+	})
+
+	client := &http.Client{Timeout: time.Second}
+	var responseStatus int
+	var responseChallenge string
+	var responseCloseErr error
+	require.Eventually(func() bool {
+		req, requestErr := http.NewRequest(http.MethodPatch, "http://"+addr+"/mcp", nil)
+		if requestErr != nil {
+			return false
+		}
+		resp, requestErr := client.Do(req)
+		if requestErr != nil {
+			return false
+		}
+		responseStatus = resp.StatusCode
+		responseChallenge = resp.Header.Get("WWW-Authenticate")
+		responseCloseErr = resp.Body.Close()
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	require.NoError(responseCloseErr)
+	assert.Equal(http.StatusUnauthorized, responseStatus)
+	assert.Equal("Bearer", responseChallenge)
+
+	cancel()
+	select {
+	case serveErr := <-done:
+		require.ErrorIs(serveErr, context.Canceled)
+	case <-time.After(15 * time.Second):
+		require.Fail("ServeHTTPWithOptions did not return after context cancellation")
+	}
+}
+
+func TestBearerAuthHandler(t *testing.T) {
+	const apiKey = "test-api-key"
+
+	methods := []string{
+		http.MethodPost,
+		http.MethodGet,
+		http.MethodDelete,
+		http.MethodHead,
+		http.MethodPatch,
+	}
+	tests := []struct {
+		name          string
+		addAuth       func(*http.Request)
+		wantStatus    int
+		wantChallenge string
+		wantCalled    bool
+	}{
+		{
+			name:          "missing",
+			wantStatus:    http.StatusUnauthorized,
+			wantChallenge: "Bearer",
+		},
+		{
+			name: "wrong",
+			addAuth: func(req *http.Request) {
+				req.Header.Set("Authorization", "Bearer wrong-key")
+			},
+			wantStatus:    http.StatusUnauthorized,
+			wantChallenge: "Bearer",
+		},
+		{
+			name: "valid",
+			addAuth: func(req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+			},
+			wantStatus: http.StatusNoContent,
+			wantCalled: true,
+		},
+	}
+
+	for _, method := range methods {
+		for _, tt := range tests {
+			t.Run(method+"_"+tt.name, func(t *testing.T) {
+				called := false
+				next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					called = true
+					w.WriteHeader(http.StatusNoContent)
+				})
+				handler := bearerAuthHandler(apiKey, next)
+				req := httptest.NewRequest(method, "/mcp", nil)
+				req.Header.Set("Mcp-Session-Id", "test-session")
+				if tt.addAuth != nil {
+					tt.addAuth(req)
+				}
+				resp := httptest.NewRecorder()
+
+				handler.ServeHTTP(resp, req)
+
+				assert.Equal(t, tt.wantStatus, resp.Code)
+				assert.Equal(t, tt.wantChallenge, resp.Header().Get("WWW-Authenticate"))
+				assert.Equal(t, tt.wantCalled, called)
+			})
+		}
+	}
+}
+
+func TestBearerAuthHandlerRejectsMalformedCredentials(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers []string
+	}{
+		{name: "wrong scheme", headers: []string{"Basic test-api-key"}},
+		{name: "missing credential", headers: []string{"Bearer"}},
+		{name: "extra field", headers: []string{"Bearer test-api-key extra"}},
+		{name: "duplicate", headers: []string{"Bearer test-api-key", "Bearer test-api-key"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			handler := bearerAuthHandler("test-api-key", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				called = true
+			}))
+			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			for _, header := range tt.headers {
+				req.Header.Add("Authorization", header)
+			}
+			resp := httptest.NewRecorder()
+
+			handler.ServeHTTP(resp, req)
+
+			assert.Equal(t, http.StatusUnauthorized, resp.Code)
+			assert.Equal(t, "Bearer", resp.Header().Get("WWW-Authenticate"))
+			assert.False(t, called)
+		})
+	}
+}
+
+func TestBearerAuthHandlerCompatibilityAndSchemeCase(t *testing.T) {
+	t.Run("empty key passes through", func(t *testing.T) {
+		called := false
+		handler := bearerAuthHandler("", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		resp := httptest.NewRecorder()
+
+		handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+
+		assert.Equal(t, http.StatusAccepted, resp.Code)
+		assert.True(t, called)
+	})
+
+	t.Run("bearer scheme is case insensitive", func(t *testing.T) {
+		called := false
+		handler := bearerAuthHandler("test-api-key", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("Authorization", "bEaReR test-api-key")
+		resp := httptest.NewRecorder()
+
+		handler.ServeHTTP(resp, req)
+
+		assert.Equal(t, http.StatusAccepted, resp.Code)
+		assert.True(t, called)
+	})
+}
+
+func TestMCPHTTPServerMountsProtectedEndpoint(t *testing.T) {
+	stdlibServer := newMCPHTTPServer(ServeOptions{
+		Engine:         &querytest.MockEngine{},
+		AttachmentsDir: t.TempDir(),
+		DataDir:        t.TempDir(),
+	}, "127.0.0.1:0", "test-api-key")
+	assert.Equal(t, 10*time.Second, stdlibServer.ReadHeaderTimeout)
+
+	missing := httptest.NewRecorder()
+	missingRequest := httptest.NewRequest(http.MethodPatch, "/mcp", nil)
+	missingRequest.Header.Set("Mcp-Session-Id", "test-session")
+	stdlibServer.Handler.ServeHTTP(missing, missingRequest)
+	assert.Equal(t, http.StatusUnauthorized, missing.Code)
+
+	authorized := httptest.NewRecorder()
+	authorizedRequest := httptest.NewRequest(http.MethodPatch, "/mcp", nil)
+	authorizedRequest.Header.Set("Authorization", "Bearer test-api-key")
+	stdlibServer.Handler.ServeHTTP(authorized, authorizedRequest)
+	assert.Equal(t, http.StatusNotFound, authorized.Code)
 }

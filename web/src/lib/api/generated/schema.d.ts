@@ -1032,6 +1032,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/import/meeting": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import one meeting */
+        post: operations["importMeeting"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/integrations/tasks/search": {
         parameters: {
             query?: never;
@@ -1303,6 +1320,52 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/api/v1/persons": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List durable person profiles
+         * @description Durable persons are curated profiles; /api/v1/people exposes derived analytics groupings. The listing is deliberately unpaginated: persons exist only through explicit promotion, so the set stays small.
+         */
+        get: operations["listPersons"];
+        put?: never;
+        /**
+         * Promote a participant cluster to a durable person
+         * @description Returns 201 when a new person is created, or 200 when the cluster is already represented by a person (idempotent re-promotion, which also binds any unbound cluster members).
+         */
+        post: operations["createPerson"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/persons/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a durable person profile */
+        get: operations["getPersonProfile"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a durable person profile
+         * @description Deletion is permanent: the person's participant bindings are removed and its vCard UID is retired forever. Re-promoting the same cluster afterwards creates a new person with a new UID.
+         */
+        delete: operations["deletePerson"];
+        options?: never;
+        head?: never;
+        /** Update a durable person's display name */
+        patch: operations["patchPerson"];
         trace?: never;
     };
     "/api/v1/query": {
@@ -2275,6 +2338,10 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        CreatePersonRequest: {
+            /** Format: int64 */
+            participant_id: number;
+        };
         CreateRequest: {
             accounts: string[] | null;
             name: string;
@@ -2880,6 +2947,51 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        Meeting: {
+            attendees?: components["schemas"]["MeetingPerson"][] | null;
+            /** Format: date-time */
+            ended_at?: string;
+            external_id: string;
+            metadata?: {
+                [key: string]: unknown;
+            };
+            organizer?: components["schemas"]["MeetingPerson"];
+            /** Format: date-time */
+            started_at: string;
+            summary_markdown?: string;
+            summary_text?: string;
+            title?: string;
+            transcript?: string;
+            transcript_segments?: components["schemas"]["TranscriptSegment"][] | null;
+        } & (({
+            summary_markdown: string;
+        } | {
+            summary_text: string;
+        } | {
+            transcript: string;
+        } | {
+            transcript_segments: unknown[];
+        }) & unknown);
+        MeetingImportRequest: {
+            meeting: components["schemas"]["Meeting"];
+            source: components["schemas"]["Source"];
+        };
+        MeetingImportResponse: {
+            /** Format: int64 */
+            message_id: number;
+            /** Format: int64 */
+            source_id: number;
+            source_message_id: string;
+            /** @enum {string} */
+            status: "created" | "updated";
+        } & {
+            [key: string]: unknown;
+        };
+        MeetingPerson: {
+            /** Format: email */
+            email: string;
+            name?: string;
+        };
         MessageDetail: {
             attachments: components["schemas"]["AttachmentInfo"][] | null;
             bcc?: string[] | null;
@@ -2964,12 +3076,30 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        PatchPersonRequest: {
+            display_name: string | null;
+        };
         PatchSavedViewRequest: {
             canonical_state?: components["schemas"]["SavedViewStateEnvelope"];
             description?: string;
             name?: string;
             /** Format: int64 */
             schema_version?: number;
+        };
+        Person: {
+            /** Format: date-time */
+            created_at: string;
+            display_name?: string;
+            /** Format: int64 */
+            id: number;
+            participant_ids: number[] | null;
+            /** Format: int64 */
+            revision: number;
+            /** Format: date-time */
+            updated_at: string;
+            vcard_uid: string;
+        } & {
+            [key: string]: unknown;
         };
         PersonCluster: {
             /** Format: int64 */
@@ -3006,6 +3136,15 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        PersonProfile: {
+            display_name?: string;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            revision: number;
+        } & {
+            [key: string]: unknown;
+        };
         PersonSearchHTTPResponse: {
             cache_revision: string;
             candidate_snapshot_id?: string;
@@ -3034,7 +3173,13 @@ export interface components {
             /** Format: date-time */
             last_at: string;
             partial_label: boolean;
+            profile?: components["schemas"]["PersonProfile"];
             source_counts: components["schemas"]["SourceCount"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonsResponse: {
+            persons: components["schemas"]["Person"][] | null;
         } & {
             [key: string]: unknown;
         };
@@ -3342,6 +3487,12 @@ export interface components {
             seed_message_id: number;
         } & {
             [key: string]: unknown;
+        };
+        Source: {
+            /** Format: email */
+            account_email: string;
+            display_name?: string;
+            identifier: string;
         };
         SourceCount: {
             /** Format: int64 */
@@ -3656,6 +3807,12 @@ export interface components {
             total_size: number;
         } & {
             [key: string]: unknown;
+        };
+        TranscriptSegment: {
+            /** Format: double */
+            offset_seconds?: number;
+            speaker: string;
+            text: string;
         };
         UpdateRequest: {
             display_name: string;
@@ -5605,6 +5762,10 @@ export interface operations {
             query?: {
                 /** @description Account email or display name to sync */
                 email?: string;
+                /** @description IMAP folder names to include (repeatable) */
+                folder?: string[];
+                /** @description IMAP folder names to exclude (repeatable) */
+                "skip-folder"?: string[];
             };
             header?: never;
             path?: never;
@@ -5647,6 +5808,10 @@ export interface operations {
                 limit?: number;
                 /** @description Ignore checkpoints and start fresh */
                 noresume?: boolean;
+                /** @description IMAP folder names to include (repeatable) */
+                folder?: string[];
+                /** @description IMAP folder names to exclude (repeatable) */
+                "skip-folder"?: string[];
             };
             header?: never;
             path?: never;
@@ -6867,6 +7032,48 @@ export interface operations {
             };
         };
     };
+    importMeeting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MeetingImportRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingImportResponse"];
+                };
+            };
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingImportResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     searchIntegrationTasks: {
         parameters: {
             query: {
@@ -7670,6 +7877,333 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersons: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonsResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createPerson: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePersonRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Person"];
+                };
+            };
+            /** @description Created */
+            201: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Person"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Person"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deletePerson: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchPerson: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchPersonRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Person"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */

@@ -27,10 +27,22 @@ type CopyResult struct {
 // data) from srcDBPath into a new database in dstDir. The destination
 // schema is initialized using the embedded store schema.
 //
+// Identity policy: subsets are documented for sharing, so by default the
+// participant boundary is message-derived — no participant, identifier,
+// link edge, or person binding is copied for identities without selected
+// messages. Link edges between included participants are preserved, and a
+// durable person is copied only when every one of its bindings falls
+// inside the subset (a partial profile under its original revision would
+// misrepresent curated data). includeIdentity opts in to the full identity
+// closure instead: participants are expanded through participant_links and
+// shared person bindings until every included cluster and person profile
+// is complete, which exposes identifiers of linked identities that have no
+// messages in the subset.
+//
 // Security: validates srcDBPath for control characters and canonicalizes
 // it before use in SQL. Callers must validate path containment.
 func CopySubset(
-	srcDBPath, dstDir string, rowCount int,
+	srcDBPath, dstDir string, rowCount int, includeIdentity bool,
 ) (*CopyResult, error) {
 	if rowCount <= 0 {
 		return nil, fmt.Errorf("rowCount must be positive, got %d", rowCount)
@@ -133,7 +145,7 @@ func CopySubset(
 		return nil, fmt.Errorf("begin transaction: %w", err)
 	}
 
-	result, err := copyData(tx, rowCount)
+	result, err := copyData(tx, rowCount, includeIdentity)
 	if err != nil {
 		_ = tx.Rollback()
 		_, _ = db.Exec("DETACH DATABASE src")
@@ -226,7 +238,7 @@ func verifyForeignKeys(db *sql.DB) error {
 }
 
 // copyData executes INSERT INTO ... SELECT in dependency order.
-func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
+func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, error) {
 	result := &CopyResult{}
 
 	if _, err := tx.Exec(fmt.Sprintf(`
@@ -313,6 +325,83 @@ func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
 		return nil, fmt.Errorf("participants rows affected: %w", err)
 	}
 
+	// Identity policy (see CopySubset): by default the boundary stays
+	// message-derived. With includeIdentity, expand the participant set
+	// through the closure of link edges and shared person bindings so
+	// every included identity cluster and person profile is complete —
+	// components can pass through participants with no copied messages.
+	if includeIdentity {
+		res, err = tx.Exec(`
+			INSERT INTO participants SELECT * FROM src.participants
+			WHERE id IN (
+				WITH RECURSIVE edge(a, b) AS (
+					SELECT participant_a, participant_b FROM src.participant_links
+					UNION ALL
+					SELECT pp1.participant_id, pp2.participant_id
+					FROM src.person_participants pp1
+					JOIN src.person_participants pp2
+					  ON pp2.person_id = pp1.person_id
+					 AND pp2.participant_id != pp1.participant_id
+				), identity(id) AS (
+					SELECT id FROM participants
+					UNION
+					SELECT CASE WHEN edge.a = identity.id
+					            THEN edge.b ELSE edge.a END
+					FROM edge
+					JOIN identity ON identity.id IN (edge.a, edge.b)
+				)
+				SELECT id FROM identity
+			)
+			  AND id NOT IN (SELECT id FROM participants)`)
+		if err != nil {
+			return nil, fmt.Errorf("copy identity-closure participants: %w", err)
+		}
+		identityMates, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("identity-closure participants rows affected: %w", err)
+		}
+		result.Participants += identityMates
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO participant_links SELECT * FROM src.participant_links
+		WHERE participant_a IN (SELECT id FROM participants)
+		  AND participant_b IN (SELECT id FROM participants)`); err != nil {
+		return nil, fmt.Errorf("copy participant_links: %w", err)
+	}
+
+	// Only complete profiles are copied: a person with any binding outside
+	// the subset is skipped, because a partial binding set under the
+	// original revision would misrepresent the curated profile. With
+	// includeIdentity, the closure above already pulled every bound
+	// participant in, so no touched person is skipped.
+	if _, err := tx.Exec(`
+		INSERT INTO persons
+			(id, vcard_uid, display_name, revision, created_at, updated_at)
+		SELECT p.id, p.vcard_uid, p.display_name, p.revision, p.created_at, p.updated_at
+		FROM src.persons p
+		WHERE EXISTS (
+			SELECT 1 FROM src.person_participants pp
+			WHERE pp.person_id = p.id
+			  AND pp.participant_id IN (SELECT id FROM participants)
+		)
+		  AND NOT EXISTS (
+			SELECT 1 FROM src.person_participants pp
+			WHERE pp.person_id = p.id
+			  AND pp.participant_id NOT IN (SELECT id FROM participants)
+		)`); err != nil {
+		return nil, fmt.Errorf("copy persons: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO person_participants (person_id, participant_id)
+		SELECT person_id, participant_id
+		FROM src.person_participants
+		WHERE person_id IN (SELECT id FROM persons)
+		  AND participant_id IN (SELECT id FROM participants)`); err != nil {
+		return nil, fmt.Errorf("copy person_participants: %w", err)
+	}
+
 	if _, err := tx.Exec(`
 		INSERT INTO participant_identifiers
 		SELECT * FROM src.participant_identifiers
@@ -347,9 +436,11 @@ func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
 	// the source's own migration filled it. It is the copy that has to be
 	// closed, not the writers: this statement is the only thing standing
 	// between a single NULL anywhere upstream and a permanently unreportable
-	// message. It names only content_changed_at, so the content-change trigger
-	// (UPDATE OF the content columns) does not fire; the blanket last_modified
-	// trigger does, which is correct — the row did change.
+	// message. It names only content_changed_at, so neither messages trigger
+	// fires: the content-change trigger is UPDATE OF the content columns, and
+	// the last_modified trigger is UPDATE OF every column except this one (see
+	// lastModifiedUpdateOfColumns). last_modified therefore keeps the value
+	// copied from the source, which is what a subset should carry.
 	if _, err := tx.Exec(fmt.Sprintf(
 		`UPDATE messages SET content_changed_at = %s WHERE content_changed_at IS NULL`,
 		(&SQLiteDialect{}).ContentChangedNow())); err != nil {
@@ -443,6 +534,11 @@ func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
 // lacks); this is the same mechanism for a table whose column list is far too
 // long to retype, with the list read from the two schemas rather than pinned in
 // source that would rot on the next ALTER TABLE ADD COLUMN.
+//
+// Reading the list from the two schemas rather than pinning it in a constant
+// is also what keeps a column added by a LegacyColumnMigrations ALTER — one
+// that never appears in schema.sql's CREATE TABLE — from being silently
+// dropped from every subset. Do not replace this with a hand-maintained list.
 //
 // A column the source lacks is simply left out of the INSERT, so the
 // destination's own DEFAULT supplies it — for content_changed_at that is the

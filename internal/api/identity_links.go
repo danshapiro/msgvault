@@ -29,12 +29,11 @@ type ClusterLookupStore interface {
 	ClusterEdges(id int64) ([]store.LinkEdge, error)
 }
 
-// IdentityCacheRefresher re-exports the identity-derived Parquet datasets
-// (owner_participants, participant_clusters) after a link/unlink mutation
-// commits, so cached analytics reflect the new participant clusters without
-// waiting for the next scheduled cache build. Implemented by the serve
-// daemon's store adapter, which wraps cacheops.RefreshIdentityDatasets with
-// the daemon's analytics directory and the cross-process cache build lock.
+// IdentityCacheRefresher rebuilds the identity-derived Parquet datasets after
+// a link/unlink mutation commits, so cached analytics reflect the new
+// participant clusters without waiting for the next scheduled cache build.
+// Implemented by the serve daemon's store adapter, which runs the refresh in
+// a short-lived resource-bounded build-cache child process.
 type IdentityCacheRefresher interface {
 	RefreshIdentityDatasets(ctx context.Context) (int64, error)
 }
@@ -113,6 +112,10 @@ func (s *Server) handleIdentityLinkMutation(
 
 	revision, err := mutate(linker, req.ParticipantA, req.ParticipantB)
 	switch {
+	case errors.Is(err, store.ErrPersonBindingConflict):
+		writeError(w, http.StatusConflict, "person_binding_conflict",
+			"The identity clusters belong to different person profiles")
+		return
 	case errors.Is(err, store.ErrAlreadyLinked):
 		writeError(w, http.StatusConflict, "already_linked",
 			"these participants are already connected through other links")

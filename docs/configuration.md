@@ -248,13 +248,13 @@ Use `msgvault logs` to view and tail log files from the selected local or remote
 
 ### `[server]`
 
-Settings for the Web UI and API server started by `msgvault serve`. The same HTTP server is used by remote CLI access and by the local background daemon for archive-access CLI commands. See [Web UI & API Server](/api-server/) for endpoint documentation, or fetch `/openapi.json` from a running server for the generated OpenAPI contract.
+Settings for the Web UI and API server started by `msgvault serve`. The same HTTP server is used by remote CLI access and by the local background daemon for archive-access CLI commands. The `api_key` setting is also reused for inbound bearer authentication when `msgvault mcp --http` starts a separate Streamable HTTP listener; that listener's address comes from the `--http` flag. See [Web UI & API Server](/api-server/) for API endpoint documentation and [MCP Server](/usage/chat/#streamablehttp-transport) for MCP client setup, or fetch `/openapi.json` from a running server for the generated OpenAPI contract.
 
 | Key | Default | Description |
 |---|---|---|
 | `api_port` | `0` (auto-select) | Port the server listens on; `0` picks an open port at startup and clients discover it automatically. Set a fixed port for remote/NAS deployments. |
 | `bind_addr` | `127.0.0.1` | Bind address |
-| `api_key` | — | API key for authentication |
+| `api_key` | — | API key for daemon/API authentication and bearer authentication on `msgvault mcp --http` |
 | `allow_insecure` | `false` | Allow non-loopback binding without `api_key` |
 | `cors_origins` | `[]` | Allowed CORS origins |
 | `cors_credentials` | `false` | Allow credentials in CORS requests |
@@ -272,6 +272,11 @@ programmatic clients continue to send the configured key. For remote browser
 access, terminate TLS at a reverse proxy and list that proxy—not arbitrary
 clients—in `trusted_proxies`. See [Web UI](/web-ui/) for the complete security
 model and the plain-HTTP warning.
+
+For MCP Streamable HTTP, send `[server].api_key` as `Authorization: Bearer
+<key>` on every `/mcp` request. This inbound credential is independent of
+`[remote].api_key`, which authenticates `msgvault mcp` when it connects to a
+remote daemon.
 
 ### `[web]`
 
@@ -438,6 +443,31 @@ max_media_mb = 100                # per-attachment download cap (MiB)
 | `rate_limit_qps` | `20` | Request rate limit against the local API |
 | `media` | `true` | Download attachment bytes (failed downloads retry via `backfill-beeper-media`) |
 | `max_media_mb` | `100` | Per-attachment download cap in MiB (over-cap media leaves a retry marker) |
+
+### `[slack]`
+
+Archive [Slack workspaces](/usage/slack/). A single block covers every
+registered workspace (tokens are per-workspace files). Authorize each
+workspace first with `msgvault add-slack`.
+
+```toml
+[slack]
+enabled = true                    # gate for the daemon schedule
+schedule = "*/30 * * * *"         # 5-field cron; empty = manual sync only
+channels = []                     # channel-name include filter (empty = all memberships)
+exclude_channels = []             # channel names to skip, e.g. ["noise"]
+media = true                      # download shared-file bytes
+max_media_mb = 100                # per-file download cap (MiB)
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Whether the daemon schedules Slack sync |
+| `schedule` | — | Cron expression used by `msgvault serve` |
+| `channels` | all | Channel names to sync (include filter; DMs are never filtered) |
+| `exclude_channels` | — | Channel names to skip (wins over `channels`) |
+| `media` | `true` | Download shared-file bytes (failed downloads retry via `backfill-slack-media`) |
+| `max_media_mb` | `100` | Per-file download cap in MiB (over-cap files leave a retry marker) |
 
 ### Granola Sources
 

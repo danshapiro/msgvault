@@ -995,6 +995,10 @@ func (c ConversationResponse) Validate() error {
 	return errors
 }
 
+type CreatePersonRequest struct {
+	ParticipantID int64 `json:"participant_id"`
+}
+
 type CreateRequest struct {
 	Accounts []string `json:"accounts,omitempty" validate:"required"`
 	Name     string   `json:"name" validate:"required"`
@@ -2491,6 +2495,115 @@ type MatchSummary struct {
 	StrongestExcerpt  *string  `json:"strongest_excerpt,omitempty"`
 }
 
+type Meeting struct {
+	Attendees          []MeetingPerson     `json:"attendees,omitempty"`
+	EndedAt            *string             `json:"ended_at,omitempty"`
+	ExternalID         string              `json:"external_id" validate:"required,max=256"`
+	Metadata           map[string]any      `json:"metadata,omitempty"`
+	Organizer          *MeetingPerson      `json:"organizer,omitempty"`
+	StartedAt          string              `json:"started_at" validate:"required"`
+	SummaryMarkdown    *string             `json:"summary_markdown,omitempty"`
+	SummaryText        *string             `json:"summary_text,omitempty"`
+	Title              *string             `json:"title,omitempty" validate:"omitempty,max=4096"`
+	Transcript         *string             `json:"transcript,omitempty"`
+	TranscriptSegments []TranscriptSegment `json:"transcript_segments,omitempty"`
+}
+
+func (m Meeting) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range m.Attendees {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Attendees[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(m.ExternalID, "required,max=256"); err != nil {
+		errors = errors.Append("ExternalID", err)
+	}
+	if m.Organizer != nil {
+		if v, ok := any(m.Organizer).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Organizer", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(m.StartedAt, "required"); err != nil {
+		errors = errors.Append("StartedAt", err)
+	}
+	if m.Title != nil {
+		if err := typesValidator.Var(m.Title, "omitempty,max=4096"); err != nil {
+			errors = errors.Append("Title", err)
+		}
+	}
+	for i, item := range m.TranscriptSegments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("TranscriptSegments[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type MeetingImportRequest struct {
+	Meeting Meeting `json:"meeting"`
+	Source  Source  `json:"source"`
+}
+
+func (m MeetingImportRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(m.Meeting).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Meeting", err)
+		}
+	}
+	if v, ok := any(m.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type MeetingImportResponse struct {
+	MessageID       int64                       `json:"message_id"`
+	SourceID        int64                       `json:"source_id"`
+	SourceMessageID string                      `json:"source_message_id" validate:"required"`
+	Status          MeetingImportResponseStatus `json:"status" validate:"required"`
+}
+
+func (m MeetingImportResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(m.SourceMessageID, "required"); err != nil {
+		errors = errors.Append("SourceMessageID", err)
+	}
+	if v, ok := any(m.Status).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Status", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type MeetingPerson struct {
+	Email string  `json:"email" validate:"required"`
+	Name  *string `json:"name,omitempty"`
+}
+
+func (m MeetingPerson) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(m))
+}
+
 type MessageDetail struct {
 	Attachments     []AttachmentInfo `json:"attachments,omitempty" validate:"required"`
 	Bcc             []string         `json:"bcc,omitempty"`
@@ -2616,6 +2729,14 @@ type OperationHealth struct {
 	StartedAt *time.Time `json:"started_at,omitempty"`
 }
 
+type PatchPersonRequest struct {
+	DisplayName *string `json:"display_name" validate:"omitempty"`
+}
+
+func (p PatchPersonRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
 type PatchSavedViewRequest struct {
 	CanonicalState *SavedViewStateEnvelope `json:"canonical_state,omitempty"`
 	Description    *string                 `json:"description,omitempty"`
@@ -2636,6 +2757,20 @@ func (p PatchSavedViewRequest) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type Person struct {
+	CreatedAt      time.Time `json:"created_at" validate:"required"`
+	DisplayName    *string   `json:"display_name,omitempty"`
+	ID             int64     `json:"id"`
+	ParticipantIds []int64   `json:"participant_ids,omitempty" validate:"required"`
+	Revision       int64     `json:"revision"`
+	UpdatedAt      time.Time `json:"updated_at" validate:"required"`
+	VcardUID       string    `json:"vcard_uid" validate:"required"`
+}
+
+func (p Person) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
 type PersonCluster struct {
@@ -2708,6 +2843,12 @@ func (p PersonIdentifier) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
+type PersonProfile struct {
+	DisplayName *string `json:"display_name,omitempty"`
+	ID          int64   `json:"id"`
+	Revision    int64   `json:"revision"`
+}
+
 type PersonSearchHTTPResponse struct {
 	CacheRevision       string           `json:"cache_revision" validate:"required"`
 	CandidateSnapshotID *string          `json:"candidate_snapshot_id,omitempty"`
@@ -2752,6 +2893,7 @@ type PersonSummary struct {
 	Identifiers   []PersonIdentifier `json:"identifiers,omitempty" validate:"required"`
 	LastAt        time.Time          `json:"last_at" validate:"required"`
 	PartialLabel  bool               `json:"partial_label"`
+	Profile       *PersonProfile     `json:"profile,omitempty"`
 	SourceCounts  []SourceCount      `json:"source_counts,omitempty" validate:"required"`
 }
 
@@ -2783,10 +2925,36 @@ func (p PersonSummary) Validate() error {
 	if err := typesValidator.Var(p.LastAt, "required"); err != nil {
 		errors = errors.Append("LastAt", err)
 	}
+	if p.Profile != nil {
+		if v, ok := any(p.Profile).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Profile", err)
+			}
+		}
+	}
 	for i, item := range p.SourceCounts {
 		if v, ok := any(item).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
 				errors = errors.Append(fmt.Sprintf("SourceCounts[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonsResponse struct {
+	Persons []Person `json:"persons,omitempty" validate:"required"`
+}
+
+func (p PersonsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Persons {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Persons[%d]", i), err)
 			}
 		}
 	}
@@ -3552,6 +3720,16 @@ func (s SimilarSearchResponse) Validate() error {
 	return errors
 }
 
+type Source struct {
+	AccountEmail string  `json:"account_email" validate:"required"`
+	DisplayName  *string `json:"display_name,omitempty" validate:"omitempty,max=256"`
+	Identifier   string  `json:"identifier" validate:"required,max=128"`
+}
+
+func (s Source) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
 type SourceCount struct {
 	Count      int64  `json:"count"`
 	SourceType string `json:"source_type" validate:"required"`
@@ -4132,6 +4310,16 @@ type TotalStatsResponse struct {
 	MessageCount          int64   `json:"message_count"`
 	SourceDeletedMessages int64   `json:"source_deleted_messages"`
 	TotalSize             int64   `json:"total_size"`
+}
+
+type TranscriptSegment struct {
+	OffsetSeconds *float64 `json:"offset_seconds,omitempty" validate:"omitempty,gte=0"`
+	Speaker       string   `json:"speaker" validate:"required"`
+	Text          string   `json:"text" validate:"required"`
+}
+
+func (t TranscriptSegment) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(t))
 }
 
 type UpdateRequest struct {

@@ -101,6 +101,22 @@ After adding an account, sync it with `msgvault sync-full`. IMAP accounts use th
 
 ---
 
+## list-folders
+
+List the selectable folders in one or all configured IMAP accounts, including
+an approximate message count for each folder.
+
+```bash
+msgvault list-folders [account]
+```
+
+Use the folder names in repeated `--folders` or `--skip-folders` flags on
+`sync-full` and `sync`. When the account argument is omitted, the command lists
+folders for every configured IMAP account. See
+[IMAP Folder Sync](/usage/imap/) for examples and matching rules.
+
+---
+
 ## add-o365
 
 Add a Microsoft 365 or Outlook.com account via OAuth2 with XOAUTH2 IMAP authentication.
@@ -190,6 +206,8 @@ msgvault sync-full [email] [flags]
 | `--before YYYY-MM-DD` | Only messages before this date |
 | `--query` | Gmail search query filter |
 | `--noresume` | Ignore checkpoints, start fresh |
+| `--folders NAME` | Scan this IMAP folder (repeatable) |
+| `--skip-folders NAME` | Skip this IMAP folder (repeatable) |
 | `--verbose` | Detailed progress output |
 
 The CLI sends the sync request to the configured remote server or local daemon
@@ -204,12 +222,20 @@ SQLite writer beside `msgvault serve`.
 Sync new and changed messages. Gmail accounts use the Gmail History API; IMAP accounts perform a mailbox scan and skip messages already in the database. When called without an email argument, syncs all accounts that have completed an initial full sync.
 
 ```bash
-msgvault sync [email]
+msgvault sync [email] [flags]
 ```
+
+| Flag | Description |
+|---|---|
+| `--folders NAME` | Scan this IMAP folder (repeatable) |
+| `--skip-folders NAME` | Skip this IMAP folder (repeatable) |
 
 The CLI sends the incremental sync request to the configured remote server or
 local daemon and streams the daemon's stdout/stderr back to the terminal. The
 daemon serializes this work with other archive mutations.
+
+Folder filters are applied only to IMAP accounts. See
+[IMAP Folder Sync](/usage/imap/) for examples and matching rules.
 
 ---
 
@@ -493,6 +519,70 @@ msgvault backfill-beeper-media --account signal
 | Flag | Default | Description |
 |---|---|---|
 | `--account` | all registered | Beeper accountID to backfill (repeatable) |
+
+---
+
+## add-slack
+
+Register a [Slack workspace](/usage/slack/) as a `slack` source. Requires a
+user token (`xoxp-…`) from an internal Slack app you create (see the usage
+guide for the two-minute setup and scope list). The token is validated with
+`auth.test` plus a `search.messages` probe (thread-reply archiving needs the
+`search:read` scope, so an under-scoped token fails here rather than on
+every future sync) and stored at `tokens/slack_<team-id>_<user-id>.json`.
+
+```bash
+msgvault add-slack
+msgvault add-slack --token-file ~/slack-token.txt
+MSGVAULT_SLACK_TOKEN="xoxp-..." msgvault add-slack
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--token-file` | | Read the user token from a file instead of prompting |
+| `--no-default-identity` | `false` | Do not auto-confirm the workspace user ID as the source's "me" identity |
+
+After adding, sync with `msgvault sync-slack`.
+
+---
+
+## sync-slack
+
+Sync Slack conversations — channels you are a member of, group DMs, and 1:1
+DMs — for registered workspaces. The first run backfills full history and is
+resumable; later runs are incremental and sweep for thread replies created
+since the last run (any thread age). Per-workspace failures do not stop the run: remaining workspaces
+still sync and the command exits non-zero listing the failures. The `[slack]`
+config `channels`/`exclude_channels` filters select which channels sync. See
+[Slack](/usage/slack/).
+
+```bash
+msgvault sync-slack
+msgvault sync-slack T0123456789
+msgvault sync-slack --full
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--limit` | `0` | Max messages of work per conversation this run, thread replies included; the reply sweep gets the same budget workspace-wide (0 = no limit; every phase resumes next run so standing limited schedules converge; only the maintenance rescan is skipped) |
+| `--full` | `false` | Start (or continue) a repair session: re-fetch every message, upserting in place (catches old thread replies and edits). Interrupted or --limit-scoped repairs resume across later runs of any kind until complete |
+| `--no-threads` | `false` | Skip thread-reply fetching for this run (a later threaded run pays the debt automatically) |
+| `--maintenance` | `false` | Repair edits/reaction changes on recent messages (ignored by default after capture) |
+| `--no-media` | `false` | Skip file downloads for this run (files become pending markers; `backfill-slack-media` fetches them later) |
+
+---
+
+## backfill-slack-media
+
+Retry pending Slack file downloads (files that failed or exceeded the size
+cap during `sync-slack`). Idempotent: files are content-addressed and
+already-downloaded ones are never re-fetched. Files hosted outside
+`files.slack.com` are metadata-only link rows and are never downloaded.
+
+```bash
+msgvault backfill-slack-media
+msgvault backfill-slack-media T0123456789
+```
 
 ---
 
@@ -1392,8 +1482,8 @@ msgvault mcp [flags]
 |---|---|---|
 | `--force-sql` | `false` | Deprecated in 0.17.0; use `[analytics].engine = "sql"` in `config.toml` instead. See [Configuration: analytics](/configuration/#analytics). |
 | `--no-sqlite-scanner` | `false` | Deprecated in 0.17.0; cache engine selection is daemon-managed. Use `[analytics].engine = "sql"` for live SQL. |
-| `--http` | — | Serve MCP over StreamableHTTP on this address instead of stdio. Bare ports bind to loopback, e.g. `8080` becomes `127.0.0.1:8080`. |
-| `--http-allow-insecure` | `false` | Allow non-loopback HTTP binding. The MCP server has no built-in auth; put it behind a trusted network or authenticated reverse proxy. |
+| `--http` | — | Serve MCP over StreamableHTTP on this address instead of stdio. Bare ports bind to loopback, e.g. `8080` becomes `127.0.0.1:8080`. Non-loopback addresses require `[server].api_key` or `--http-allow-insecure`. |
+| `--http-allow-insecure` | `false` | Allow non-loopback HTTP binding without `[server].api_key`. A configured key is still enforced; without one, use only behind a trusted network boundary or authenticated reverse proxy. |
 
 See [MCP Server](/usage/chat/) for configuration and tool reference.
 

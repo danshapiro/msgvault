@@ -1,11 +1,13 @@
 package store_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/mime"
@@ -1429,6 +1431,153 @@ func TestStore_AddMessageLabels(t *testing.T) {
 	f.AssertLabelCount(msgID, 4)
 }
 
+func TestStore_ReconcileMessageLabelsReportsChanges(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	messageID := f.CreateMessage("msg-reconcile-labels")
+	labels := f.EnsureLabels(map[string]string{
+		"INBOX":   "Inbox",
+		"STARRED": "Starred",
+		"SENT":    "Sent",
+	}, "system")
+	require.NoError(f.Store.ReplaceMessageLabels(
+		messageID, []int64{labels["INBOX"]}))
+
+	changed, err := f.Store.ReconcileMessageLabels(
+		messageID, []int64{labels["INBOX"]}, false)
+	require.NoError(err)
+	assert.False(changed)
+
+	changed, err = f.Store.ReconcileMessageLabels(
+		messageID, []int64{labels["STARRED"]}, false)
+	require.NoError(err)
+	assert.True(changed)
+
+	changed, err = f.Store.ReconcileMessageLabels(
+		messageID, []int64{labels["INBOX"], labels["STARRED"]}, true)
+	require.NoError(err)
+	assert.False(changed)
+
+	changed, err = f.Store.ReconcileMessageLabels(
+		messageID, []int64{labels["SENT"]}, true)
+	require.NoError(err)
+	assert.True(changed)
+	f.AssertLabelCount(messageID, 1)
+	f.AssertMessageHasLabel(messageID, labels["SENT"])
+}
+
+func TestStore_DedupReconciliationReportsChanges(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	messageID := f.CreateMessage("INBOX|1")
+	labels := f.EnsureLabels(map[string]string{
+		"INBOX":   "Inbox",
+		"Archive": "Archive",
+		"Trash":   "Trash",
+	}, "system")
+	require.NoError(f.Store.ReplaceMessageLabels(
+		messageID, []int64{labels["INBOX"]}))
+
+	changed, err := f.Store.UpdateMessageOnDedup(
+		messageID, "Archive|2", []int64{labels["Archive"]})
+	require.NoError(err)
+	assert.True(changed)
+	sourceMessageID, err := f.Store.GetMessageSourceID(messageID)
+	require.NoError(err)
+	assert.Equal("Archive|2", sourceMessageID)
+	f.AssertLabelCount(messageID, 1)
+	f.AssertMessageHasLabel(messageID, labels["Archive"])
+
+	changed, err = f.Store.UpdateMessageOnDedup(
+		messageID, "Archive|2", []int64{labels["Archive"]})
+	require.NoError(err)
+	assert.False(changed)
+
+	changed, err = f.Store.UpdateMessageOnPartialDedup(
+		messageID, "Trash|3", []int64{labels["Trash"]})
+	require.NoError(err)
+	assert.True(changed)
+	sourceMessageID, err = f.Store.GetMessageSourceID(messageID)
+	require.NoError(err)
+	assert.Equal("Trash|3", sourceMessageID)
+	f.AssertLabelCount(messageID, 2)
+	f.AssertMessageHasLabel(messageID, labels["Archive"])
+	f.AssertMessageHasLabel(messageID, labels["Trash"])
+
+	changed, err = f.Store.UpdateMessageOnPartialDedup(
+		messageID, "Trash|3", []int64{labels["Trash"]})
+	require.NoError(err)
+	assert.False(changed)
+}
+
+func TestStore_MessageMetadataWithRawBatch(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+
+	withRaw := storetest.NewMessage(f.Source.ID, f.ConvID).
+		WithSourceMessageID("INBOX|1").
+		Build()
+	withRaw.RFC822MessageID = sql.NullString{
+		String: "<old@example.com>",
+		Valid:  true,
+	}
+	withRawID, err := f.Store.PersistMessage(&store.MessagePersistData{
+		Message: withRaw,
+		RawMIME: sampleRawMessage,
+	})
+	require.NoError(err)
+
+	withoutRaw := storetest.NewMessage(f.Source.ID, f.ConvID).
+		WithSourceMessageID("INBOX|2").
+		Build()
+	_, err = f.Store.UpsertMessage(withoutRaw)
+	require.NoError(err)
+
+	got, err := f.Store.MessageMetadataWithRawBatch(
+		f.Source.ID,
+		[]string{"INBOX|1", "INBOX|2", "INBOX|3"},
+	)
+	require.NoError(err)
+	require.Len(got, 1)
+	assert.Equal(withRawID, got["INBOX|1"].ID)
+	assert.Equal(
+		sql.NullString{String: "<old@example.com>", Valid: true},
+		got["INBOX|1"].RFC822MessageID,
+	)
+}
+
+func TestStore_RekeyMessageSourceIDRequiresExpectedID(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	messageID := f.CreateMessage("INBOX|1")
+
+	changed, err := f.Store.RekeyMessageSourceID(
+		messageID,
+		"wrong|1",
+		"msgvault-invalidated:1",
+	)
+	require.NoError(err)
+	assert.False(changed)
+	sourceMessageID, err := f.Store.GetMessageSourceID(messageID)
+	require.NoError(err)
+	assert.Equal("INBOX|1", sourceMessageID)
+
+	changed, err = f.Store.RekeyMessageSourceID(
+		messageID,
+		"INBOX|1",
+		"msgvault-invalidated:1",
+	)
+	require.NoError(err)
+	assert.True(changed)
+	sourceMessageID, err = f.Store.GetMessageSourceID(messageID)
+	require.NoError(err)
+	assert.Equal("msgvault-invalidated:1", sourceMessageID)
+}
+
 func TestStore_RemoveMessageLabels(t *testing.T) {
 	require := require.New(t)
 	f := storetest.New(t)
@@ -1588,6 +1737,73 @@ func TestStore_PersistMessage_Atomicity(t *testing.T) {
 	existing, err := f.Store.MessageExistsBatch(f.Source.ID, []string{"persist-atomic"})
 	require.NoError(t, err, "MessageExistsBatch")
 	assert.Empty(t, existing, "message should not exist after failed PersistMessage")
+}
+
+func TestStore_PersistMessageContext_CancellationRollsBack(t *testing.T) {
+	testutil.SkipIfPostgres(t, "uses a SQLite trigger and registered function to pause persistence")
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	f.Store.DB().SetMaxOpenConns(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	persistStarted := make(chan struct{})
+	conn, err := f.Store.DB().Conn(context.Background())
+	require.NoError(err, "get SQLite connection")
+	err = conn.Raw(func(driverConn any) error {
+		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+		require.True(ok, "driver connection is SQLite")
+		return sqliteConn.RegisterFunc("wait_for_persist_cancel", func() int {
+			close(persistStarted)
+			<-ctx.Done()
+			return 0
+		}, true)
+	})
+	require.NoError(err, "register cancellation function")
+	require.NoError(conn.Close(), "return SQLite connection to pool")
+	_, err = f.Store.DB().Exec(`
+		CREATE TRIGGER wait_before_meeting_raw_insert
+		BEFORE INSERT ON message_raw
+		WHEN NEW.raw_format = 'meeting_json'
+		BEGIN
+			SELECT wait_for_persist_cancel();
+		END
+	`)
+	require.NoError(err, "create cancellation trigger")
+
+	msg := storetest.NewMessage(f.Source.ID, f.ConvID).
+		WithSourceMessageID("persist-cancel").
+		WithSubject("Canceled persistence").
+		Build()
+	done := make(chan error, 1)
+	go func() {
+		_, persistErr := f.Store.PersistMessageContext(ctx, &store.MessagePersistData{
+			Message:   msg,
+			BodyText:  sql.NullString{String: "must roll back", Valid: true},
+			RawMIME:   []byte(`{"meeting":"cancel"}`),
+			RawFormat: "meeting_json",
+		})
+		done <- persistErr
+	}()
+
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		require.FailNow("message persistence did not reach cancellation trigger")
+	}
+	cancel()
+
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		require.FailNow("message persistence did not stop after cancellation")
+	}
+	require.ErrorIs(err, context.Canceled)
+
+	existing, err := f.Store.MessageExistsBatch(f.Source.ID, []string{"persist-cancel"})
+	require.NoError(err, "lookup canceled message")
+	assert.Empty(existing, "canceled message transaction must roll back")
 }
 
 func TestStore_OAuthAppColumn(t *testing.T) {

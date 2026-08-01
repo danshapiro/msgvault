@@ -642,6 +642,17 @@ func serveWithoutWriteDeadline(
 	next.ServeHTTP(w, r)
 }
 
+func serveMeetingImportWithReadDeadline(
+	w http.ResponseWriter,
+	r *http.Request,
+	next http.Handler,
+) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(DaemonLongRequestTimeout))
+	_ = controller.SetWriteDeadline(time.Time{})
+	next.ServeHTTP(w, r)
+}
+
 func serveWithProtectiveRequestDeadline(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -659,6 +670,12 @@ func serveWithProtectiveRequestDeadline(
 
 func (s *Server) timeoutMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost &&
+			r.URL.Path == meetingImportEndpointPath &&
+			s.apiRequestAuthorized(r) {
+			serveMeetingImportWithReadDeadline(w, r, next)
+			return
+		}
 		if s.requestUsesCLITimeoutPolicy(r) {
 			if cliRequestNeedsProtectiveCeiling(r) {
 				serveWithProtectiveRequestDeadline(w, r, next)
@@ -706,9 +723,9 @@ func cliRequestNeedsProtectiveCeiling(r *http.Request) bool {
 
 // requestTimeoutForPath returns the context deadline to impose on a request
 // and whether one applies at all. POST /api/v1/query gets its own generous
-// ceiling; the streaming/long-running CLI operations stay unbounded (they
-// report progress and are gated by the operation gate); everything else gets
-// the standard per-request timeout.
+// ceiling; the streaming/long-running CLI operations and meeting imports stay
+// unbounded (they report progress and are gated by the operation gate);
+// everything else gets the standard per-request timeout.
 func (s *Server) requestTimeoutForPath(path string) (time.Duration, bool) {
 	if path == queryEndpointPath {
 		return s.queryTimeout, true
@@ -723,6 +740,7 @@ func isLongDaemonRequest(path string) bool {
 	switch path {
 	case "/api/v1/cli/build-cache",
 		"/api/v1/cli/deduplicate/plan",
+		meetingImportEndpointPath,
 		"/api/v1/cli/rebuild-fts",
 		"/api/v1/cli/repair-encoding",
 		"/api/v1/cli/run",
@@ -935,7 +953,7 @@ func (s *Server) handleDaemonShutdown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", applicationJSONMediaType)
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"shutting_down"}`))
 	go s.shutdownFunc()

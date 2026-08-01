@@ -211,6 +211,15 @@ func (s *Store) bumpIdentityRevisionContext(
 // serialized against other writers. On PostgreSQL the UPDATE takes a row
 // lock on the identity-revision row, so concurrent link/unlink
 // transactions queue on it.
+//
+// ORDERING CONTRACT (PostgreSQL): any transaction that both writes a table
+// in exclusiveLockTables and touches the identity-revision row (this lock
+// or bumpIdentityRevision) must acquire the row BEFORE its first table
+// write. BeginExclusive takes the row and then LOCK TABLE over that list,
+// so the reverse order deadlocks against a serialized source removal.
+// Transactions with a cheap no-op fast path should check it read-only
+// first and take this lock only when they will actually write (see
+// SetParticipantIdentifier and the legacy identity migration).
 func (s *Store) lockIdentityMutationTx(tx *loggedTx) error {
 	return s.lockIdentityMutationTxContext(context.Background(), tx)
 }
@@ -253,8 +262,13 @@ func (s *Store) verifyParticipantsExistTx(tx *loggedTx, lo, hi int64) error {
 // ErrInvalidParticipantID (wrapped) for a self-link or non-positive ID, and
 // ErrParticipantNotFound (wrapped) if either ID is not a participants row.
 // Idempotent for the exact existing edge; returns ErrAlreadyLinked for a new
-// redundant edge between participants already connected indirectly. Returns
-// the identity revision after the call.
+// redundant edge between participants already connected indirectly. Linking
+// clusters curated as different durable people returns
+// ErrPersonBindingConflict (wrapped) rather than merging those profiles.
+// When exactly one durable person covers the two clusters, the new link
+// binds the combined cluster's unbound members to that person (bumping its
+// revision), so person membership never drifts behind cluster membership.
+// Returns the identity revision after the call.
 func (s *Store) LinkParticipants(a, b int64) (int64, error) {
 	if a == b || a <= 0 || b <= 0 {
 		return 0, fmt.Errorf("link participants: ids must be distinct positive IDs (got %d, %d): %w",
@@ -274,6 +288,12 @@ func (s *Store) LinkParticipants(a, b int64) (int64, error) {
 		if err != nil {
 			return err
 		}
+		personID, unionMembers, err := s.personForClusterUnionTx(
+			context.Background(), tx, lo, hi, edges,
+		)
+		if err != nil {
+			return err
+		}
 		for _, e := range edges {
 			if e.a == lo && e.b == hi {
 				revision, err = s.currentIdentityRevisionTx(tx)
@@ -287,6 +307,19 @@ func (s *Store) LinkParticipants(a, b int64) (int64, error) {
 			`INSERT INTO participant_links (participant_a, participant_b) VALUES (?, ?)`,
 			lo, hi); err != nil {
 			return fmt.Errorf("insert participant link: %w", err)
+		}
+		if personID != 0 {
+			changed, err := s.bindPersonParticipantsTx(
+				context.Background(), tx, personID, unionMembers)
+			if err != nil {
+				return err
+			}
+			if changed {
+				if err := s.bumpPersonRevisionsTx(
+					context.Background(), tx, personID); err != nil {
+					return err
+				}
+			}
 		}
 		revision, err = s.bumpIdentityRevision(tx)
 		return err

@@ -68,6 +68,8 @@ type LinkIdentityParticipantsBody = IdentityLinkRequest
 
 type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
+type ImportMeetingBody = MeetingImportRequest
+
 type CreateOrLinkMessageTaskBody = TaskLinkMutationRequest
 
 type SearchPeopleBody = IdentitySearchHTTPRequest
@@ -77,6 +79,10 @@ type SearchPersonFilesBody = FileSearchHTTPRequest
 type GetPersonContextSummaryBody = ExploreHTTPRequest
 
 type GetPersonTimelineBody = ExploreHTTPRequest
+
+type CreatePersonBody = CreatePersonRequest
+
+type PatchPersonBody = PatchPersonRequest
 
 type RunQueryBody = QueryRequest
 
