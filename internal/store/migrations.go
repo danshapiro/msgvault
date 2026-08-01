@@ -11,9 +11,10 @@ import (
 // last_modified backfill alone is a full messages-table scan — seconds of
 // startup on a large archive).
 const (
-	migrationAttachmentsContentHashUnique = "attachments_content_hash_unique_index"
-	migrationMessagesLastModifiedBackfill = "messages_last_modified_backfill"
-	migrationArchiveIdentity              = "archive_identity_v1"
+	migrationAttachmentsContentHashUnique     = "attachments_content_hash_unique_index"
+	migrationMessagesLastModifiedBackfill     = "messages_last_modified_backfill"
+	migrationArchiveIdentity                  = "archive_identity_v1"
+	migrationMessagesContentChangedAtBackfill = "messages_content_changed_at_backfill"
 )
 
 // IsMigrationApplied reports whether the named one-time data migration

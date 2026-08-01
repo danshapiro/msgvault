@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -327,10 +328,32 @@ func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
 		return nil, fmt.Errorf("copy conversation_participants: %w", err)
 	}
 
-	if _, err := tx.Exec(`
-		INSERT INTO messages SELECT * FROM src.messages
-		WHERE id IN (SELECT id FROM selected_messages)`); err != nil {
-		return nil, fmt.Errorf("copy messages: %w", err)
+	if err := copyMessages(tx); err != nil {
+		return nil, err
+	}
+
+	// The copy names content_changed_at whenever the source has it, which
+	// supplies the value explicitly and so bypasses the column's DEFAULT, and on
+	// a database created from schema.sql there is no AFTER INSERT trigger behind
+	// that default (the default is the whole INSERT-time writer there — see
+	// EnsureTriggers). So a NULL watermark in the source lands in the subset as
+	// a NULL watermark and nothing ever stamps it: the change feed's range
+	// predicate excludes NULL, and InitSchema's `WHERE content_changed_at IS
+	// NULL` backfill already ran on this database while it was empty and is
+	// recorded as applied, so it will not run again. The row would be invisible
+	// to the feed for the life of the archive.
+	//
+	// Normally this updates nothing — every write path stamps the column, and
+	// the source's own migration filled it. It is the copy that has to be
+	// closed, not the writers: this statement is the only thing standing
+	// between a single NULL anywhere upstream and a permanently unreportable
+	// message. It names only content_changed_at, so the content-change trigger
+	// (UPDATE OF the content columns) does not fire; the blanket last_modified
+	// trigger does, which is correct — the row did change.
+	if _, err := tx.Exec(fmt.Sprintf(
+		`UPDATE messages SET content_changed_at = %s WHERE content_changed_at IS NULL`,
+		(&SQLiteDialect{}).ContentChangedNow())); err != nil {
+		return nil, fmt.Errorf("stamp missing content_changed_at watermarks: %w", err)
 	}
 
 	// Null out reply_to_message_id when the parent message wasn't
@@ -403,6 +426,99 @@ func copyData(tx *sql.Tx, rowCount int) (*CopyResult, error) {
 	}
 
 	return result, nil
+}
+
+// copyMessages copies the selected messages, naming the columns the source and
+// destination have in common instead of relying on `SELECT *`.
+//
+// The destination is always built from the current schema, so a positional
+// copy requires the source to be at the current schema too: it supplies one
+// value per source column, and SQLite rejects the statement outright when the
+// counts differ ("table messages has N columns but M values were supplied").
+// Every archive written before content_changed_at existed is such a source, and
+// the whole copy fails on it — including the NULL restamp below, which never
+// gets to run because the INSERT fails first. Older source schemas are
+// supported elsewhere in this copy (see the oauth_app fallback for `sources`,
+// which names its columns and substitutes NULL for the one a legacy source
+// lacks); this is the same mechanism for a table whose column list is far too
+// long to retype, with the list read from the two schemas rather than pinned in
+// source that would rot on the next ALTER TABLE ADD COLUMN.
+//
+// A column the source lacks is simply left out of the INSERT, so the
+// destination's own DEFAULT supplies it — for content_changed_at that is the
+// stamp ContentChangedNow writes, in the one textual shape the feed's lexical
+// cursor can order. Columns the source has and the destination does not are
+// dropped, which is the only sane reading of "copy into the current schema".
+func copyMessages(tx *sql.Tx) error {
+	cols, err := commonColumns(tx, "messages")
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 {
+		return errors.New(
+			"copy messages: source and destination share no messages columns")
+	}
+	list := strings.Join(cols, ", ")
+	if _, err := tx.Exec(fmt.Sprintf(`
+		INSERT INTO messages (%s) SELECT %s FROM src.messages
+		WHERE id IN (SELECT id FROM selected_messages)`, list, list)); err != nil {
+		return fmt.Errorf("copy messages: %w", err)
+	}
+	return nil
+}
+
+// commonColumns returns the quoted names of the columns `table` has in both the
+// destination (main) and the attached source, in destination declaration order.
+func commonColumns(tx *sql.Tx, table string) ([]string, error) {
+	dst, err := schemaColumns(tx, "main", table)
+	if err != nil {
+		return nil, err
+	}
+	src, err := schemaColumns(tx, "src", table)
+	if err != nil {
+		return nil, err
+	}
+	inSrc := make(map[string]struct{}, len(src))
+	for _, name := range src {
+		inSrc[name] = struct{}{}
+	}
+	common := make([]string, 0, len(dst))
+	for _, name := range dst {
+		if _, ok := inSrc[name]; ok {
+			common = append(common, `"`+name+`"`)
+		}
+	}
+	return common, nil
+}
+
+// schemaColumns lists a table's column names in declaration order. Names
+// containing a double quote are rejected rather than quoted: nothing in this
+// schema has one, and an identifier that cannot be quoted safely must not be
+// interpolated into SQL.
+func schemaColumns(tx *sql.Tx, schema, table string) ([]string, error) {
+	rows, err := tx.Query(
+		`SELECT name FROM pragma_table_info(?, ?) ORDER BY cid`, table, schema)
+	if err != nil {
+		return nil, fmt.Errorf("list %s.%s columns: %w", schema, table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan %s.%s column: %w", schema, table, err)
+		}
+		if strings.Contains(name, `"`) {
+			return nil, fmt.Errorf(
+				"%s.%s column name contains a double quote: %q", schema, table, name)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s.%s columns: %w", schema, table, err)
+	}
+	return names, nil
 }
 
 // updateConversationCounts updates the denormalized counts on

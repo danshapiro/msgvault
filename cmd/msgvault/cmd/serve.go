@@ -798,6 +798,7 @@ var _ api.IdentityLinkStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityCacheRefresher = (*storeAPIAdapter)(nil)
 var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
+var _ api.ChangedMessageLister = (*storeAPIAdapter)(nil)
 
 func (a *storeAPIAdapter) ConversationExistsContext(ctx context.Context, conversationID int64) (bool, error) {
 	return a.store.ConversationExistsContext(ctx, conversationID)
@@ -810,6 +811,16 @@ func (a *storeAPIAdapter) GetConversationWindowContext(
 	start, end *time.Time,
 ) (*store.ConversationWindow, error) {
 	return a.store.GetConversationWindowContext(ctx, conversationID, anchorID, before, after, start, end)
+}
+
+// ListChangedMessages exposes the content-change feed to the API server. The
+// daemon passes this adapter -- not *store.Store -- as ServerOptions.Store, so
+// without this method the route's optional-interface check fails and the
+// endpoint reports itself unavailable on every production request.
+func (a *storeAPIAdapter) ListChangedMessages(
+	ctx context.Context, since time.Time, sinceID int64, limit int,
+) (store.ChangedMessagePage, error) {
+	return a.store.ListChangedMessages(ctx, since, sinceID, limit)
 }
 
 func (a *storeAPIAdapter) GetStats() (*api.StoreStats, error) {

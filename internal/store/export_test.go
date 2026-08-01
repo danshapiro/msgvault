@@ -19,3 +19,13 @@ func SetBackfillFTSBatchErrHookForTest(fn func(fromID, toID int64) error) func()
 	backfillFTSBatchErrHook = fn
 	return func() { backfillFTSBatchErrHook = nil }
 }
+
+// SetInitSchemaWindowHookForTest installs (or, with nil, clears) the test-only
+// hook that fires inside InitSchema after the content_changed_at backfill has
+// recorded itself and while the remaining index builds are still pending. Tests
+// use it to perform a real INSERT exactly where a concurrent writer used to lose
+// its watermark. Returns a restore func, so callers can defer it.
+func SetInitSchemaWindowHookForTest(fn func()) func() {
+	initSchemaWindowHook = fn
+	return func() { initSchemaWindowHook = nil }
+}

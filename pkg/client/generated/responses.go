@@ -857,6 +857,10 @@ type ListMessagesResponse = MessageListResponse
 
 type ListMessagesErrorResponse = ErrorResponse
 
+type ListChangedMessagesResponse = ChangesResponse
+
+type ListChangedMessagesErrorResponse = ErrorResponse
+
 type FilterMessagesResponse = FilteredMessagesResponse
 
 type FilterMessagesErrorResponse = ErrorResponse
@@ -1934,6 +1938,13 @@ type ListMessagesResp struct {
 	Body         []byte
 	StatusCode   int
 	JSON200      *ListMessagesResponse
+}
+
+type ListChangedMessagesResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListChangedMessagesResponse
 }
 
 type FilterMessagesResp struct {

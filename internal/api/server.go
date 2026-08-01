@@ -107,6 +107,23 @@ func (s *Server) getMessagesSummariesByIDs(ctx context.Context, ids []int64) ([]
 	return s.store.GetMessagesSummariesByIDs(ids)
 }
 
+// ChangedMessageLister is an optional extension of MessageStore for stores that
+// can serve the content-change feed. Optional because the feed reads a
+// trigger-maintained watermark that a cache-backed store cannot answer
+// correctly; such a store does not implement it and the route reports the
+// feature unavailable rather than returning wrong answers.
+type ChangedMessageLister interface {
+	ListChangedMessages(ctx context.Context, since time.Time, sinceID int64, limit int) (store.ChangedMessagePage, error)
+}
+
+// The store implementation must satisfy the optional interface. This guards the
+// store side of the contract only: the daemon passes cmd.storeAPIAdapter, not
+// *store.Store, so the assertion that actually protects the production route is
+// the one beside that adapter in cmd/msgvault/cmd/serve.go, which is a non-test
+// file and so fails the build rather than a test run. An end-to-end test drives
+// the route through the adapter in cmd/msgvault/cmd/changes_api_e2e_test.go.
+var _ ChangedMessageLister = (*store.Store)(nil)
+
 // SourceStatusStore defines the source/sync read operations used by the
 // source status endpoint.
 type SourceStatusStore interface {
@@ -207,6 +224,11 @@ type Server struct {
 	// can report it. See ensureCLISearchIndexAsync.
 	ftsEnsureRunning atomic.Bool
 	ftsIndexState    atomic.Value
+	// changesStallLoggedAt throttles the WARN handleMessageChanges emits when
+	// the content-change feed is held back by a long-lived write transaction.
+	// Unix nanoseconds of the last such line, so a consumer polling once a
+	// second cannot turn one stuck connection into a log flood.
+	changesStallLoggedAt atomic.Int64
 	// ftsRebuildGen is a seqlock-style generation for index rebuilds:
 	// handleCLIRebuildFTS bumps it to odd on entry and back to even on
 	// return. The ensure worker's completeness probe runs outside the
