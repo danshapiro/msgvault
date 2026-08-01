@@ -391,8 +391,11 @@ func TestContentChangedAt_LastModifiedUnaffected(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	id := seedMessage(t, st, 1)
 
-	// Order matters: stamping content_changed_at is itself an UPDATE, so it
-	// bumps last_modified. Baseline last_modified after it, not before.
+	// Baseline last_modified after the stamp, not before. On PostgreSQL the
+	// stamp is a plain UPDATE and bumps last_modified; on SQLite the trigger's
+	// UPDATE OF scope excludes content_changed_at, so a statement naming only
+	// that column does not. Ordering this way makes the assertion below hold on
+	// either backend without asserting which one applies.
 	ccBase := stampContentChangedAt(t, st, id)
 	lmBase := baselineLM(t, st, id)
 
@@ -406,9 +409,10 @@ func TestContentChangedAt_LastModifiedUnaffected(t *testing.T) {
 		"the same bookkeeping-only update must leave content_changed_at alone")
 }
 
-// stampLastModified writes an explicit last_modified value directly. It names
-// only last_modified, so no UPDATE OF list matches and the write is not
-// re-bumped by a trigger. The upgrade test needs a distinguishable, known-past
+// stampLastModified writes an explicit last_modified value directly. The write
+// is not re-bumped by a trigger: the value differs from the stored one, so the
+// last_modified trigger's WHEN guard (OLD.last_modified = NEW.last_modified)
+// yields to it. The upgrade test needs a distinguishable, known-past
 // value to prove the content_changed_at backfill seeds from last_modified
 // rather than from "now"; unlike stampContentChangedAt (which stamps
 // content_changed_at to a fixed constant), the value here must vary and must

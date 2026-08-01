@@ -334,18 +334,24 @@ CREATE TABLE IF NOT EXISTS message_bodies (
 -- owns it via these triggers. InitSchema re-execs schema.sql idempotently, so
 -- `IF NOT EXISTS` makes these safe on both fresh and existing databases.
 
--- On messages: re-stamp last_modified after any UPDATE. The WHEN guard
+-- On messages: re-stamp last_modified after an UPDATE. The WHEN guard
 -- (OLD.last_modified = NEW.last_modified) prevents infinite recursion: the
 -- trigger's own UPDATE changes last_modified, so on the re-fire
 -- OLD.last_modified <> NEW.last_modified and WHEN evaluates false, regardless
 -- of the recursive_triggers pragma. It also yields to an explicit
 -- last_modified write in the original UPDATE rather than clobbering it.
-CREATE TRIGGER IF NOT EXISTS trg_messages_last_modified
-AFTER UPDATE ON messages FOR EACH ROW
-WHEN OLD.last_modified = NEW.last_modified
-BEGIN
-    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
+--
+-- This trigger is NOT created here. It needs an `UPDATE OF <every column except
+-- content_changed_at>` scope -- without it, the content_changed_at stamp (a
+-- second UPDATE on SQLite) re-enters this trigger and destroys the explicit
+-- write the guard above promises to yield to. That column list has to be read
+-- from the live table, which SQL alone cannot do, so SQLiteDialect.EnsureTriggers
+-- builds it -- see lastModifiedUpdateOfColumns. InitSchema always runs
+-- EnsureTriggers, and it DROPs before CREATEing, so an archive still carrying an
+-- older blanket definition is corrected on open.
+--
+-- The message_bodies triggers below stay here: they write messages.last_modified
+-- directly instead of reacting to a messages UPDATE, so nothing can re-enter them.
 
 -- On message_bodies: a body change must bump the parent message's
 -- last_modified so the worker's CAS token covers body edits too.

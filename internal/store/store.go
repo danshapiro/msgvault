@@ -854,15 +854,18 @@ func (s *Store) InitSchema() error {
 	// `UPDATE OF <content columns>`, and content_changed_at is not one of those
 	// columns, so a statement naming only the watermark never matches. The
 	// last_modified backfill writes a value that differs from the old NULL,
-	// which is what both dialects' last_modified triggers yield to. The one
-	// interaction that does exist is the reverse — the content_changed_at
-	// backfill trips the blanket last_modified trigger — and it is documented
-	// at that backfill. Creating the triggers here rather than at the end makes
-	// PostgreSQL match SQLite on that point, where the trigger has always come
-	// from schema.sql and has always fired.
+	// which is what both dialects' last_modified triggers yield to. The reverse
+	// interaction — the content_changed_at backfill tripping the last_modified
+	// trigger — is now backend-specific and documented at that backfill: on
+	// PostgreSQL the trigger is blanket and still fires; on SQLite its UPDATE OF
+	// scope excludes content_changed_at, so a statement naming only the
+	// watermark no longer bumps last_modified.
 	//
-	// On SQLite this covers the content_changed_at triggers only (the
-	// last_modified ones ride schema.sql); on PostgreSQL it covers both sets.
+	// On SQLite this covers the content_changed_at triggers plus the messages
+	// last_modified trigger, which needs an UPDATE OF scope built from the live
+	// column list (see lastModifiedUpdateOfColumns) and so cannot be static SQL;
+	// only the message_bodies last_modified pair still rides schema.sql. On
+	// PostgreSQL it covers both sets.
 	// Both dialects drop and recreate, so a later change to the content-column
 	// list reaches an existing archive. Run under runMaintenance for consistency
 	// with EnsureFTSIndex (no statement_timeout cap on the DDL).
@@ -1035,16 +1038,22 @@ func (s *Store) InitSchema() error {
 	// and its sentinel ship in the same release. Under runMaintenance so a
 	// full-table UPDATE is not cut off by the pool-wide statement_timeout.
 	//
-	// This UPDATE bumps last_modified on every row it touches, once, at upgrade,
-	// on both backends. The pre-existing blanket last_modified trigger fires on
-	// any UPDATE that leaves last_modified alone, and this statement names only
-	// content_changed_at. It cannot be suppressed from here: the trigger yields
-	// only to a statement that writes a DIFFERENT last_modified, so preserving
-	// the old value is not expressible, and dropping the trigger around the
-	// backfill would leave the embed worker's CAS token unmaintained if the
-	// upgrade were interrupted. The consequence is bounded — embedding candidate
-	// selection keys off embed_gen, not last_modified, and the bump happens once
-	// per archive — so it is documented rather than worked around.
+	// On PostgreSQL this UPDATE bumps last_modified on every row it touches,
+	// once, at upgrade: that trigger fires on any UPDATE leaving last_modified
+	// alone, and this statement names only content_changed_at. It cannot be
+	// suppressed from here — the trigger yields only to a statement writing a
+	// DIFFERENT last_modified, so preserving the old value is not expressible,
+	// and dropping the trigger around the backfill would leave the embed
+	// worker's CAS token unmaintained if the upgrade were interrupted. The
+	// consequence is bounded — embedding candidate selection keys off embed_gen,
+	// not last_modified, and the bump happens once per archive — so it is
+	// documented rather than worked around.
+	//
+	// SQLite does not bump: its last_modified trigger is scoped
+	// `UPDATE OF <every column except content_changed_at>`, which it must be so
+	// the content_changed_at stamp cannot clobber an explicit last_modified
+	// write (see lastModifiedUpdateOfColumns). This statement names only the
+	// watermark, so it no longer matches.
 	contentChangedMigrated, err := s.IsMigrationApplied(migrationMessagesContentChangedAtBackfill)
 	if err != nil {
 		return err

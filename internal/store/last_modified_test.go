@@ -79,6 +79,43 @@ func TestLastModified_MessageUpdateBumps(t *testing.T) {
 	assert.NotEqual(t, base, got, "message UPDATE must bump last_modified")
 }
 
+// TestLastModified_ExplicitWriteSurvivesContentUpdate pins the yield documented
+// on baselineLM: a statement that sets last_modified by hand keeps that value
+// rather than having it re-stamped.
+//
+// The risk is backend-specific and only appears once content_changed_at exists.
+// PostgreSQL stamps that watermark in a BEFORE trigger, assigning NEW in place,
+// so the caller's statement stays a single UPDATE. SQLite cannot assign to NEW,
+// so its content_changed_at trigger issues a SECOND UPDATE of the same row —
+// and a last_modified trigger that fires on every UPDATE re-fires on that one,
+// overwriting the value the caller just wrote. ApplyMessageDateRepairs' CAS
+// compares against exactly this token, so losing the write disarms it silently.
+func TestLastModified_ExplicitWriteSurvivesContentUpdate(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	control := seedMessage(t, st, 91)
+	withContent := seedMessage(t, st, 92)
+
+	const explicit = "2000-06-15 12:30:45+00"
+
+	// Control: an explicit write naming no content column. Both backends
+	// already yield to this, so its stored form is the canonical rendering of
+	// the literal on this backend — which is what the real case must match.
+	_, err := st.DB().Exec(
+		st.Rebind(`UPDATE messages SET last_modified = ? WHERE id = ?`), explicit, control)
+	require.NoError(t, err, "explicit last_modified write alone")
+
+	// The real case: the same explicit write, in a statement that also changes
+	// a content column and so trips the content_changed_at trigger.
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages SET subject = ?, last_modified = ? WHERE id = ?`),
+		"changed subject", explicit, withContent)
+	require.NoError(t, err, "explicit last_modified write beside a content column")
+
+	assert.Equal(t, readLM(t, st, control), readLM(t, st, withContent),
+		"an explicit last_modified write must survive a content-column update: "+
+			"ApplyMessageDateRepairs' CAS compares against exactly this token")
+}
+
 // TestLastModified_EmbedGenUpdateBumps verifies even an embed_gen-only UPDATE
 // bumps last_modified — expected/harmless (the worker's CAS WHERE matches the
 // PRE-trigger value, so its own stamp still succeeds; see
@@ -142,15 +179,20 @@ func TestLastModified_BodyInsertBumpsParent(t *testing.T) {
 // TestLastModified_UpgradePathMissingColumn covers the universal SQLite
 // upgrade path for the last_modified watermark: a pre-existing archive whose
 // messages table predates the column. On such a DB, InitSchema runs schema.sql
-// FIRST — which executes `CREATE TRIGGER IF NOT EXISTS trg_messages_last_modified`,
-// a trigger that REFERENCES last_modified — BEFORE LegacyColumnMigrations adds
+// FIRST — which executes the two message_bodies last_modified triggers, whose
+// bodies REFERENCE messages.last_modified — BEFORE LegacyColumnMigrations adds
 // the column. This only works because SQLite resolves a trigger body's column
 // references lazily (at fire time, not create time). After the column is added,
 // InitSchema's one-shot backfill stamps the pre-existing NULL rows.
 //
+// trg_messages_last_modified is not part of that ordering risk: EnsureTriggers
+// creates it after the migrations (see lastModifiedUpdateOfColumns, which has
+// to read the live column list). The message_bodies pair still rides schema.sql
+// and so still lands before the column.
+//
 // Every existing SQLite user hits this exact path on upgrade, yet the other
 // last_modified trigger tests all use a fresh DB where the column already
-// exists when the trigger is created — so none of them exercise the
+// exists when the triggers are created — so none of them exercise the
 // trigger-before-column ordering. This test reconstructs the precondition by
 // dropping the column (and the triggers that reference it, which SQLite would
 // otherwise refuse to leave dangling) from a real schema, then re-runs the

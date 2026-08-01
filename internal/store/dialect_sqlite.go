@@ -480,21 +480,29 @@ func (d *SQLiteDialect) FTSRebuildSchema(ctx context.Context, q contextQuerier) 
 // not a post-migration step (cr2-10).
 func (d *SQLiteDialect) EnsureFTSIndex(querier) error { return nil }
 
-// EnsureTriggers creates the content_changed_at maintenance triggers.
+// EnsureTriggers creates the content_changed_at maintenance triggers and
+// re-scopes the messages last_modified trigger (see lastModifiedUpdateOfColumns
+// for why the latter cannot stay a blanket AFTER UPDATE in schema.sql).
 //
-// The last_modified triggers are NOT here: they are CREATE TRIGGER IF NOT
-// EXISTS in schema.sql, which InitSchema re-execs on every open, and their
-// definition is unchanged by this feature.
+// The message_bodies last_modified triggers ARE still schema.sql's: they write
+// messages.last_modified directly rather than reacting to a messages UPDATE, so
+// no trigger of ours can re-enter them.
 //
 // content_changed_at's triggers are built here because their column list comes
 // from MessagesContentColumns, shared with the PostgreSQL dialect so the two
 // backends cannot drift, and because DROP + CREATE can replace a definition on
 // an existing archive where CREATE TRIGGER IF NOT EXISTS silently would not.
+// The same DROP + CREATE is what lets the re-scoped last_modified trigger reach
+// an archive that already carries schema.sql's older, blanket definition.
 func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 	cols := ContentChangedTriggerColumnList()
 	guard := ContentChangedValueGuard("IS NOT")
 	now := d.ContentChangedNow()
 	insertStampedByDefault, err := d.contentChangedAtDefaultStamps(q)
+	if err != nil {
+		return err
+	}
+	lastModifiedCols, err := d.lastModifiedUpdateOfColumns(q)
 	if err != nil {
 		return err
 	}
@@ -549,6 +557,15 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		    BEGIN
 		        UPDATE messages SET content_changed_at = %s WHERE id = NEW.message_id;
 		    END`, now),
+		`DROP TRIGGER IF EXISTS trg_messages_last_modified`,
+		// Identical to schema.sql's definition except for the UPDATE OF scope,
+		// which is what keeps the stamp above from re-entering it.
+		fmt.Sprintf(`CREATE TRIGGER trg_messages_last_modified
+		    AFTER UPDATE OF %s ON messages FOR EACH ROW
+		    WHEN OLD.last_modified = NEW.last_modified
+		    BEGIN
+		        UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.id;
+		    END`, lastModifiedCols),
 	)
 	for _, stmt := range stmts {
 		if _, err := q.Exec(stmt); err != nil {
@@ -568,6 +585,42 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 // format, since the change feed's cursor comparison is lexical. A default that
 // has drifted from ContentChangedNow leaves the trigger in place, trading speed
 // for a watermark the feed can still sort.
+// lastModifiedUpdateOfColumns renders every live column of `messages` EXCEPT
+// content_changed_at, for the last_modified trigger's `UPDATE OF` clause.
+//
+// last_modified is a blanket row-level watermark: it must move whenever any
+// real column changes, so the list is "everything except", not a curated set.
+// The one exclusion exists because SQLite triggers cannot assign to NEW, so
+// trg_messages_content_changed_at stamps the watermark with a SECOND UPDATE of
+// the row. A blanket AFTER UPDATE last_modified trigger fires on that stamp
+// too, and because the stamp does not name last_modified its WHEN guard
+// (OLD.last_modified = NEW.last_modified) holds — so it overwrites whatever
+// last_modified the caller's original statement had just set by hand. That
+// silently disarms ApplyMessageDateRepairs, whose CAS compares against exactly
+// that written token. `UPDATE OF` matches on the columns a statement NAMES, so
+// excluding content_changed_at excludes the stamp and nothing else.
+// PostgreSQL needs none of this: it stamps in a BEFORE trigger, in place.
+//
+// Read from the live table rather than MessagesContentColumns +
+// MessagesNonContentColumns so it cannot drift from the real schema and so
+// PostgreSQL-only columns (search_fts) are naturally absent. EnsureTriggers
+// runs after LegacyColumnMigrations, so every column already exists.
+func (d *SQLiteDialect) lastModifiedUpdateOfColumns(q querier) (string, error) {
+	var cols sql.NullString
+	err := q.QueryRow(
+		`SELECT group_concat(name, ', ') FROM pragma_table_info('messages')
+		 WHERE name <> 'content_changed_at'`,
+	).Scan(&cols)
+	if err != nil {
+		return "", fmt.Errorf("read messages columns for last_modified trigger: %w", err)
+	}
+	if !cols.Valid || cols.String == "" {
+		return "", errors.New(
+			"cannot scope the last_modified trigger: messages has no columns")
+	}
+	return cols.String, nil
+}
+
 func (d *SQLiteDialect) contentChangedAtDefaultStamps(q querier) (bool, error) {
 	var dflt sql.NullString
 	err := q.QueryRow(
