@@ -107,6 +107,8 @@ func reapedPID(t *testing.T) int {
 // warm pool must not weaken: two fixtures in one binary get different schemas,
 // each starts empty, and writes through one are invisible to the other.
 func TestPostgresFixturesGetPrivateEmptySchemas(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	requirePostgresTestURL(t)
 
 	first := NewTestStore(t)
@@ -114,46 +116,50 @@ func TestPostgresFixturesGetPrivateEmptySchemas(t *testing.T) {
 
 	firstSchema := currentSchemaOf(t, first)
 	secondSchema := currentSchemaOf(t, second)
-	assert.NotEqual(t, firstSchema, secondSchema, "fixtures must not share a schema")
+	assert.NotEqual(firstSchema, secondSchema, "fixtures must not share a schema")
 
-	assert.Equal(t, 0, countSources(t, first), "first fixture starts empty")
-	assert.Equal(t, 0, countSources(t, second), "second fixture starts empty")
+	assert.Equal(0, countSources(t, first), "first fixture starts empty")
+	assert.Equal(0, countSources(t, second), "second fixture starts empty")
 
 	_, err := first.GetOrCreateSource("gmail", "isolation@example.com")
-	require.NoError(t, err, "write through the first fixture")
+	require.NoError(err, "write through the first fixture")
 
-	assert.Equal(t, 1, countSources(t, first), "write lands in the first fixture")
-	assert.Equal(t, 0, countSources(t, second), "write must not leak into the second fixture")
+	assert.Equal(1, countSources(t, first), "write lands in the first fixture")
+	assert.Equal(0, countSources(t, second), "write must not leak into the second fixture")
 }
 
 // TestPostgresFixtureSchemaDroppedAfterCleanup proves the claiming test still
 // owns removal of whatever schema it was handed.
 func TestPostgresFixtureSchemaDroppedAfterCleanup(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	dbURL := requirePostgresTestURL(t)
 
 	adminDB, err := pgAdminDB(dbURL)
-	require.NoError(t, err, "open admin connection")
+	require.NoError(err, "open admin connection")
 
 	var schema string
 	t.Run("owner", func(t *testing.T) {
 		schema = currentSchemaOf(t, NewTestStore(t))
 	})
 
-	require.NotEmpty(t, schema, "subtest recorded its schema")
-	assert.False(t, schemaExists(t, adminDB, schema), "claimed schema is gone after the owning test's cleanup")
+	require.NotEmpty(schema, "subtest recorded its schema")
+	assert.False(schemaExists(t, adminDB, schema), "claimed schema is gone after the owning test's cleanup")
 }
 
 // TestSweepWarmSchemasDropsOnlyDeadOwners covers the sweeper's liveness rule:
 // a warm schema whose creating process is gone is reclaimed, one whose owner is
 // still running is left alone.
 func TestSweepWarmSchemasDropsOnlyDeadOwners(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	dbURL := requirePostgresTestURL(t)
 	if runtime.GOOS != "linux" {
 		t.Skip("process liveness is only decidable via /proc on Linux")
 	}
 
 	adminDB, err := pgAdminDB(dbURL)
-	require.NoError(t, err, "open admin connection")
+	require.NoError(err, "open admin connection")
 
 	dead := fmt.Sprintf("%s%d_%s", warmSchemaPrefix, reapedPID(t), randomSchemaSuffix(t))
 	self := fmt.Sprintf("%s%d_%s", warmSchemaPrefix, os.Getpid(), randomSchemaSuffix(t))
@@ -163,22 +169,24 @@ func TestSweepWarmSchemasDropsOnlyDeadOwners(t *testing.T) {
 	createSchemaForTest(t, adminDB, otherLive)
 
 	dropped, err := sweepWarmSchemas(adminDB, processAlive)
-	require.NoError(t, err, "sweep warm schemas")
+	require.NoError(err, "sweep warm schemas")
 
-	assert.Contains(t, dropped, dead, "sweep reports the reclaimed schema")
-	assert.False(t, schemaExists(t, adminDB, dead), "dead owner's warm schema is reclaimed")
-	assert.True(t, schemaExists(t, adminDB, self), "this process's own warm schema survives")
-	assert.True(t, schemaExists(t, adminDB, otherLive), "a live owner's warm schema survives")
+	assert.Contains(dropped, dead, "sweep reports the reclaimed schema")
+	assert.False(schemaExists(t, adminDB, dead), "dead owner's warm schema is reclaimed")
+	assert.True(schemaExists(t, adminDB, self), "this process's own warm schema survives")
+	assert.True(schemaExists(t, adminDB, otherLive), "a live owner's warm schema survives")
 }
 
 // TestSweepWarmSchemasNeverDropsTestSchemas is the safety test: other agents'
 // in-flight fixtures use the msgvault_test_ prefix on this shared server, and no
 // liveness verdict may ever put one of those in the sweeper's sights.
 func TestSweepWarmSchemasNeverDropsTestSchemas(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	dbURL := requirePostgresTestURL(t)
 
 	adminDB, err := pgAdminDB(dbURL)
-	require.NoError(t, err, "open admin connection")
+	require.NoError(err, "open admin connection")
 
 	// A fixture-shaped schema, plus one that mimics the warm naming inside the
 	// test prefix — neither may be touched.
@@ -196,15 +204,15 @@ func TestSweepWarmSchemasNeverDropsTestSchemas(t *testing.T) {
 	// Declare only the bait's owner dead: sibling test binaries sharing this
 	// server keep their warm schemas.
 	dropped, err := sweepWarmSchemas(adminDB, func(pid int) bool { return pid != strangerPID })
-	require.NoError(t, err, "sweep warm schemas")
+	require.NoError(err, "sweep warm schemas")
 
-	assert.Contains(t, dropped, bait, "sweep did drop something in this run")
+	assert.Contains(dropped, bait, "sweep did drop something in this run")
 	for _, name := range dropped {
-		assert.True(t, strings.HasPrefix(name, warmSchemaPrefix),
+		assert.Truef(strings.HasPrefix(name, warmSchemaPrefix),
 			"sweep may only ever drop names carrying the warm prefix, got %q", name)
 	}
-	assert.True(t, schemaExists(t, adminDB, testSchema), "a msgvault_test_ schema must survive the sweep")
-	assert.True(t, schemaExists(t, adminDB, lookalike), "a warm-looking msgvault_test_ schema must survive the sweep")
+	assert.True(schemaExists(t, adminDB, testSchema), "a msgvault_test_ schema must survive the sweep")
+	assert.True(schemaExists(t, adminDB, lookalike), "a warm-looking msgvault_test_ schema must survive the sweep")
 }
 
 // TestParseWarmSchemaName pins which names the sweeper is even able to consider.
@@ -212,13 +220,16 @@ func TestParseWarmSchemaName(t *testing.T) {
 	suffix := "0123456789abcdef"
 
 	t.Run("accepts a name this package generated", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+
 		name, err := newWarmSchemaName()
-		require.NoError(t, err, "generate warm schema name")
+		require.NoError(err, "generate warm schema name")
 
 		pid, parsedSuffix, ok := parseWarmSchemaName(name)
-		require.True(t, ok, "generated names must round-trip")
-		assert.Equal(t, os.Getpid(), pid, "name carries the creating pid")
-		assert.Equal(t, name, fmt.Sprintf("%s%d_%s", warmSchemaPrefix, pid, parsedSuffix), "parts rebuild the name")
+		require.True(ok, "generated names must round-trip")
+		assert.Equal(os.Getpid(), pid, "name carries the creating pid")
+		assert.Equal(name, fmt.Sprintf("%s%d_%s", warmSchemaPrefix, pid, parsedSuffix), "parts rebuild the name")
 	})
 
 	rejected := []string{
@@ -245,15 +256,17 @@ func TestParseWarmSchemaName(t *testing.T) {
 // TestWarmPoolServesInitializedSchemas proves the pool's product is a real,
 // already-migrated schema, not just a name.
 func TestWarmPoolServesInitializedSchemas(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	dbURL := requirePostgresTestURL(t)
 
 	adminDB, err := pgAdminDB(dbURL)
-	require.NoError(t, err, "open admin connection")
+	require.NoError(err, "open admin connection")
 
 	pool := warmPoolFor(dbURL)
 
 	var name string
-	require.Eventually(t, func() bool {
+	require.Eventually(func() bool {
 		select {
 		case claimed, ok := <-pool.names:
 			name = claimed
@@ -266,28 +279,30 @@ func TestWarmPoolServesInitializedSchemas(t *testing.T) {
 		_, _ = adminDB.Exec("DROP SCHEMA IF EXISTS " + name + " CASCADE")
 	})
 
-	assert.True(t, strings.HasPrefix(name, warmSchemaPrefix), "warm schemas are self-owned, got %q", name)
+	assert.Truef(strings.HasPrefix(name, warmSchemaPrefix), "warm schemas are self-owned, got %q", name)
 
 	var messagesTable sql.NullString
-	require.NoError(t, adminDB.QueryRow("SELECT to_regclass($1)", name+".messages").Scan(&messagesTable),
+	require.NoError(adminDB.QueryRow("SELECT to_regclass($1)", name+".messages").Scan(&messagesTable),
 		"look up the messages table in the warm schema")
-	assert.True(t, messagesTable.Valid, "warm schema already carries the initialized DDL")
+	assert.True(messagesTable.Valid, "warm schema already carries the initialized DDL")
 }
 
 // TestNewTestStoreFallsBackWhenWarmPoolDisabled covers the path a pool outage
 // takes: the fixture creates its own schema and behaves exactly as before.
 func TestNewTestStoreFallsBackWhenWarmPoolDisabled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	requirePostgresTestURL(t)
 	t.Setenv(warmPoolDisableEnv, "0")
 
 	st := NewTestStore(t)
 
 	schema := currentSchemaOf(t, st)
-	assert.True(t, strings.HasPrefix(schema, "msgvault_test_"),
+	assert.Truef(strings.HasPrefix(schema, "msgvault_test_"),
 		"the fallback path creates its own schema, got %q", schema)
-	assert.Equal(t, 0, countSources(t, st), "fallback fixture starts empty")
+	assert.Equal(0, countSources(t, st), "fallback fixture starts empty")
 
 	_, err := st.GetOrCreateSource("gmail", "fallback@example.com")
-	require.NoError(t, err, "write through the fallback fixture")
-	assert.Equal(t, 1, countSources(t, st), "fallback fixture is writable")
+	require.NoError(err, "write through the fallback fixture")
+	assert.Equal(1, countSources(t, st), "fallback fixture is writable")
 }
