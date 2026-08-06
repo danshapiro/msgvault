@@ -132,11 +132,7 @@ func (p *warmSchemaPool) start() {
 
 	var running sync.WaitGroup
 	for range warmPoolWorkers {
-		running.Add(1)
-		go func() {
-			defer running.Done()
-			p.work()
-		}()
+		running.Go(p.work)
 	}
 
 	go func() {
@@ -260,28 +256,8 @@ func parseWarmSchemaName(name string) (pid int, suffix string, ok bool) {
 // cannot parse leaves the schema alone. A missed orphan costs a schema until
 // the next run sweeps it; a wrong verdict would delete a running test's data.
 func sweepWarmSchemas(db *sql.DB, alive func(pid int) bool) ([]string, error) {
-	pattern := strings.ReplaceAll(warmSchemaPrefix, "_", `\_`) + "%"
-	rows, err := db.Query("SELECT nspname FROM pg_namespace WHERE nspname LIKE $1", pattern)
+	candidates, err := listWarmSchemas(db)
 	if err != nil {
-		return nil, err
-	}
-
-	var candidates []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			_ = rows.Close()
-
-			return nil, err
-		}
-		candidates = append(candidates, name)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 
@@ -306,6 +282,32 @@ func sweepWarmSchemas(db *sql.DB, alive func(pid int) bool) ([]string, error) {
 	}
 
 	return dropped, nil
+}
+
+// listWarmSchemas returns the schema names carrying the warm prefix. The LIKE
+// pattern is derived from the prefix constant with its underscores escaped, so
+// the server is never asked about any other family of schema.
+func listWarmSchemas(db *sql.DB) ([]string, error) {
+	pattern := strings.ReplaceAll(warmSchemaPrefix, "_", `\_`) + "%"
+	rows, err := db.Query("SELECT nspname FROM pg_namespace WHERE nspname LIKE $1", pattern)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return names, nil
 }
 
 // processAlive reports whether a pid is still running, answering "yes" whenever
