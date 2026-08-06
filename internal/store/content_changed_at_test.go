@@ -3,7 +3,10 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"testing"
@@ -471,15 +474,21 @@ func dropContentChangedAtColumn(t *testing.T, st *store.Store) {
 // contentChangedBackfillMigration is the ledger name InitSchema records once the
 // content_changed_at backfill has run.
 const contentChangedBackfillMigration = "messages_content_changed_at_backfill"
+const messageWatermarkTriggersMigration = "message_watermark_triggers_v1"
 
 // clearContentChangedBackfillLedger deletes that row from applied_migrations so
 // InitSchema treats the migration as never having run -- the ledger state of
 // an archive from before the migration shipped.
 func clearContentChangedBackfillLedger(t *testing.T, st *store.Store) {
 	t.Helper()
-	_, err := st.DB().Exec(
-		st.Rebind(`DELETE FROM applied_migrations WHERE name = ?`), contentChangedBackfillMigration)
-	require.NoErrorf(t, err, "clear migration ledger entry %s", contentChangedBackfillMigration)
+	for _, name := range []string{
+		contentChangedBackfillMigration,
+		messageWatermarkTriggersMigration,
+	} {
+		_, err := st.DB().Exec(
+			st.Rebind(`DELETE FROM applied_migrations WHERE name = ?`), name)
+		require.NoErrorf(t, err, "clear migration ledger entry %s", name)
+	}
 }
 
 // TestContentChangedAt_UpgradeFromDatabaseWithoutColumn proves the migration an
@@ -529,6 +538,347 @@ func TestContentChangedAt_UpgradeFromDatabaseWithoutColumn(t *testing.T) {
 	applied, err := st.IsMigrationApplied(contentChangedBackfillMigration)
 	require.NoError(err)
 	assert.True(applied)
+}
+
+// TestContentChangedAt_InterruptedBackfillResumesWhereItStopped is the whole
+// reason the backfill walks the table in committed id batches instead of
+// issuing one whole-table UPDATE.
+//
+// The backfill runs at daemon startup, and on a large archive it is minutes to
+// hours of work. As a single transaction, an interruption anywhere in it — an
+// operator's Ctrl-C, an OOM kill, a laptop lid — rolls back every row, so the
+// next start begins again from nothing and the archive can never finish
+// upgrading if the window between restarts is shorter than the backfill. On
+// PostgreSQL each abandoned attempt also leaves a whole table's worth of dead
+// tuples behind.
+//
+// Batched, an interruption costs only the batch in flight. This test proves
+// both halves: rows stamped before the interruption are still stamped after it,
+// and the next run does the remainder without revisiting them. The "without
+// revisiting" half is made observable by moving last_modified — the value the
+// backfill seeds from — on the already-stamped rows: a run that re-stamped them
+// would drag their watermarks to the new value.
+func TestContentChangedAt_InterruptedBackfillResumesWhereItStopped(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	const rows = 6
+	ids := make([]int64, 0, rows)
+	for n := 1; n <= rows; n++ {
+		id := seedMessage(t, st, n)
+		stampLastModified(t, st, id, fmt.Sprintf("2020-01-%02d 03:04:05", n))
+		ids = append(ids, id)
+	}
+
+	// Reconstruct an archive that predates the column so InitSchema really runs
+	// the backfill, and shrink the batch so six rows span several batches.
+	dropContentChangedAtColumn(t, st)
+	clearContentChangedBackfillLedger(t, st)
+	defer store.SetContentChangedBackfillBatchSizeForTest(2)()
+
+	// Interrupt at the second batch boundary: the first batch has committed and
+	// nothing else has run.
+	batches := 0
+	restoreHook := store.SetContentChangedBackfillBatchHookForTest(func(fromID, toID int64) error {
+		batches++
+		if batches == 2 {
+			return errors.New("simulated interruption mid-upgrade")
+		}
+		return nil
+	})
+	require.Error(st.InitSchema(), "the interrupted upgrade must report failure")
+	restoreHook()
+	require.Equal(2, batches, "the interruption must land at a batch boundary, not before the first batch")
+
+	applied, err := st.IsMigrationApplied(contentChangedBackfillMigration)
+	require.NoError(err)
+	require.False(applied,
+		"an interrupted backfill must not record itself as applied: the ledger gate would "+
+			"stop the remaining rows from ever being stamped")
+
+	stampedBeforeResume := map[int64]string{}
+	for _, id := range ids {
+		if got := readRawContentChangedAt(t, st, id); got.Valid {
+			stampedBeforeResume[id] = got.String
+		}
+	}
+	require.NotEmpty(stampedBeforeResume,
+		"the batch that committed before the interruption must survive it; one whole-table "+
+			"UPDATE would have rolled every stamped row back and the next run would start over")
+	require.Less(len(stampedBeforeResume), len(ids),
+		"the interruption must leave real work behind, or the resume half proves nothing")
+
+	// Move the seed value on the rows that are already done. The resumed run
+	// must not look at them, so their watermarks must not follow.
+	for id := range stampedBeforeResume {
+		stampLastModified(t, st, id, "2031-06-07 08:09:10")
+	}
+
+	require.NoError(st.InitSchema(), "the next open must finish the backfill")
+
+	for i, id := range ids {
+		got := readRawContentChangedAt(t, st, id)
+		require.Truef(got.Valid,
+			"message %d has a NULL watermark after the resumed backfill: the resumed run has to "+
+				"cover every row the interrupted one did not reach", id)
+		if before, ok := stampedBeforeResume[id]; ok {
+			assert.Equalf(before, got.String,
+				"message %d was stamped before the interruption and must not be re-stamped: "+
+					"the resumed run does the remainder, it does not redo committed work", id)
+			continue
+		}
+		assert.Containsf(got.String, fmt.Sprintf("2020-01-%02d", i+1),
+			"message %d was stamped by the resumed run and must still be seeded from its own "+
+				"last_modified", id)
+	}
+
+	applied, err = st.IsMigrationApplied(contentChangedBackfillMigration)
+	require.NoError(err)
+	assert.True(applied, "the completed backfill must record itself so later opens do not rescan")
+}
+
+// TestContentChangedAt_BackfillStopsWhenTheContextIsCancelled is the operator's
+// exit from an upgrade that is going to take hours.
+//
+// The backfill walks every message in an existing archive and runs at daemon
+// startup, before the port is bound. Run with a background context it cannot be
+// interrupted at all: SIGINT and SIGTERM reach the process, the signal-cancelled
+// root context is cancelled, and the backfill and its open transaction carry on
+// regardless. The operator's only remaining move is SIGKILL, on a process in the
+// middle of writing.
+//
+// This is NOT the resumability test above. That one injects an error to prove
+// the committed batches survive; this one proves an operator can cause the stop
+// in the first place. The two halves it adds are that cancellation is honoured
+// promptly, and that a cancelled upgrade does not record itself as applied —
+// which would strand every unstamped row outside the feed forever.
+func TestContentChangedAt_BackfillStopsWhenTheContextIsCancelled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	const rows = 8
+	ids := make([]int64, 0, rows)
+	for n := 1; n <= rows; n++ {
+		id := seedMessage(t, st, n)
+		stampLastModified(t, st, id, fmt.Sprintf("2020-01-%02d 03:04:05", n))
+		ids = append(ids, id)
+	}
+
+	dropContentChangedAtColumn(t, st)
+	clearContentChangedBackfillLedger(t, st)
+	defer store.SetContentChangedBackfillBatchSizeForTest(2)()
+
+	// Cancel at the second batch boundary: one batch has committed and the rest
+	// of the table is still ahead, which is where an operator's Ctrl-C lands.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batches := 0
+	restoreHook := store.SetContentChangedBackfillBatchHookForTest(func(fromID, toID int64) error {
+		batches++
+		if batches == 2 {
+			cancel()
+		}
+		return nil
+	})
+	err := st.InitSchemaContext(ctx)
+	restoreHook()
+
+	require.Error(err, "a cancelled initialisation must report failure, not a silent partial upgrade")
+	require.ErrorIs(err, context.Canceled,
+		"and report it as cancellation, so the daemon exits on the signal rather than "+
+			"treating an operator's Ctrl-C as a corrupt archive")
+	require.Equal(2, batches,
+		"the backfill must stop at the batch the cancellation reached, not walk the rest "+
+			"of the table first: on a real archive that is the hours the operator was "+
+			"trying to get back")
+
+	stamped := map[int64]string{}
+	for _, id := range ids {
+		if got := readRawContentChangedAt(t, st, id); got.Valid {
+			stamped[id] = got.String
+		}
+	}
+	require.NotEmpty(stamped,
+		"the batch that committed before the cancellation must survive it")
+	require.Less(len(stamped), len(ids),
+		"the cancellation must leave real work behind, or the resume half proves nothing")
+
+	applied, err := st.IsMigrationApplied(contentChangedBackfillMigration)
+	require.NoError(err)
+	require.False(applied,
+		"a cancelled backfill must not record itself as applied: the ledger gate would "+
+			"stop the remaining rows from ever being stamped")
+
+	// The next open — an uncancelled one — finishes the job.
+	require.NoError(st.InitSchema(), "the next open must resume and complete the backfill")
+	for id, before := range stamped {
+		assert.Equalf(before, readRawContentChangedAt(t, st, id).String,
+			"message %d was stamped before the cancellation and must not be re-stamped", id)
+	}
+	for _, id := range ids {
+		require.Truef(readRawContentChangedAt(t, st, id).Valid,
+			"message %d must be stamped after the resumed run", id)
+	}
+	applied, err = st.IsMigrationApplied(contentChangedBackfillMigration)
+	require.NoError(err)
+	assert.True(applied, "the completed backfill must record itself")
+}
+
+// seedMessageAtID seeds message n and gives it an explicit id, so a test can
+// place a row anywhere in the id space the backfill has to cope with. The two
+// backends need opposite orders: SQLite's `INTEGER PRIMARY KEY` is the rowid and
+// takes any 64-bit value, so the row is inserted first and moved afterwards;
+// PostgreSQL's id is `GENERATED ALWAYS AS IDENTITY`, which refuses an UPDATE
+// outright, so the identity sequence is repositioned before the insert instead.
+// Returns the id, having checked the row really landed on it.
+func seedMessageAtID(t *testing.T, st *store.Store, n int, id int64) int64 {
+	t.Helper()
+	if st.IsPostgreSQL() {
+		// The default lower bound of a bigint identity is 1, so an id below that
+		// needs MINVALUE lowered before RESTART will accept it. MINVALUE is only
+		// ever lowered: raising it above the sequence's START (still 1) or up to
+		// MAXVALUE is rejected outright.
+		alter := fmt.Sprintf(`ALTER TABLE messages ALTER COLUMN id RESTART WITH %d`, id)
+		if id < 1 {
+			alter = fmt.Sprintf(
+				`ALTER TABLE messages ALTER COLUMN id SET MINVALUE %d RESTART WITH %d`, id, id)
+		}
+		_, err := st.DB().Exec(alter)
+		require.NoErrorf(t, err, "reposition the messages identity sequence to %d", id)
+		got := seedMessage(t, st, n)
+		require.Equalf(t, id, got, "message %d did not land on the requested id", n)
+		return id
+	}
+	got := seedMessage(t, st, n)
+	_, err := st.DB().Exec(
+		st.Rebind(`UPDATE messages SET id = ? WHERE id = ?`), id, got)
+	require.NoErrorf(t, err, "move message %d to id %d", n, id)
+	return id
+}
+
+// countBackfillBatches installs the batch hook as a counter and returns a
+// pointer to the count. The guard is not decoration: a backfill that walks the
+// numeric id span instead of the rows needing work does not merely run slowly at
+// the extremes of the id space, it never terminates, so a test that only
+// asserted on the count would hang the whole suite instead of failing. The hook
+// aborts the run once the batch count passes what any correct walk could need,
+// turning that into a fast, readable failure.
+func countBackfillBatches(t *testing.T, maxBatches int) *int {
+	t.Helper()
+	batches := 0
+	restore := store.SetContentChangedBackfillBatchHookForTest(func(fromID, toID int64) error {
+		batches++
+		if batches > maxBatches {
+			return fmt.Errorf(
+				"the backfill has run %d batches for an archive that needs at most %d: "+
+					"it is walking the id span rather than the rows that need work",
+				batches, maxBatches)
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+	return &batches
+}
+
+// TestContentChangedAt_BackfillStampsTheRowAtIDZero covers an archive whose
+// highest message id is 0.
+//
+// SQLite's `INTEGER PRIMARY KEY` is the rowid, and the schema puts no positive
+// constraint on it, so 0 is a legal id and an archive can consist of exactly
+// that row. A backfill that reads `MAX(id) == 0` as "empty table" skips it and
+// then records itself as applied — and the skip is permanent: the feed's range
+// predicate excludes NULL and the ledger gate means the scan never runs again.
+// The message is invisible to the feed for the life of the archive.
+func TestContentChangedAt_BackfillStampsTheRowAtIDZero(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	id := seedMessageAtID(t, st, 1, 0)
+	stampLastModified(t, st, id, "2020-01-02 03:04:05")
+
+	// Reconstruct an archive that predates the column so InitSchema really runs
+	// the backfill over this row.
+	dropContentChangedAtColumn(t, st)
+	clearContentChangedBackfillLedger(t, st)
+	require.NoError(st.InitSchema())
+
+	got := readRawContentChangedAt(t, st, id)
+	require.True(got.Valid,
+		"the message at id 0 has a NULL watermark after the upgrade: the backfill has "+
+			"already recorded itself as applied, so nothing will ever stamp it and it can "+
+			"never appear in the change feed")
+	assert.Contains(got.String, "2020-01-02",
+		"and it must be seeded from last_modified like every other backfilled row")
+}
+
+// TestContentChangedAt_BackfillFinishesAtTheEdgesOfTheIDSpace covers an archive
+// holding a legal id near either end of the 64-bit range.
+//
+// A walk that advances by adding a batch size to a cursor overflows there: at
+// the top the batch end wraps negative, so the range matches nothing and the
+// cursor wraps instead of terminating. That is not a slow upgrade, it is an
+// upgrade that never finishes — at daemon startup, before the port is bound, so
+// the daemon never serves at all. The batch guard turns the non-termination into
+// a failure this suite can report.
+func TestContentChangedAt_BackfillFinishesAtTheEdgesOfTheIDSpace(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	low := seedMessageAtID(t, st, 1, math.MinInt64)
+	high := seedMessageAtID(t, st, 2, math.MaxInt64)
+	stampLastModified(t, st, low, "2020-01-02 03:04:05")
+	stampLastModified(t, st, high, "2020-01-03 03:04:05")
+
+	dropContentChangedAtColumn(t, st)
+	clearContentChangedBackfillLedger(t, st)
+	// Both rows fit in one batch, so anything past a handful of batches is the
+	// walk crawling the id span.
+	batches := countBackfillBatches(t, 4)
+
+	require.NoError(st.InitSchema(),
+		"the upgrade must finish on an archive holding ids at the edges of the id space")
+	assert.Contains(readContentChangedAt(t, st, low), "2020-01-02", "the row at the bottom of the id space")
+	assert.Contains(readContentChangedAt(t, st, high), "2020-01-03", "the row at the top of the id space")
+	assert.LessOrEqual(*batches, 2, "two rows one batch apart need one batch, not %d", *batches)
+}
+
+// TestContentChangedAt_BackfillSkipsIDRangesWithNoWork covers a sparse archive:
+// legal ids spread thinly over a wide span, which is what a long-lived archive
+// looks like after deletions, imports from several sources, or a subset copy.
+//
+// The cost that matters is transactions, not rows. A walk that steps through the
+// numeric span from MIN(id) to MAX(id) opens one transaction per batch of ids
+// whether or not any row lives there, so an archive with a handful of rows
+// spread over millions of ids pays millions of empty transactions at daemon
+// startup — before the port is bound. A walk over the rows that need work pays
+// one transaction per batch of rows.
+func TestContentChangedAt_BackfillSkipsIDRangesWithNoWork(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	// Two rows, four million ids apart, against the production batch size of
+	// 5000: one batch of work, 800 batches of empty span.
+	const gap = 4_000_001
+	first := seedMessageAtID(t, st, 1, 1)
+	second := seedMessageAtID(t, st, 2, gap)
+	stampLastModified(t, st, first, "2020-01-02 03:04:05")
+	stampLastModified(t, st, second, "2020-01-03 03:04:05")
+
+	dropContentChangedAtColumn(t, st)
+	clearContentChangedBackfillLedger(t, st)
+	batches := countBackfillBatches(t, 8)
+
+	require.NoError(st.InitSchema())
+	assert.Contains(readContentChangedAt(t, st, first), "2020-01-02", "the first row")
+	assert.Contains(readContentChangedAt(t, st, second), "2020-01-03", "the second row")
+	assert.Equal(1, *batches,
+		"both rows fit in one batch of work, so the upgrade must open one transaction, "+
+			"not one per batch of empty id span")
 }
 
 // TestContentChangedAt_BackfillNeverMintsANullWatermark covers the values
@@ -582,7 +932,7 @@ func TestContentChangedAt_BackfillNeverMintsANullWatermark(t *testing.T) {
 	// zero cursor. Settle the clock first — the fallback stamps "now", and the
 	// feed deliberately withholds the instant it is reading in.
 	settleFeedClock(t, st)
-	page, err := st.ListChangedMessages(context.Background(), time.Time{}, 0, 100)
+	page, err := st.ListChangedMessages(context.Background(), store.ChangedMessagesCursor{}, 100)
 	require.NoError(err)
 	seen := map[int64]bool{}
 	for _, m := range page.Messages {
@@ -749,11 +1099,15 @@ func insertMessagesTriggerPrograms(t *testing.T, st *store.Store, insert string,
 // SQLite triggers cannot assign to NEW, so an AFTER INSERT trigger that stamps
 // the watermark has to re-UPDATE the row that was just inserted. Worse, merely
 // HAVING a row trigger on messages makes SQLite compile a trigger subprogram
-// into every INSERT and open a statement journal for it — measured at 6.4s
-// against 1.1s for a 100k-row bulk insert even with the trigger's WHEN guard
-// never once satisfied. Every importer and internal/fakevault runs through this
-// path. The column DEFAULT stamps fresh databases instead, and EnsureTriggers
-// omits the INSERT trigger entirely when that DEFAULT is present.
+// into every INSERT and open a statement journal for it, whether or not the
+// body runs — measured at 7.3s against 1.4s for 100k rows inserted inside one
+// transaction (Linux, WAL, synchronous=FULL, same at OFF) with the WHEN guard
+// never once satisfied. The cost is specific to inserts sharing a transaction:
+// the same trigger over 20k messages persisted one transaction each made no
+// measurable difference. The bulk paths are the ones that pay — fakevault's
+// INSERT ... SELECT generator and subset.go's message copy. The column DEFAULT
+// stamps fresh databases instead, and EnsureTriggers omits the INSERT trigger
+// entirely when that DEFAULT is present.
 //
 // total_changes() is SQLite's per-connection count of rows written, and unlike
 // changes() it does include rows written by trigger programs — which is exactly
@@ -840,6 +1194,141 @@ func TestContentChangedAt_UpgradedDatabaseKeepsTheInsertTrigger(t *testing.T) {
 		"a row inserted after an ALTER TABLE upgrade must still be stamped: the column has no "+
 			"DEFAULT there, so the INSERT trigger is the only writer")
 	assert.Regexp(contentChangedStampShape, stamp.String)
+}
+
+// rewriteMessagesContentChangedAtDefault replaces the DEFAULT expression on
+// messages.content_changed_at in the stored schema.
+//
+// SQLite has no ALTER COLUMN, and ADD COLUMN refuses a non-constant default, so
+// the only way to reach this state — from a test or from an operator with a
+// SQLite shell — is to rewrite sqlite_master under PRAGMA writable_schema. All
+// three statements run on ONE pinned connection: writable_schema is a
+// per-connection setting and the pool would otherwise hand the UPDATE to a
+// connection that still refuses it.
+func rewriteMessagesContentChangedAtDefault(t *testing.T, st *store.Store, want string) {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := st.DB().Conn(ctx)
+	require.NoError(t, err, "pin a connection")
+	defer func() { _ = conn.Close() }()
+
+	const read = `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'`
+	var schema string
+	require.NoError(t, conn.QueryRowContext(ctx, read).Scan(&schema),
+		"read the messages schema")
+
+	// Line-anchored, because the default expression itself contains a comma:
+	// strftime('%Y-%m-%d %H:%M:%f','now'). The final comma is required and
+	// captured separately so the rewrite cannot remove the column delimiter.
+	declaration := regexp.MustCompile(`(?m)^(\s*content_changed_at DATETIME DEFAULT ).*(,)(\r?)$`)
+	rewritten := declaration.ReplaceAllStringFunc(schema, func(line string) string {
+		parts := declaration.FindStringSubmatch(line)
+		return parts[1] + want + parts[2] + parts[3]
+	})
+	require.NotEqual(t, schema, rewritten,
+		"the messages schema must declare a content_changed_at default to rewrite")
+
+	for _, stmt := range []string{`PRAGMA writable_schema=ON`, "", `PRAGMA writable_schema=OFF`} {
+		if stmt == "" {
+			_, err = conn.ExecContext(ctx,
+				`UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = 'messages'`,
+				rewritten)
+			require.NoError(t, err, "rewrite the messages schema")
+			continue
+		}
+		_, err = conn.ExecContext(ctx, stmt)
+		require.NoErrorf(t, err, "exec %s", stmt)
+	}
+}
+
+// readContentChangedAtDefault reports the DEFAULT SQLite records for the column.
+func readContentChangedAtDefault(t *testing.T, st *store.Store) string {
+	t.Helper()
+	var dflt sql.NullString
+	require.NoError(t, st.DB().QueryRow(
+		`SELECT dflt_value FROM pragma_table_info('messages') WHERE name = 'content_changed_at'`).
+		Scan(&dflt), "read content_changed_at default")
+	return dflt.String
+}
+
+// TestContentChangedAt_NoncanonicalDefaultIsRejected covers the archive whose
+// content_changed_at DEFAULT is neither absent nor the one this build writes.
+//
+// The INSERT trigger cannot rescue such an archive, which is what makes it a
+// data-loss case rather than a slow one. The trigger fires only WHEN
+// NEW.content_changed_at IS NULL, and SQLite applies a non-NULL column DEFAULT
+// BEFORE the trigger runs — so any drifted non-NULL default stays authoritative
+// and keeps writing a value with the wrong meaning or shape. The feed compares
+// SQLite timestamps lexically, so once both shapes are in the table a cursor
+// sorts rows into the wrong place and silently skips or repeats changes, with
+// nothing anywhere reporting it.
+//
+// So the archive is refused at open, before a single row can be written with the
+// wrong shape. Loud and immediate beats a feed that quietly loses records.
+func TestContentChangedAt_NoncanonicalDefaultIsRejected(t *testing.T) {
+	testutil.SkipIfPostgres(t, "the DEFAULT/trigger interaction is a SQLite one")
+	require := require.New(t)
+	assert := assert.New(t)
+
+	dbPath := filepath.Join(t.TempDir(), "drifted-default.db")
+	seed, err := store.OpenForTest(dbPath)
+	require.NoError(err, "open seed store")
+	require.NoError(seed.InitSchema(), "seed InitSchema")
+	const driftedDefault = `'2000-01-01 00:00:00'`
+	rewriteMessagesContentChangedAtDefault(t, seed, driftedDefault)
+	require.NoError(seed.Close(), "close seed store")
+
+	drifted, err := store.OpenForTest(dbPath)
+	require.NoError(err, "reopen the drifted archive")
+	require.Equal(driftedDefault, readContentChangedAtDefault(t, drifted),
+		"precondition: the archive must really carry a drifted default")
+
+	err = drifted.InitSchema()
+	require.Error(err,
+		"an archive whose content_changed_at default is not the one this build writes "+
+			"must be refused, not opened with a trigger that cannot override the default")
+	assert.Contains(err.Error(), "content_changed_at",
+		"the error must name the column an operator has to repair")
+	assert.Contains(err.Error(), driftedDefault,
+		"and the default it found")
+	assert.Contains(err.Error(), "strftime",
+		"and the default it expects, so the repair does not need this source file")
+	require.NoError(drifted.Close(), "close the drifted archive")
+
+	// The remedy: put the default back, and the archive opens and stamps in the
+	// one shape the feed's lexical cursor can order. The rewrite gets its own
+	// handle because a sqlite_master edit only reaches connections opened after
+	// it — which is also how an operator would do the repair, with the daemon
+	// stopped.
+	repairHandle, err := store.OpenForTest(dbPath)
+	require.NoError(err, "reopen for repair")
+	rewriteMessagesContentChangedAtDefault(t, repairHandle,
+		`(strftime('%Y-%m-%d %H:%M:%f','now'))`)
+	require.NoError(repairHandle.Close(), "close the repair handle")
+
+	repaired, err := store.OpenForTest(dbPath)
+	require.NoError(err, "reopen the repaired archive")
+	t.Cleanup(func() { _ = repaired.Close() })
+	require.Equal(`strftime('%Y-%m-%d %H:%M:%f','now')`,
+		readContentChangedAtDefault(t, repaired), "precondition: the repair landed")
+	require.NoError(repaired.InitSchema(), "a repaired archive must open")
+
+	src, err := repaired.GetOrCreateSource("gmail", "repaired@example.com")
+	require.NoError(err)
+	conv, err := repaired.EnsureConversationWithType(src.ID, "repaired", "email_thread", "Repaired")
+	require.NoError(err)
+	_, err = repaired.DB().Exec(
+		`INSERT INTO messages (source_id, source_message_id, conversation_id, message_type)
+		 VALUES (?,?,?,?)`, src.ID, "repaired-1", conv, "email")
+	require.NoError(err)
+
+	var stamp sql.NullString
+	require.NoError(repaired.DB().QueryRow(
+		`SELECT CAST(content_changed_at AS TEXT) FROM messages WHERE source_message_id = 'repaired-1'`).
+		Scan(&stamp))
+	require.True(stamp.Valid, "the repaired archive must still stamp new rows")
+	assert.Regexp(contentChangedStampShape, stamp.String,
+		"and stamp them in the one shape the feed's lexical cursor can order")
 }
 
 // TestContentChangedAt_NullWatermarkIsStamped pins the null-safe comparison in

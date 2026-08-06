@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"slices"
@@ -37,7 +40,18 @@ func newChangesServer(t *testing.T) (*Server, *store.Store) {
 		Store:  st,
 		Logger: testLogger(),
 	})
+	relaxChangeFeedRateLimit(t, srv)
 	return srv, st
+}
+
+func relaxChangeFeedRateLimit(t *testing.T, srv *Server) {
+	t.Helper()
+	srv.changesRateLimiter.Close()
+	srv.changesRateLimiter = NewRateLimiter(1_000_000, 1_000_000)
+	t.Cleanup(func() {
+		srv.rateLimiter.Close()
+		srv.changesRateLimiter.Close()
+	})
 }
 
 // seedChangedMessages inserts count messages through the same UpsertMessage
@@ -127,6 +141,39 @@ func setChangesWatermarkAt(t *testing.T, st *store.Store, when time.Time, ids ..
 	}
 }
 
+// seedChangedMessageAtID seeds one message on an exact id, which is how a test
+// reaches an id no auto-increment hands out. 0 and negatives are legal ids: the
+// column is SQLite's INTEGER PRIMARY KEY — the rowid — and BIGINT on
+// PostgreSQL, and the schema constrains neither further.
+//
+// The two backends need opposite orders, the same way seedMessageAtID in
+// internal/store's tests does: SQLite takes any 64-bit rowid, so the row is
+// inserted first and moved afterwards; PostgreSQL's id is GENERATED ALWAYS AS
+// IDENTITY and refuses the UPDATE outright, so the identity sequence is
+// repositioned before the insert instead.
+func seedChangedMessageAtID(t *testing.T, st *store.Store, id int64) int64 {
+	t.Helper()
+	if st.IsPostgreSQL() {
+		// The default lower bound of a bigint identity is 1, so an id below that
+		// needs MINVALUE lowered before RESTART will accept it.
+		alter := fmt.Sprintf(`ALTER TABLE messages ALTER COLUMN id RESTART WITH %d`, id)
+		if id < 1 {
+			alter = fmt.Sprintf(
+				`ALTER TABLE messages ALTER COLUMN id SET MINVALUE %d RESTART WITH %d`, id, id)
+		}
+		_, err := st.DB().Exec(alter)
+		require.NoErrorf(t, err, "reposition the messages identity sequence to %d", id)
+		got := seedChangedMessages(t, st, 1)[0]
+		require.Equalf(t, id, got, "the seeded message did not land on id %d", id)
+		return id
+	}
+	got := seedChangedMessages(t, st, 1)[0]
+	_, err := st.DB().Exec(
+		st.Rebind(`UPDATE messages SET id = ? WHERE id = ?`), id, got)
+	require.NoErrorf(t, err, "move message %d to id %d", got, id)
+	return id
+}
+
 // setChangesMessageTimestamp writes a lifecycle timestamp column directly.
 // These are content columns, so the write also bumps the watermark.
 func setChangesMessageTimestamp(t *testing.T, st *store.Store, id int64, col string, value time.Time) {
@@ -148,16 +195,17 @@ func subSecondWatermark(st *store.Store) string {
 	return "2026-07-26 10:00:00.731"
 }
 
-// changesTarget builds a /messages/changes URL. A zero value for since,
-// sinceID, or limit omits that parameter, which is how a first-run consumer
-// calls the feed.
-func changesTarget(since string, sinceID int64, limit int) string {
+// changesTarget builds a /messages/changes URL. An empty cursor or a zero limit
+// omits that parameter, which is how a first-run consumer calls the feed.
+//
+// The cursor is opaque, so no test in this file builds one out of its parts. A
+// test that needs to start from a chosen position asks encodeChangesCursor for
+// it — the same codec the server publishes with — and every other test reuses a
+// next_cursor a real response handed back.
+func changesTarget(cursor string, limit int) string {
 	q := url.Values{}
-	if since != "" {
-		q.Set("since", since)
-	}
-	if sinceID != 0 {
-		q.Set("since_id", strconv.FormatInt(sinceID, 10))
+	if cursor != "" {
+		q.Set("cursor", cursor)
 	}
 	if limit != 0 {
 		q.Set("limit", strconv.Itoa(limit))
@@ -169,15 +217,47 @@ func changesTarget(since string, sinceID int64, limit int) string {
 	return target
 }
 
+// changesArchiveUID reads the durable archive identity the server binds every
+// cursor it issues to. A test that builds a cursor has to bind it the same way
+// or the server rejects it as belonging to another archive — which is the
+// point.
+func changesArchiveUID(t *testing.T, srv *Server) string {
+	t.Helper()
+	identifier, ok := srv.store.(ArchiveIdentifier)
+	require.True(t, ok, "the change feed's store must be able to identify its archive")
+	uid, err := identifier.ArchiveUIDContext(context.Background())
+	require.NoError(t, err, "ArchiveUIDContext")
+	return uid
+}
+
+// changesCursor builds a cursor for srv's archive at a chosen position — just
+// after the row (at, id) — through the same codec the server publishes with.
+func changesCursor(t *testing.T, srv *Server, at time.Time, id int64) string {
+	t.Helper()
+	return encodeChangesCursor(changesArchiveUID(t, srv), store.ChangedMessagesAfter(at, id))
+}
+
+// changesInstantCursor builds the other position the server publishes: the
+// START of an instant, which carries no id tiebreak and so stands below every
+// row stamped there. It is what the future-cursor clamp hands back, and what an
+// absent cursor means with at zero.
+func changesInstantCursor(t *testing.T, srv *Server, at time.Time) string {
+	t.Helper()
+	return encodeChangesCursor(changesArchiveUID(t, srv), store.ChangedMessagesFrom(at))
+}
+
 // changesFarFuture is a cursor no watermark can reach, so a page requested with
 // it comes back empty and carries nothing but the clock reading.
-const changesFarFuture = "2999-01-01T00:00:00Z"
+func changesFarFuture(t *testing.T, srv *Server) string {
+	t.Helper()
+	return changesCursor(t, srv, time.Date(2999, 1, 1, 0, 0, 0, 0, time.UTC), 0)
+}
 
 // changesServerTime reads the database clock the way a client does: every page
 // carries it, empty ones included.
 func changesServerTime(t *testing.T, srv *Server) time.Time {
 	t.Helper()
-	resp := getChangesPage(t, srv, changesTarget(changesFarFuture, 0, 1))
+	resp := getChangesPage(t, srv, changesTarget(changesFarFuture(t, srv), 1))
 	at, err := time.Parse(time.RFC3339Nano, resp.ServerTime)
 	require.NoErrorf(t, err, "server_time %q must parse as RFC3339", resp.ServerTime)
 	return at
@@ -185,11 +265,18 @@ func changesServerTime(t *testing.T, srv *Server) time.Time {
 
 // changesCompleteThrough reads how far the feed is complete — its page bound,
 // which is what decides whether a row is publishable yet.
+func changesCompleteThroughString(t *testing.T, resp ChangesResponse) string {
+	t.Helper()
+	require.NotNil(t, resp.CompleteThrough, "complete_through must be present once a bound exists")
+	return *resp.CompleteThrough
+}
+
 func changesCompleteThrough(t *testing.T, srv *Server) time.Time {
 	t.Helper()
-	resp := getChangesPage(t, srv, changesTarget(changesFarFuture, 0, 1))
-	at, err := time.Parse(time.RFC3339Nano, resp.CompleteThrough)
-	require.NoErrorf(t, err, "complete_through %q must parse as RFC3339", resp.CompleteThrough)
+	resp := getChangesPage(t, srv, changesTarget(changesFarFuture(t, srv), 1))
+	value := changesCompleteThroughString(t, resp)
+	at, err := time.Parse(time.RFC3339Nano, value)
+	require.NoErrorf(t, err, "complete_through %q must parse as RFC3339", value)
 	return at
 }
 
@@ -200,13 +287,19 @@ func changesCompleteThrough(t *testing.T, srv *Server) time.Time {
 // their own watermarks in the past do not need it.
 func settleChangesClock(t *testing.T, srv *Server) {
 	t.Helper()
-	start := changesServerTime(t, srv)
+	waitChangesBoundPast(t, srv, changesServerTime(t, srv))
+}
+
+// waitChangesBoundPast blocks until the feed's commit bound has moved strictly
+// past at, which is what makes a watermark stamped at or below at publishable.
+func waitChangesBoundPast(t *testing.T, srv *Server, at time.Time) {
+	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
-	for !changesCompleteThrough(t, srv).After(start) {
+	for !changesCompleteThrough(t, srv).After(at) {
 		if time.Now().After(deadline) {
 			require.Failf(t, "the change feed stopped advancing",
 				"complete_through never moved past %s; something is holding a write "+
-					"transaction open", start)
+					"transaction open", at)
 			return
 		}
 		time.Sleep(200 * time.Microsecond)
@@ -232,10 +325,11 @@ func changedIDs(resp ChangesResponse) []int64 {
 	return ids
 }
 
-// TestChangesEndpoint_WalksEveryMessageExactlyOnce follows next_since/
-// next_since_id the way a client would, across a block sharing one watermark.
-// The final page is also the exact-boundary case: 25 rows walked five at a time
-// ends on a full page with nothing after it, and has_more must say so.
+// TestChangesEndpoint_WalksEveryMessageExactlyOnce follows next_cursor the way
+// a client would, across a block sharing one watermark: five pages, no
+// duplicate and no skip. The final page is also the exact-boundary case: 25 rows
+// walked five at a time ends on a full page with nothing after it, and has_more
+// must say so.
 func TestChangesEndpoint_WalksEveryMessageExactlyOnce(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -247,17 +341,17 @@ func TestChangesEndpoint_WalksEveryMessageExactlyOnce(t *testing.T) {
 	setChangesWatermark(t, st, subSecondWatermark(st), want...)
 
 	var (
-		got     []int64
-		since   string
-		sinceID int64
-		pages   int
+		got    []int64
+		cursor string
+		pages  int
 	)
 	for {
 		require.Lessf(pages, 200,
 			"the feed did not terminate after %d pages: the cursor is not advancing", pages)
-		resp := getChangesPage(t, srv, changesTarget(since, sinceID, pageSize))
+		resp := getChangesPage(t, srv, changesTarget(cursor, pageSize))
 		require.LessOrEqual(len(resp.Messages), pageSize, "a page must not exceed the limit")
 		require.Equal(len(resp.Messages), resp.Count, "count must describe the page it ships with")
+		require.NotEmpty(resp.NextCursor, "every page must hand back something to send next")
 		if len(resp.Messages) == 0 {
 			assert.False(resp.HasMore, "an empty page has nothing after it")
 			break
@@ -266,7 +360,7 @@ func TestChangesEndpoint_WalksEveryMessageExactlyOnce(t *testing.T) {
 		got = append(got, changedIDs(resp)...)
 		assert.Equalf(len(got) < total, resp.HasMore,
 			"has_more after %d of %d rows", len(got), total)
-		since, sinceID = resp.NextSince, resp.NextSinceID
+		cursor = resp.NextCursor
 	}
 
 	require.Len(got, total,
@@ -278,10 +372,13 @@ func TestChangesEndpoint_WalksEveryMessageExactlyOnce(t *testing.T) {
 }
 
 // TestChangesEndpoint_CursorRoundTripsFullPrecision is the loop guard: take
-// next_since from one response, send it back, and assert the second page does
-// not repeat the first. A cursor serialised with time.RFC3339 loses the
-// sub-second part of the watermark, and the truncated value re-selects the page
-// that was just delivered — forever.
+// next_cursor from one response, send it back, and assert the second page does
+// not repeat the first. A cursor that lost the sub-second part of the watermark
+// re-selects the page that was just delivered — forever.
+//
+// The token is opaque, so the precision itself is held by
+// TestChangesCursorRoundTripsSubSecondPrecision; what is checked here is the
+// position the server chose to publish, and that resending it moves the walk on.
 func TestChangesEndpoint_CursorRoundTripsFullPrecision(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -291,25 +388,20 @@ func TestChangesEndpoint_CursorRoundTripsFullPrecision(t *testing.T) {
 	watermark := subSecondWatermark(st)
 	setChangesWatermark(t, st, watermark, ids...)
 
-	first := getChangesPage(t, srv, changesTarget("", 0, 10))
+	first := getChangesPage(t, srv, changesTarget("", 10))
 	require.Equal(ids, changedIDs(first), "the first page returns the whole archive")
 
 	last := first.Messages[len(first.Messages)-1]
-	require.Equal(last.ContentChangedAt, first.NextSince,
-		"next_since must be the last row's watermark verbatim")
-	require.Equal(last.ID, first.NextSinceID, "next_since_id must be the last row's id")
+	watermarkAt, err := time.Parse(time.RFC3339Nano, last.ContentChangedAt)
+	require.NoErrorf(err, "content_changed_at %q must parse as RFC3339", last.ContentChangedAt)
+	require.NotZerof(watermarkAt.Nanosecond(),
+		"this test is meaningless unless the watermark %q carries a sub-second part", watermark)
+	assert.Equal(changesCursor(t, srv, watermarkAt, last.ID), first.NextCursor,
+		"the published cursor must be the last row's position, sub-second part included")
 
-	cursor, err := time.Parse(time.RFC3339Nano, first.NextSince)
-	require.NoErrorf(err, "next_since %q must parse as RFC3339", first.NextSince)
-	require.NotZerof(cursor.Nanosecond(),
-		"this test is meaningless unless the watermark %q carries a sub-second part; "+
-			"next_since was %q", watermark, first.NextSince)
-	assert.NotEqual(cursor.Truncate(time.Second).Format(time.RFC3339), first.NextSince,
-		"next_since must not be truncated to whole seconds")
-
-	second := getChangesPage(t, srv, changesTarget(first.NextSince, first.NextSinceID, 10))
+	second := getChangesPage(t, srv, changesTarget(first.NextCursor, 10))
 	assert.Empty(second.Messages,
-		"resending next_since must not redeliver the page it came from; a "+
+		"resending next_cursor must not redeliver the page it came from; a "+
 			"second-truncated cursor makes a polling consumer loop forever")
 }
 
@@ -327,14 +419,16 @@ func TestChangesEndpoint_ResumeFromEarlierCursorRedelivers(t *testing.T) {
 	ids := seedChangedMessages(t, st, 6)
 	setChangesWatermark(t, st, subSecondWatermark(st), ids...)
 
-	first := getChangesPage(t, srv, changesTarget("", 0, 3))
+	first := getChangesPage(t, srv, changesTarget("", 3))
 	require.Len(first.Messages, 3, "first page")
 	require.True(first.HasMore, "more rows remain")
 
 	// Resume from the position the consumer held after the FIRST row of the
 	// first page: the two rows it already saw come back again.
 	resumed := first.Messages[0]
-	rewound := getChangesPage(t, srv, changesTarget(resumed.ContentChangedAt, resumed.ID, 10))
+	resumedAt, err := time.Parse(time.RFC3339Nano, resumed.ContentChangedAt)
+	require.NoErrorf(err, "content_changed_at %q must parse as RFC3339", resumed.ContentChangedAt)
+	rewound := getChangesPage(t, srv, changesTarget(changesCursor(t, srv, resumedAt, resumed.ID), 10))
 	assert.Equal(ids[1:], changedIDs(rewound),
 		"a cursor resumed from an earlier position redelivers the rows after it, "+
 			"so a consumer may safely re-read an overlapping window")
@@ -350,7 +444,7 @@ func TestChangesEndpoint_EmptyArchiveReturnsEchoableCursor(t *testing.T) {
 	assert := assert.New(t)
 	srv, _ := newChangesServer(t)
 
-	w := doGet(srv, changesTarget("", 0, 0))
+	w := doGet(srv, changesTarget("", 0))
 	require.Equalf(http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var raw map[string]json.RawMessage
@@ -363,8 +457,9 @@ func TestChangesEndpoint_EmptyArchiveReturnsEchoableCursor(t *testing.T) {
 	require.NoError(json.Unmarshal(w.Body.Bytes(), &resp), "decode changes response")
 	assert.Equal(0, resp.Count, "count")
 	assert.False(resp.HasMore, "has_more")
-	assert.Empty(resp.NextSince, "next_since echoes the absent request cursor")
-	assert.Zero(resp.NextSinceID, "next_since_id echoes the absent request cursor")
+	assert.Equal(changesInstantCursor(t, srv, time.Time{}), resp.NextCursor,
+		"a caller that sent no cursor is still handed one: the start of the archive, "+
+			"which is where it still stands")
 
 	serverTime, err := time.Parse(time.RFC3339Nano, resp.ServerTime)
 	require.NoErrorf(err, "server_time %q must parse as RFC3339", resp.ServerTime)
@@ -384,19 +479,17 @@ func TestChangesEndpoint_EmptyPageEchoesRequestCursor(t *testing.T) {
 	ids := seedChangedMessages(t, st, 3)
 	setChangesWatermark(t, st, subSecondWatermark(st), ids...)
 
-	first := getChangesPage(t, srv, changesTarget("", 0, 10))
+	first := getChangesPage(t, srv, changesTarget("", 10))
 	require.Len(first.Messages, 3, "first page")
 
-	caughtUp := getChangesPage(t, srv, changesTarget(first.NextSince, first.NextSinceID, 10))
+	caughtUp := getChangesPage(t, srv, changesTarget(first.NextCursor, 10))
 	require.Empty(caughtUp.Messages, "the consumer is caught up")
-	assert.Equal(first.NextSince, caughtUp.NextSince,
-		"an empty page echoes the requested since so the consumer holds its place")
-	assert.Equal(first.NextSinceID, caughtUp.NextSinceID,
-		"an empty page echoes the requested since_id so the consumer holds its place")
+	assert.Equal(first.NextCursor, caughtUp.NextCursor,
+		"an empty page echoes the cursor it was sent so the consumer holds its place")
 	assert.False(caughtUp.HasMore, "has_more")
 
 	// The echoed cursor must itself be re-sendable, which is the whole point.
-	stillCaughtUp := getChangesPage(t, srv, changesTarget(caughtUp.NextSince, caughtUp.NextSinceID, 10))
+	stillCaughtUp := getChangesPage(t, srv, changesTarget(caughtUp.NextCursor, 10))
 	assert.Empty(stillCaughtUp.Messages, "polling an idle feed must stay empty")
 }
 
@@ -423,25 +516,76 @@ func TestChangesEndpoint_CursorAboveTheDatabaseClockRecovers(t *testing.T) {
 	seedChangedMessages(t, st, 2)
 	settleChangesClock(t, srv)
 
-	future := changesServerTime(t, srv).Add(time.Hour).UTC().Format(changesTimeLayout)
-	poisoned := getChangesPage(t, srv, changesTarget(future, 0, 100))
+	future := changesCursor(t, srv, changesServerTime(t, srv).Add(time.Hour), 0)
+	poisoned := getChangesPage(t, srv, changesTarget(future, 100))
 	require.Zero(poisoned.Count, "a cursor an hour ahead of the clock matches nothing")
 
-	serverTime, err := time.Parse(time.RFC3339Nano, poisoned.ServerTime)
-	require.NoError(err)
-	nextSince, err := time.Parse(time.RFC3339Nano, poisoned.NextSince)
-	require.NoError(err)
-	assert.Falsef(nextSince.After(serverTime),
-		"next_since %s is above server_time %s, so the very next poll is unsatisfiable too",
-		poisoned.NextSince, poisoned.ServerTime)
+	boundValue := changesCompleteThroughString(t, poisoned)
+	bound, err := time.Parse(time.RFC3339Nano, boundValue)
+	require.NoErrorf(err, "complete_through %q must parse as RFC3339", boundValue)
+	assert.Equal(changesInstantCursor(t, srv, bound), poisoned.NextCursor,
+		"the cursor must come back moved down to the START of this page's own commit "+
+			"bound, which is never above server_time; echoing it would make the very "+
+			"next poll unsatisfiable too, and landing after any id in that instant "+
+			"would skip the rows stamped there")
 
 	// Changes arrive after the poisoned poll and must be delivered.
 	seedMoreChangedMessages(t, st, "late", 3)
 	settleChangesClock(t, srv)
 
-	resumed := getChangesPage(t, srv, changesTarget(poisoned.NextSince, poisoned.NextSinceID, 100))
+	resumed := getChangesPage(t, srv, changesTarget(poisoned.NextCursor, 100))
 	assert.NotZero(resumed.Count,
 		"the feed stalled: changes made after the cursor was clamped were never delivered")
+}
+
+// TestChangesEndpoint_ClampedCursorReachesEveryIDAtTheBound covers the row the
+// clamp above has to be able to come back for.
+//
+// The clamped cursor stands ON the commit bound, and the page query stops
+// strictly below it, so a row stamped exactly there is delivered by a LATER
+// poll or by none at all. Which of the two it is comes down to the id half of
+// the clamped position: the store's keyset predicate is
+// `>= cursor AND (> cursor OR id > tiebreak)`, so any tiebreak VALUE skips the
+// rows at the bound whose ids do not sort above it. Message ids are not all
+// positive — `id` is SQLite's rowid and BIGINT on PostgreSQL, with no further
+// constraint in the schema — and SQLite stamps at millisecond resolution, so a
+// write landing in the same millisecond as the bound on a row at id 0 or below
+// is reachable rather than theoretical. Dropping it would be silent and
+// permanent: the row is not waiting for anything, and only a later edit that
+// gives it a newer watermark would ever bring it back.
+//
+// The existing clamp tests cannot catch this. They seed through UpsertMessage,
+// which hands out auto-generated positive ids, and every positive id sorts
+// above any tiebreak the clamp has ever published.
+func TestChangesEndpoint_ClampedCursorReachesEveryIDAtTheBound(t *testing.T) {
+	for _, id := range []int64{0, -7} {
+		t.Run(fmt.Sprintf("a row at id %d", id), func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			srv, st := newChangesServer(t)
+
+			seedChangedMessageAtID(t, st, id)
+
+			poisoned := getChangesPage(t, srv, changesTarget(changesFarFuture(t, srv), 100))
+			require.Zero(poisoned.Count, "a cursor in the year 2999 matches nothing")
+			boundValue := changesCompleteThroughString(t, poisoned)
+			bound, err := time.Parse(time.RFC3339Nano, boundValue)
+			require.NoErrorf(err, "complete_through %q must parse as RFC3339",
+				boundValue)
+
+			// Stamped exactly at the instant the clamp landed on — the one
+			// instant a clamped cursor has to remain able to reach.
+			setChangesWatermarkAt(t, st, bound, id)
+			waitChangesBoundPast(t, srv, bound)
+
+			resumed := getChangesPage(t, srv, changesTarget(poisoned.NextCursor, 100))
+			assert.Containsf(changedIDs(resumed), id,
+				"message %d is stamped exactly at the bound the clamp moved the cursor "+
+					"to (%s) and the bound has since moved past it, so the clamped cursor "+
+					"must still deliver it; a clamped position that sorts above it drops "+
+					"the row for good", id, boundValue)
+		})
+	}
 }
 
 // TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor holds the
@@ -473,18 +617,19 @@ func TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor(t *testing.
 		// the cursor the consumer has held since before the step.
 		setChangesWatermarkAt(t, st, now.Add(-5*time.Minute), afterStep)
 
-		preStep := now.Add(time.Hour).UTC().Format(changesTimeLayout)
-		poisoned := getChangesPage(t, srv, changesTarget(preStep, 4242, 100))
+		preStep := changesCursor(t, srv, now.Add(time.Hour), 4242)
+		poisoned := getChangesPage(t, srv, changesTarget(preStep, 100))
 		require.Zero(poisoned.Count, "a cursor above the stepped-back clock matches nothing")
-		require.NotEqual(preStep, poisoned.NextSince, "the future cursor must be clamped")
+		require.NotEqual(preStep, poisoned.NextCursor, "the future cursor must be clamped")
+		boundValue := changesCompleteThroughString(t, poisoned)
 
-		recovered := getChangesPage(t, srv, changesTarget(poisoned.NextSince, poisoned.NextSinceID, 100))
+		recovered := getChangesPage(t, srv, changesTarget(poisoned.NextCursor, 100))
 		assert.NotContainsf(changedIDs(recovered), afterStep,
-			"message %d was stamped below the clamp target %s, so the clamp cannot "+
-				"return it", afterStep, poisoned.NextSince)
+			"message %d was stamped below the clamp target (this page's commit bound, "+
+				"%s), so the clamp cannot return it", afterStep, boundValue)
 
 		// And it never comes back: the clamped cursor only rises from here.
-		again := getChangesPage(t, srv, changesTarget(recovered.NextSince, recovered.NextSinceID, 100))
+		again := getChangesPage(t, srv, changesTarget(recovered.NextCursor, 100))
 		assert.NotContainsf(changedIDs(again), afterStep,
 			"message %d is below the cursor for good; a later poll cannot reach "+
 				"back under it", afterStep)
@@ -492,7 +637,7 @@ func TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor(t *testing.
 		// The documented repair. Unlike an unparseable or NULL watermark, the
 		// row is perfectly selectable — it is only below the cursor — so a
 		// reconciling full re-read does return it.
-		reread := getChangesPage(t, srv, changesTarget("", 0, 100))
+		reread := getChangesPage(t, srv, changesTarget("", 100))
 		assert.Containsf(changedIDs(reread), afterStep,
 			"a full re-read from an empty cursor is the only thing that recovers "+
 				"message %d, and the delivery contract says so", afterStep)
@@ -513,16 +658,14 @@ func TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor(t *testing.
 		setChangesWatermarkAt(t, st, now.Add(-time.Hour), afterStep)
 		setChangesWatermarkAt(t, st, now.Add(-10*time.Minute), later)
 
-		cursor := now.Add(-30 * time.Minute).UTC().Format(changesTimeLayout)
-		page := getChangesPage(t, srv, changesTarget(cursor, delivered, 100))
+		sent := now.Add(-30 * time.Minute)
+		page := getChangesPage(t, srv, changesTarget(changesCursor(t, srv, sent, delivered), 100))
 
 		serverTime, err := time.Parse(changesTimeLayout, page.ServerTime)
 		require.NoError(err, "server_time must parse")
-		sent, err := time.Parse(changesTimeLayout, cursor)
-		require.NoError(err, "the sent cursor must parse")
 		require.Truef(serverTime.After(sent),
 			"this cursor (%s) is below the clock (%s), so the future-cursor clamp "+
-				"cannot have fired", cursor, page.ServerTime)
+				"cannot have fired", sent, page.ServerTime)
 
 		assert.Containsf(changedIDs(page), later,
 			"message %d is above the cursor and must still be delivered: the feed "+
@@ -531,7 +674,7 @@ func TestChangesEndpoint_BackwardClockStepLosesChangesBelowTheCursor(t *testing.
 			"message %d was stamped below the cursor by the stepped-back clock and "+
 				"is skipped with no clamp involved", afterStep)
 
-		reread := getChangesPage(t, srv, changesTarget("", 0, 100))
+		reread := getChangesPage(t, srv, changesTarget("", 100))
 		assert.Containsf(changedIDs(reread), afterStep,
 			"the repair is the same on this side of the clamp: only a full re-read "+
 				"from an empty cursor returns message %d", afterStep)
@@ -638,7 +781,7 @@ func TestChangesEndpoint_ExactPageBoundaryReportsNoMorePages(t *testing.T) {
 	ids := seedChangedMessages(t, st, 3)
 	setChangesWatermark(t, st, subSecondWatermark(st), ids...)
 
-	resp := getChangesPage(t, srv, changesTarget("", 0, len(ids)))
+	resp := getChangesPage(t, srv, changesTarget("", len(ids)))
 
 	assert.Equal(ids, changedIDs(resp), "the page holds every row")
 	assert.False(resp.HasMore,
@@ -646,21 +789,24 @@ func TestChangesEndpoint_ExactPageBoundaryReportsNoMorePages(t *testing.T) {
 			"has_more false")
 }
 
-// TestChangesEndpoint_RejectsMalformedCursor: a bad cursor is rejected rather
-// than silently read as a zero value, which would replay the entire archive.
-// The rejection happens before the store is consulted, so a client typo is
-// reported as the typo it is whatever backend is configured.
+// TestChangesEndpoint_RejectsMalformedCursor: a cursor this API did not issue is
+// rejected rather than silently read as the start of the archive, which would
+// turn a client bug into a full re-delivery. The rejection happens before the
+// store is consulted, so a client typo is reported as the typo it is whatever
+// backend is configured.
 func TestChangesEndpoint_RejectsMalformedCursor(t *testing.T) {
 	srv, st := newChangesServer(t)
-	seedChangedMessages(t, st, 1)
+	ids := seedChangedMessages(t, st, 3)
+	setChangesWatermark(t, st, subSecondWatermark(st), ids...)
 
 	tests := []struct {
 		name     string
 		target   string
 		wantCode string
 	}{
-		{"since not a timestamp", "/api/v1/messages/changes?since=yesterday", "invalid_since"},
-		{"since_id not numeric", "/api/v1/messages/changes?since_id=abc", "invalid_since_id"},
+		{"cursor is not a token", "/api/v1/messages/changes?cursor=yesterday!!", "invalid_cursor"},
+		{"cursor is a truncated token", "/api/v1/messages/changes?cursor=" +
+			changesCursor(t, srv, time.Now(), 5)[:6], "invalid_cursor"},
 		{"limit not numeric", "/api/v1/messages/changes?limit=many", "invalid_limit"},
 	}
 	for _, tc := range tests {
@@ -669,12 +815,15 @@ func TestChangesEndpoint_RejectsMalformedCursor(t *testing.T) {
 			require.Equalf(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
 			env := decodeErrorEnvelope(t, w)
 			assert.Equal(t, tc.wantCode, env.Error, "error code")
+			assert.NotContains(t, w.Body.String(), `"messages"`,
+				"an unusable cursor must not fall back to the beginning of the archive: "+
+					"the caller would silently re-receive everything it already holds")
 		})
 	}
 }
 
 // TestChangesEndpoint_EmptyCursorStartsFromTheBeginning pins what an EMPTY
-// parameter value means, as opposed to an unparseable one. `?since=` is read as
+// parameter value means, as opposed to an unusable one. `?cursor=` is read as
 // absent — the same as omitting it — across this whole API, so a client whose
 // serialiser writes empty query parameters gets the first-run behaviour rather
 // than a 400. It is the surprising half of the cursor contract, so the docs
@@ -687,13 +836,134 @@ func TestChangesEndpoint_EmptyCursorStartsFromTheBeginning(t *testing.T) {
 	ids := seedChangedMessages(t, st, 3)
 	setChangesWatermark(t, st, subSecondWatermark(st), ids...)
 
-	resp := getChangesPage(t, srv, "/api/v1/messages/changes?since=&since_id=5&limit=10")
+	empty := getChangesPage(t, srv, "/api/v1/messages/changes?cursor=&limit=10")
+	absent := getChangesPage(t, srv, "/api/v1/messages/changes?limit=10")
 
-	require.Equal(ids, changedIDs(resp),
-		"an empty since is absent, not a parse failure, so the feed starts from "+
+	require.Equal(ids, changedIDs(empty),
+		"an empty cursor is absent, not a parse failure, so the feed starts from "+
 			"the beginning of the archive")
-	assert.Equal(len(ids), resp.Count, "count")
-	assert.False(resp.HasMore, "the whole archive fits in one page here")
+	assert.Equal(changedIDs(absent), changedIDs(empty), "an empty cursor and no cursor must agree")
+	assert.Equal(absent.NextCursor, empty.NextCursor, "and must leave the caller in the same place")
+	assert.Equal(len(ids), empty.Count, "count")
+	assert.False(empty.HasMore, "the whole archive fits in one page here")
+}
+
+// TestChangesEndpoint_AcceptsAFabricatedCursorForItsOwnArchive pins a DECISION
+// at the route, where a consumer meets it.
+//
+// The cursor is not signed and the server has no secret to sign it with, so it
+// cannot distinguish a cursor it issued from a well-formed one a caller built,
+// and it does not try. A forged cursor buys its holder nothing: it moves that
+// caller's own position in that caller's own feed and reaches no message the
+// caller could not already request through /messages/filter. The published
+// contract says "opaque" — do not construct one — but that is advice about
+// coupling, not an enforced rule, and the docs say so rather than promising an
+// enforcement this server cannot perform.
+func TestChangesEndpoint_AcceptsAFabricatedCursorForItsOwnArchive(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, st := newChangesServer(t)
+	ids := seedChangedMessages(t, st, 4)
+	setChangesWatermark(t, st, "2026-07-26 10:00:00.731", ids...)
+
+	// Hand-built from the published shape, naming a position no page ever
+	// issued: after the second row's watermark, so the walk resumes at the third.
+	fabricated := "1." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil,
+		`{"t":"2026-07-26T10:00:00.731Z","i":%d,"a":"%s"}`,
+		ids[1], changesArchiveUID(t, srv)))
+	require.NotEqual(changesInstantCursor(t, srv, time.Time{}), fabricated,
+		"this test is meaningless unless the token is one no page handed out")
+
+	resp := getChangesPage(t, srv, changesTarget(fabricated, 10))
+
+	assert.Equal(ids[2:], changedIDs(resp),
+		"a well-formed cursor naming this archive is honoured whoever built it")
+}
+
+// TestChangesEndpoint_RejectsACursorFromAnotherArchive is the silent-loss guard
+// the whole feed exists for, applied to the cursor itself.
+//
+// A cursor is a position in ONE archive: a watermark and an archive-local
+// message id. Point a consumer at a restored copy, a rebuilt archive, or simply
+// a different one — same daemon, different --db — and its stored cursor is
+// meaningful nowhere but where it came from. Accepted, it starts the walk at
+// some unrelated position and every record before that position is never
+// delivered: exactly the silent omission the feed is meant to make impossible.
+// So the cursor carries the archive's durable UID and a foreign one is a 400.
+//
+// The same test pins the other half, because a check that rejects everything
+// would also pass the first half: a cursor sent back to the archive that issued
+// it resumes the walk.
+func TestChangesEndpoint_RejectsACursorFromAnotherArchive(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	srvA, stA := newChangesServer(t)
+	idsA := seedChangedMessages(t, stA, 4)
+	setChangesWatermark(t, stA, subSecondWatermark(stA), idsA...)
+	first := getChangesPage(t, srvA, changesTarget("", 2))
+	require.Equal(idsA[:2], changedIDs(first), "precondition: archive A hands out page one")
+	require.NotEmpty(first.NextCursor, "precondition: archive A publishes a cursor")
+
+	// Its own archive: the cursor resumes the walk.
+	resumed := getChangesPage(t, srvA, changesTarget(first.NextCursor, 2))
+	assert.Equal(idsA[2:], changedIDs(resumed),
+		"a cursor sent back to the archive that issued it must resume the walk")
+
+	// A different archive: the cursor means nothing there.
+	srvB, stB := newChangesServer(t)
+	idsB := seedChangedMessages(t, stB, 4)
+	setChangesWatermark(t, stB, subSecondWatermark(stB), idsB...)
+
+	w := doGet(srvB, changesTarget(first.NextCursor, 10))
+	require.Equalf(http.StatusBadRequest, w.Code,
+		"a cursor from another archive must be rejected, not silently honoured: %s",
+		w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("invalid_cursor", env.Error, "error code")
+	assert.Contains(env.Message, "archive",
+		"the message must say the cursor belongs to a different archive")
+	assert.Contains(env.Message, "from the beginning",
+		"and it must name the repair: the sync restarts from the beginning")
+	assert.NotContains(w.Body.String(), `"messages"`,
+		"a foreign cursor must never be read as the start of the archive: the "+
+			"consumer would silently re-receive everything, or worse, resume at a "+
+			"position that skips rows it has never seen")
+}
+
+// TestChangesEndpoint_AlwaysPublishesACursor: a client always has something to
+// send back, whatever shape the page took. A page that withheld the cursor would
+// leave the caller with nothing to hold its place but the start of the archive.
+func TestChangesEndpoint_AlwaysPublishesACursor(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, st := newChangesServer(t)
+	ids := seedChangedMessages(t, st, 3)
+	setChangesWatermark(t, st, subSecondWatermark(st), ids...)
+
+	first := getChangesPage(t, srv, changesTarget("", 10))
+	require.Len(first.Messages, len(ids), "the archive fits in one page")
+
+	full := getChangesPage(t, srv, changesTarget("", 2))
+	require.True(full.HasMore, "a full page with rows behind it")
+
+	caughtUp := getChangesPage(t, srv, changesTarget(first.NextCursor, 10))
+	require.Empty(caughtUp.Messages, "an empty page")
+
+	firstEver := getChangesPage(t, srv, changesTarget("", 0))
+
+	empty, _ := newChangesServer(t)
+	emptyArchive := getChangesPage(t, empty, changesTarget("", 10))
+
+	for name, page := range map[string]ChangesResponse{
+		"a partial page":              first,
+		"a full page":                 full,
+		"an empty page":               caughtUp,
+		"a first request":             firstEver,
+		"a first request, no archive": emptyArchive,
+	} {
+		assert.NotEmptyf(page.NextCursor, "%s must hand back a cursor", name)
+	}
 }
 
 // TestChangesEndpoint_ReportsDeletedMessages: removals are changes. A consumer
@@ -712,7 +982,7 @@ func TestChangesEndpoint_ReportsDeletedMessages(t *testing.T) {
 	setChangesMessageTimestamp(t, st, removed, "deleted_from_source_at", removedAt)
 	settleChangesClock(t, srv)
 
-	resp := getChangesPage(t, srv, changesTarget("", 0, 10))
+	resp := getChangesPage(t, srv, changesTarget("", 10))
 	byID := make(map[int64]ChangedMessageJSON, len(resp.Messages))
 	for _, m := range resp.Messages {
 		byID[m.ID] = m
@@ -746,59 +1016,339 @@ func TestChangesEndpoint_UnavailableWhenStoreLacksSupport(t *testing.T) {
 	require.NotImplements((*ChangedMessageLister)(nil), srv.store,
 		"this test only means something with a store that lacks the feed")
 
-	w := doGet(srv, changesTarget("", 0, 0))
+	w := doGet(srv, changesTarget("", 0))
 
 	require.Equalf(http.StatusServiceUnavailable, w.Code, "body: %s", w.Body.String())
 	env := decodeErrorEnvelope(t, w)
 	assert.Equal("feature_unavailable", env.Error, "error code")
 }
 
+// stubArchiveUID is the identity every store double below reports. The feed
+// binds each cursor it issues to it, exactly as it does to a real archive's.
+const stubArchiveUID = "9a8b7c6d5e4f30211203f4e5d6c7b8a9"
+
+// stubArchiveIdentity gives a store double the archive identity the change feed
+// needs before it can read or issue a cursor. It is embedded rather than folded
+// into mockStore so that a double can still be built WITHOUT it — which is what
+// TestChangesEndpoint_UnavailableWhenTheStoreCannotIdentifyItsArchive needs.
+type stubArchiveIdentity struct{}
+
+func (stubArchiveIdentity) ArchiveUIDContext(context.Context) (string, error) {
+	return stubArchiveUID, nil
+}
+
 // stubChangedMessageLister answers the feed with a fixed page, so a handler test
 // can present a row no real store produces.
 type stubChangedMessageLister struct {
+	*mockStore
+	stubArchiveIdentity
+
+	page  store.ChangedMessagePage
+	calls int
+}
+
+func (s *stubChangedMessageLister) ListChangedMessages(
+	_ context.Context, _ store.ChangedMessagesCursor, _ int,
+) (store.ChangedMessagePage, error) {
+	s.calls++
+	return s.page, nil
+}
+
+// failingChangedMessageLister refuses the watermark query the way a real store
+// does — PostgreSQL refuses it outright when it has never seen every writer.
+type failingChangedMessageLister struct {
+	*mockStore
+	stubArchiveIdentity
+
+	err error
+}
+
+func (s *failingChangedMessageLister) ListChangedMessages(
+	_ context.Context, _ store.ChangedMessagesCursor, _ int,
+) (store.ChangedMessagePage, error) {
+	return store.ChangedMessagePage{}, s.err
+}
+
+// TestChangesEndpoint_StoreFailureIsA500WithTheDetailOnlyInTheLog pins where a
+// refused watermark query is reported. The store's own message names the remedy
+// (a PostgreSQL grant) and the database objects behind it, so it belongs in the
+// operator's log and not in a response any API client can read.
+func TestChangesEndpoint_StoreFailureIsA500WithTheDetailOnlyInTheLog(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	logs := &bytes.Buffer{}
+	const detail = "read watermark bounds: grant the msgvault role pg_read_all_stats"
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store: &failingChangedMessageLister{
+			mockStore: &mockStore{},
+			err:       errors.New(detail),
+		},
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	w := doGet(srv, changesTarget("", 10))
+
+	require.Equalf(http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("internal_error", env.Error, "error code")
+	assert.NotContains(w.Body.String(), "pg_read_all_stats",
+		"the store's message names database internals and an operator's remedy; a "+
+			"client that cannot act on either must not be handed them")
+	assert.Contains(logs.String(), detail,
+		"the operator has to be able to act on the failure, so the detail the "+
+			"response withholds must survive in the log")
+}
+
+func TestChangesEndpoint_MalformedWatermarkIsA500WithoutACursor(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewSQLiteTestStore(t)
+	id := seedChangedMessages(t, st, 1)[0]
+	setChangesWatermark(t, st, "1999-13-45 99:99:99.999", id)
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  st,
+		Logger: testLogger(),
+	})
+
+	w := doGet(srv, changesTarget("", 10))
+
+	require.Equalf(http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("internal_error", env.Error)
+	assert.NotContains(w.Body.String(), `"next_cursor"`,
+		"corrupt cursor state must stop the feed instead of publishing a synthetic position")
+}
+
+// TestChangesEndpoint_CanceledRequestIsNotReportedAsAServerFault covers the
+// branch beside the 500: a client that hangs up mid-query is not a fault of this
+// server, so it answers with the defined refusal and leaves the error log clean
+// for failures an operator can do something about.
+func TestChangesEndpoint_CanceledRequestIsNotReportedAsAServerFault(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	logs := &bytes.Buffer{}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store: &failingChangedMessageLister{
+			mockStore: &mockStore{},
+			err:       fmt.Errorf("list changed messages: %w", context.Canceled),
+		},
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	w := doGet(srv, changesTarget("", 10))
+
+	require.Equalf(http.StatusServiceUnavailable, w.Code, "body: %s", w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("query_canceled", env.Error, "error code")
+	assert.NotContains(logs.String(), "changed messages query failed",
+		"an abandoned request must not raise an error an operator will go looking "+
+			"for a cause of")
+}
+
+// unidentifiedChangedMessageLister can serve the feed but cannot say which
+// archive it is — the capability split ArchiveIdentifier exists to express.
+type unidentifiedChangedMessageLister struct {
 	*mockStore
 
 	page store.ChangedMessagePage
 }
 
-func (s *stubChangedMessageLister) ListChangedMessages(
-	_ context.Context, _ time.Time, _ int64, _ int,
+func (s *unidentifiedChangedMessageLister) ListChangedMessages(
+	_ context.Context, _ store.ChangedMessagesCursor, _ int,
 ) (store.ChangedMessagePage, error) {
 	return s.page, nil
 }
 
-// TestChangesEndpoint_UnreadableWatermarkDoesNotRewindTheCursor is the handler's
-// half of the same defence the store makes: whatever a store reports for a row's
-// watermark, the cursor the response publishes can never sit below the cursor
-// the request carried. A zero watermark reaching next_since tells the consumer
-// to resume from year 1, and it re-reads the whole archive on every poll from
-// then on.
-func TestChangesEndpoint_UnreadableWatermarkDoesNotRewindTheCursor(t *testing.T) {
+// TestChangesEndpoint_UnavailableWhenTheStoreCannotIdentifyItsArchive: a cursor
+// that names no archive is one any other archive will silently honour, so a
+// store that cannot identify itself gets the same defined refusal as one that
+// cannot serve the feed at all. Falling back to an unbound cursor would trade a
+// visible 503 for silent, undetectable data loss on the next restore.
+func TestChangesEndpoint_UnavailableWhenTheStoreCannotIdentifyItsArchive(t *testing.T) {
+	require := require.New(t)
 	assert := assert.New(t)
-	since := time.Date(2026, 3, 4, 5, 6, 7, 891011000, time.UTC)
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  &unidentifiedChangedMessageLister{mockStore: &mockStore{}},
+		Logger: testLogger(),
+	})
+	require.Implements((*ChangedMessageLister)(nil), srv.store,
+		"this test only means something with a store that CAN serve the feed")
+	require.NotImplements((*ArchiveIdentifier)(nil), srv.store,
+		"and that cannot identify its archive")
+
+	w := doGet(srv, changesTarget("", 10))
+
+	require.Equalf(http.StatusServiceUnavailable, w.Code, "body: %s", w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("feature_unavailable", env.Error, "error code")
+	assert.NotContains(w.Body.String(), `"next_cursor"`,
+		"an unbound cursor must never be published")
+}
+
+// erroringArchiveIdentity reports a store whose archive identity cannot be read
+// — a real state: ErrArchiveIdentityCorrupt means the identity migration ran but
+// its durable UID is gone.
+type erroringArchiveIdentity struct {
+	*mockStore
+
+	err error
+}
+
+func (s *erroringArchiveIdentity) ArchiveUIDContext(context.Context) (string, error) {
+	return "", s.err
+}
+
+func (s *erroringArchiveIdentity) ListChangedMessages(
+	_ context.Context, _ store.ChangedMessagesCursor, _ int,
+) (store.ChangedMessagePage, error) {
+	return store.ChangedMessagePage{}, nil
+}
+
+// TestChangesEndpoint_UnreadableArchiveIdentityIsA500WithTheDetailOnlyInTheLog:
+// the other loud failure. An identity that errors is a broken archive, not a
+// missing feature, so it is a 500 with the cause in the operator's log — and
+// again never a cursor bound to nothing.
+func TestChangesEndpoint_UnreadableArchiveIdentityIsA500WithTheDetailOnlyInTheLog(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	logs := &bytes.Buffer{}
+	const detail = "archive identity is corrupt: migration ledger is present but archive UID is missing"
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store: &erroringArchiveIdentity{
+			mockStore: &mockStore{},
+			err:       errors.New(detail),
+		},
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	w := doGet(srv, changesTarget("", 10))
+
+	require.Equalf(http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("internal_error", env.Error, "error code")
+	assert.NotContains(w.Body.String(), "migration ledger",
+		"the response must not carry the archive's internals")
+	assert.Contains(logs.String(), detail,
+		"the operator has to be able to act on a corrupt archive identity")
+	assert.NotContains(w.Body.String(), `"next_cursor"`,
+		"an unbound cursor must never be published")
+}
+
+// blockingArchiveIdentity holds the archive-identity lookup open until the test
+// releases it, which is what a saturated connection pool does to it: the lookup
+// waits for a connection, and nothing about waiting for a connection is bounded
+// by the request that is waiting on it.
+type blockingArchiveIdentity struct {
+	*mockStore
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingArchiveIdentity) ArchiveUIDContext(ctx context.Context) (string, error) {
+	close(s.entered)
+	select {
+	case <-s.release:
+		return stubArchiveUID, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (s *blockingArchiveIdentity) ListChangedMessages(
+	_ context.Context, _ store.ChangedMessagesCursor, _ int,
+) (store.ChangedMessagePage, error) {
+	return store.ChangedMessagePage{}, nil
+}
+
+// TestChangesEndpoint_CanceledRequestDoesNotBlockInArchiveIdentity covers the
+// step before the feed's context-aware query: resolving which archive the
+// cursor belongs to.
+//
+// The lookup receives the request context directly, so a saturated pool cannot
+// outlive both the client hanging up and the server's request timeout.
+func TestChangesEndpoint_CanceledRequestDoesNotBlockInArchiveIdentity(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	identity := &blockingArchiveIdentity{
+		mockStore: &mockStore{},
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	// Released whatever happens, so the blocked resolution never outlives the
+	// test even if the handler returns without it.
+	t.Cleanup(func() { close(identity.release) })
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  identity,
+		Logger: testLogger(),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, changesTarget("", 10), nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		srv.Router().ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-identity.entered:
+	case <-time.After(10 * time.Second):
+		require.FailNow("the handler never reached archive-identity resolution")
+	}
+	cancel()
+
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		require.FailNow(
+			"the handler is still blocked in archive-identity resolution after the " +
+				"request was cancelled; on a saturated pool that wait outlives the " +
+				"server's request timeout too")
+	}
+
+	require.Equalf(http.StatusServiceUnavailable, w.Code, "body: %s", w.Body.String())
+	env := decodeErrorEnvelope(t, w)
+	assert.Equal("query_canceled", env.Error,
+		"an abandoned request is not a server fault, so it gets the same defined "+
+			"refusal as one cancelled inside the feed query")
+}
+
+// TestChangesEndpoint_NoBoundPublishesNull pins the wire value of the state
+// complete_through has no instant for.
+func TestChangesEndpoint_NoBoundPublishesNull(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	srv := NewServerWithOptions(ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
 		Store: &stubChangedMessageLister{
 			mockStore: &mockStore{},
 			page: store.ChangedMessagePage{
-				// ContentChangedAt left zero: the shape a row whose stored value
-				// could not be parsed arrives in.
-				Messages:   []store.ChangedMessage{{ID: 42}},
-				ServerTime: since.Add(time.Second),
+				ServerTime: time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
+				// CompleteThrough left zero: no bound established yet.
 			},
 		},
 		Logger: testLogger(),
 	})
 
-	resp := getChangesPage(t, srv, changesTarget(since.Format(time.RFC3339Nano), 7, 10))
+	w := doGet(srv, changesTarget("", 10))
+	require.Equalf(http.StatusOK, w.Code, "body: %s", w.Body.String())
 
-	assert.Equal(since.Format(changesTimeLayout), resp.NextSince,
-		"next_since must be floored at the requested cursor, never rewound to the "+
-			"zero time")
-	assert.Equal(int64(42), resp.NextSinceID,
-		"next_since_id still comes from the last row, so flooring next_since back "+
-			"to the requested cursor does not also hand back the requested "+
-			"since_id of 7")
+	var raw map[string]json.RawMessage
+	require.NoError(json.Unmarshal(w.Body.Bytes(), &raw), "decode response object")
+	require.Contains(raw, "complete_through",
+		"complete_through is required, so the no-bound state must still carry it")
+	assert.JSONEq(`null`, string(raw["complete_through"]),
+		"no bound is a state, not the year-one instant")
 }
 
 // seedSparseChangedMessages inserts the two shapes whose JSON is mostly holes:
@@ -853,7 +1403,7 @@ func TestChangesEndpoint_PagesSatisfyTheGeneratedClientContract(t *testing.T) {
 		email, chat := seedSparseChangedMessages(t, st)
 		settleChangesClock(t, srv)
 
-		page := decodeGeneratedChangesPage(t, srv, changesTarget("", 0, 10))
+		page := decodeGeneratedChangesPage(t, srv, changesTarget("", 10))
 		require.NoError(page.Validate(),
 			"the generated client must accept an ordinary page: a live message has "+
 				"no deletion timestamps and a chat message has no subject")
@@ -880,12 +1430,12 @@ func TestChangesEndpoint_PagesSatisfyTheGeneratedClientContract(t *testing.T) {
 		require := require.New(t)
 		srv, _ := newChangesServer(t)
 
-		page := decodeGeneratedChangesPage(t, srv, changesTarget("", 0, 10))
+		page := decodeGeneratedChangesPage(t, srv, changesTarget("", 10))
 		require.NoError(page.Validate(),
-			"a caller that has never polled sends no cursor, so there is none to "+
-				"echo back and next_since is absent")
+			"a caller that has never polled still gets a cursor for the start of the "+
+				"archive, which is what makes next_cursor declarable as required")
 		assert.Empty(page.Messages, "messages")
-		assert.Nil(page.NextSince, "next_since")
+		assert.NotEmpty(page.NextCursor, "next_cursor")
 		assert.NotEmpty(page.ServerTime, "server_time is always a clock reading")
 	})
 }
@@ -952,16 +1502,17 @@ func TestChangesEndpoint_PublishesHowFarItIsComplete(t *testing.T) {
 	ids := seedChangedMessages(t, st, 2)
 	settleChangesClock(t, srv)
 
-	caughtUp := getChangesPage(t, srv, changesTarget("", 0, 10))
+	caughtUp := getChangesPage(t, srv, changesTarget("", 10))
 	require.Len(caughtUp.Messages, 2, "the seeded messages must be delivered first")
-	completeThrough, err := time.Parse(time.RFC3339Nano, caughtUp.CompleteThrough)
-	require.NoErrorf(err, "complete_through %q must parse as RFC3339", caughtUp.CompleteThrough)
+	caughtUpValue := changesCompleteThroughString(t, caughtUp)
+	completeThrough, err := time.Parse(time.RFC3339Nano, caughtUpValue)
+	require.NoErrorf(err, "complete_through %q must parse as RFC3339", caughtUpValue)
 	serverTime, err := time.Parse(time.RFC3339Nano, caughtUp.ServerTime)
 	require.NoErrorf(err, "server_time %q must parse as RFC3339", caughtUp.ServerTime)
 	assert.Falsef(completeThrough.After(serverTime),
 		"complete_through %s is after server_time %s: the feed cannot be complete "+
 			"through an instant the database clock has not reached",
-		caughtUp.CompleteThrough, caughtUp.ServerTime)
+		caughtUpValue, caughtUp.ServerTime)
 
 	// A writer stamps a change and holds its transaction open.
 	tx, err := st.DB().BeginTx(context.Background(), nil)
@@ -972,24 +1523,25 @@ func TestChangesEndpoint_PublishesHowFarItIsComplete(t *testing.T) {
 	require.NoError(err, "stamp the pending change")
 
 	held := getChangesPage(t, srv,
-		changesTarget(caughtUp.NextSince, caughtUp.NextSinceID, 10))
+		changesTarget(caughtUp.NextCursor, 10))
 	assert.Empty(held.Messages, "an uncommitted change must not be reported")
-	heldThrough, err := time.Parse(time.RFC3339Nano, held.CompleteThrough)
-	require.NoErrorf(err, "complete_through %q must parse as RFC3339", held.CompleteThrough)
+	heldValue := changesCompleteThroughString(t, held)
+	heldThrough, err := time.Parse(time.RFC3339Nano, heldValue)
+	require.NoErrorf(err, "complete_through %q must parse as RFC3339", heldValue)
 	heldServerTime, err := time.Parse(time.RFC3339Nano, held.ServerTime)
 	require.NoErrorf(err, "server_time %q must parse as RFC3339", held.ServerTime)
 	assert.Truef(heldServerTime.After(heldThrough),
 		"the clock reads %s and the feed claims to be complete through %s, with a "+
 			"write still pending: a held-back feed that publishes complete_through "+
 			"== server_time is telling a consumer it is caught up when it is not",
-		held.ServerTime, held.CompleteThrough)
+		held.ServerTime, heldValue)
 
 	require.NoError(tx.Commit(), "commit the pending change")
 	deadline := time.Now().Add(20 * time.Second)
 	var resumed ChangesResponse
 	for {
 		resumed = getChangesPage(t, srv,
-			changesTarget(held.NextSince, held.NextSinceID, 10))
+			changesTarget(held.NextCursor, 10))
 		if len(resumed.Messages) > 0 || time.Now().After(deadline) {
 			break
 		}
@@ -997,11 +1549,12 @@ func TestChangesEndpoint_PublishesHowFarItIsComplete(t *testing.T) {
 	}
 	require.Len(resumed.Messages, 1, "the committed change must arrive")
 	assert.Equal(ids[0], resumed.Messages[0].ID, "the changed message")
-	resumedThrough, err := time.Parse(time.RFC3339Nano, resumed.CompleteThrough)
-	require.NoErrorf(err, "complete_through %q must parse as RFC3339", resumed.CompleteThrough)
+	resumedValue := changesCompleteThroughString(t, resumed)
+	resumedThrough, err := time.Parse(time.RFC3339Nano, resumedValue)
+	require.NoErrorf(err, "complete_through %q must parse as RFC3339", resumedValue)
 	assert.Truef(resumedThrough.After(heldThrough),
 		"complete_through stayed at %s once the write finished: a bound that never "+
-			"recovers is a stalled feed, not a cautious one", resumed.CompleteThrough)
+			"recovers is a stalled feed, not a cautious one", resumedValue)
 }
 
 // TestChangesEndpoint_StalledFeedIsLogged is the operator's half of the same
@@ -1025,8 +1578,9 @@ func TestChangesEndpoint_StalledFeedIsLogged(t *testing.T) {
 		},
 		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
+	relaxChangeFeedRateLimit(t, srv)
 
-	resp := getChangesPage(t, srv, changesTarget("", 0, 10))
+	resp := getChangesPage(t, srv, changesTarget("", 10))
 	require.Empty(resp.Messages, "the stub serves an empty page")
 
 	assert.Contains(logs.String(), "message change feed is not advancing",
@@ -1038,7 +1592,7 @@ func TestChangesEndpoint_StalledFeedIsLogged(t *testing.T) {
 			"tell a momentary batch from a connection left open since Tuesday")
 
 	for range 5 {
-		getChangesPage(t, srv, changesTarget("", 0, 10))
+		getChangesPage(t, srv, changesTarget("", 10))
 	}
 	assert.Equal(1, strings.Count(logs.String(), "message change feed is not advancing"),
 		"consumers poll, so the condition is re-observed on every request; one "+
@@ -1054,9 +1608,10 @@ func TestChangesEndpoint_StalledFeedIsLogged(t *testing.T) {
 // free, which a restart during a bulk import produces. The page is correct (it
 // is complete through nothing, so it carries no rows and moves no cursor), but
 // subtracting year 1 from now saturates time.Duration, and the operator's
-// warning then reads "lag=2562047h47m17s", which looks like a corrupt clock
-// rather than a server that started a moment ago. The lag is not merely large
-// here; it is undefined, and the log has to say which of the two it is.
+// warning would then read "lag=2562047h47m16.854775807s" — the saturated value,
+// which Round(time.Second) cannot shorten — looking like a corrupt clock rather
+// than a server that started a moment ago. The lag is not merely large here; it
+// is undefined, and the log has to say which of the two it is.
 func TestChangesEndpoint_FeedWithNoBoundYetLogsAFiniteLag(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1073,7 +1628,7 @@ func TestChangesEndpoint_FeedWithNoBoundYetLogsAFiniteLag(t *testing.T) {
 		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 
-	resp := getChangesPage(t, srv, changesTarget("", 0, 10))
+	resp := getChangesPage(t, srv, changesTarget("", 10))
 	require.Empty(resp.Messages, "a feed with no bound can publish no rows")
 
 	assert.Contains(logs.String(), "message change feed is not advancing",
@@ -1094,11 +1649,11 @@ func TestChangesEndpoint_FeedWithNoBoundYetLogsAFiniteLag(t *testing.T) {
 //
 // It bounds what the feed is COMPLETE through, not what this response handed
 // over: when the page filled, everything between the last row and that instant
-// is still waiting behind next_since. The published wording used to say the
+// is still waiting behind next_cursor. The published wording used to say the
 // change had "been offered to you", and a consumer that believed it and set its
 // next cursor from complete_through skipped every one of those rows silently.
 // So the property is two-sided — the gap is real (a consumer must not treat the
-// bound as a cursor), and following next_since closes it completely.
+// bound as a cursor), and following next_cursor closes it completely.
 func TestChangesEndpoint_CompleteThroughIsAReachabilityBoundNotACursor(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1106,19 +1661,20 @@ func TestChangesEndpoint_CompleteThroughIsAReachabilityBoundNotACursor(t *testin
 	seeded := seedChangedMessages(t, st, 12)
 	settleChangesClock(t, srv)
 
-	first := getChangesPage(t, srv, changesTarget("", 0, 3))
+	first := getChangesPage(t, srv, changesTarget("", 3))
 	require.True(first.HasMore, "a page of 3 out of 12 must report more to come")
-	bound, err := time.Parse(time.RFC3339Nano, first.CompleteThrough)
-	require.NoErrorf(err, "complete_through %q must parse as RFC3339", first.CompleteThrough)
+	boundValue := changesCompleteThroughString(t, first)
+	bound, err := time.Parse(time.RFC3339Nano, boundValue)
+	require.NoErrorf(err, "complete_through %q must parse as RFC3339", boundValue)
 
 	below := countMessagesStampedBelow(t, st, bound)
 	assert.Greaterf(below, first.Count,
 		"complete_through %s stands above %d committed changes but the page carried "+
 			"%d: a consumer that resumed from the bound would skip the difference, "+
 			"which is why it must never be used as a cursor",
-		first.CompleteThrough, below, first.Count)
+		boundValue, below, first.Count)
 
-	// Following next_since instead is what the guarantee is actually about.
+	// Following next_cursor instead is what the guarantee is actually about.
 	delivered := map[int64]bool{}
 	page := first
 	for range 20 {
@@ -1128,14 +1684,14 @@ func TestChangesEndpoint_CompleteThroughIsAReachabilityBoundNotACursor(t *testin
 		if !page.HasMore {
 			break
 		}
-		page = getChangesPage(t, srv, changesTarget(page.NextSince, page.NextSinceID, 3))
+		page = getChangesPage(t, srv, changesTarget(page.NextCursor, 3))
 	}
 	assert.False(page.HasMore, "the walk must reach the end of the feed")
 	for _, id := range seeded {
 		assert.Truef(delivered[id],
 			"message %d was committed below the first page's complete_through (%s) and "+
-				"following next_since never produced it: the bound would then promise "+
-				"something the cursor does not deliver", id, first.CompleteThrough)
+				"following next_cursor never produced it: the bound would then promise "+
+				"something the cursor does not deliver", id, boundValue)
 	}
 }
 
@@ -1193,22 +1749,20 @@ func TestChangesEndpoint_FutureCursorClampsToTheCommitBoundNotTheClock(t *testin
 	})
 
 	future := serverTime.Add(time.Hour)
-	resp := getChangesPage(t, srv, changesTarget(future.Format(changesTimeLayout), 7, 10))
-
-	got, err := time.Parse(changesTimeLayout, resp.NextSince)
-	require.NoError(err, "next_since must parse")
+	resp := getChangesPage(t, srv, changesTarget(changesCursor(t, srv, future, 7), 10))
 
 	// Equality, not "not after". A merely-lower cursor is satisfied by the zero
 	// time, and an implementation that rewound the consumer to the start of the
 	// archive on every future cursor -- which this plan explicitly rejects --
-	// would pass a `not after` assertion while being badly wrong.
-	assert.Truef(got.Equal(completeThrough),
-		"the recovered cursor must be exactly the commit bound (%s), got %s; "+
-			"anything above it skips the change stamped at %s by the still-open "+
-			"writer, and anything below it replays the archive",
-		completeThrough, got, inFlightStamp)
-	assert.Equal(int64(0), resp.NextSinceID,
-		"the id tiebreak belonged to a different instant and must be reset")
+	// would pass a `not after` assertion while being badly wrong. The tiebreak
+	// resets with it: it belonged to a different instant.
+	require.Equal(changesInstantCursor(t, srv, completeThrough), resp.NextCursor,
+		"the recovered cursor must be exactly the commit bound (%s) with no "+
+			"tiebreak; anything above it skips the change stamped at %s by the "+
+			"still-open writer, and anything below it replays the archive",
+		completeThrough, inFlightStamp)
+	assert.NotEqual(changesCursor(t, srv, future, 7), resp.NextCursor,
+		"and it must not be the unsatisfiable cursor that was sent")
 }
 
 // TestChangesEndpoint_FutureCursorIsEchoedWhenNoBoundIsEstablished pins the one
@@ -1233,18 +1787,14 @@ func TestChangesEndpoint_FutureCursorIsEchoedWhenNoBoundIsEstablished(t *testing
 		Logger: testLogger(),
 	})
 
-	future := serverTime.Add(time.Hour)
-	sent := future.Format(changesTimeLayout)
-	// A nonzero tiebreak, so the echo is checked as a whole composite cursor.
-	// Resetting the id here would re-deliver the start of that instant on every
-	// poll, which the clamp branch accepts deliberately but this branch must not:
-	// nothing has been clamped, so there is nothing to re-deliver.
-	resp := getChangesPage(t, srv, changesTarget(sent, 7, 10))
+	// A nonzero tiebreak, so the echo is checked as a whole position. Resetting
+	// the id here would re-deliver the start of that instant on every poll, which
+	// the clamp branch accepts deliberately but this branch must not: nothing has
+	// been clamped, so there is nothing to re-deliver.
+	sent := changesCursor(t, srv, serverTime.Add(time.Hour), 7)
+	resp := getChangesPage(t, srv, changesTarget(sent, 10))
 
-	assert.Equal(sent, resp.NextSince,
-		"with no bound established the cursor must be echoed unchanged, not "+
-			"clamped to the clock and not reset to the zero time")
-	assert.Equal(int64(7), resp.NextSinceID,
-		"and its tiebreak must be echoed with it -- this branch clamps nothing, "+
-			"so resetting the id would re-deliver that instant on every poll")
+	assert.Equal(sent, resp.NextCursor,
+		"with no bound established the cursor must be echoed unchanged, tiebreak "+
+			"included: not clamped to the clock and not reset to the zero time")
 }

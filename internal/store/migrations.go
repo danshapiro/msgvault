@@ -21,6 +21,7 @@ const (
 	migrationMessageAttributionProvenance     = "message_attribution_provenance_v2"
 	migrationArchiveIdentity                  = "archive_identity_v1"
 	migrationMessagesContentChangedAtBackfill = "messages_content_changed_at_backfill"
+	migrationMessageWatermarkTriggers         = "message_watermark_triggers_v1"
 )
 
 func backfillLegacyMessageAttributionProvenance(
@@ -150,7 +151,8 @@ func backfillLegacyCalendarAttribution(
 			return fmt.Errorf("close legacy calendar attribution: %w", err)
 		}
 
-		if err := execInChunks(
+		if err := execInChunksContext(
+			ctx,
 			tx,
 			messageIDs,
 			nil,

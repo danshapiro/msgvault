@@ -194,7 +194,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	setStartupPhase("migrating archive schema")
 	logger.Info("daemon startup step", "step", "init_archive_schema")
-	if err := s.InitSchema(); err != nil {
+	// Under the signal-cancelled root context, not a background one: on an
+	// existing archive this step runs a one-time full-table backfill that can
+	// take hours, and it runs before the port is bound. With a background
+	// context SIGINT and SIGTERM reach the process and nothing happens — the
+	// backfill and its open transaction carry on, and the operator's only
+	// remaining move is SIGKILL on a writing process. Cancelling here stops it
+	// at the next batch boundary, keeps every batch already committed, and
+	// leaves the migration unmarked so the next start resumes.
+	if err := s.InitSchemaContext(cmd.Context()); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
 	logger.Info("daemon startup step complete", "step", "init_archive_schema")
@@ -881,10 +889,13 @@ var _ api.CLIDedupDeleteStore = (*storeAPIAdapter)(nil)
 var _ api.ContextCLIDedupDeleteStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityLinkStore = (*storeAPIAdapter)(nil)
 var _ api.PersonProfileStore = (*storeAPIAdapter)(nil)
+var _ api.AttributeDefinitionStore = (*storeAPIAdapter)(nil)
+var _ api.PersonAttributeStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityCacheRefresher = (*storeAPIAdapter)(nil)
 var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
 var _ api.ChangedMessageLister = (*storeAPIAdapter)(nil)
+var _ api.ArchiveIdentifier = (*storeAPIAdapter)(nil)
 
 func (a *storeAPIAdapter) ConversationExistsContext(ctx context.Context, conversationID int64) (bool, error) {
 	return a.store.ConversationExistsContext(ctx, conversationID)
@@ -904,9 +915,18 @@ func (a *storeAPIAdapter) GetConversationWindowContext(
 // without this method the route's optional-interface check fails and the
 // endpoint reports itself unavailable on every production request.
 func (a *storeAPIAdapter) ListChangedMessages(
-	ctx context.Context, since time.Time, sinceID int64, limit int,
+	ctx context.Context, since store.ChangedMessagesCursor, limit int,
 ) (store.ChangedMessagePage, error) {
-	return a.store.ListChangedMessages(ctx, since, sinceID, limit)
+	return a.store.ListChangedMessages(ctx, since, limit)
+}
+
+// ArchiveUIDContext exposes the archive's durable identity to the API server, which
+// binds every change-feed cursor to it so a cursor cannot be resumed against a
+// different archive. Same reason as ListChangedMessages above: the daemon
+// passes this adapter, not *store.Store, so without this method the route
+// reports itself unavailable on every production request.
+func (a *storeAPIAdapter) ArchiveUIDContext(ctx context.Context) (string, error) {
+	return a.store.ArchiveUIDContext(ctx)
 }
 
 func (a *storeAPIAdapter) GetStats() (*api.StoreStats, error) {
@@ -1076,8 +1096,9 @@ func (a *storeAPIAdapter) runCLISyncWithRunner(
 	}, emitWarning)
 }
 
-// emitFolderArgs appends a --folders/<--skip-folders> flag for each
-// element in values, e.g. "--folders Inbox --folders Archive".
+// emitFolderArgs appends a --folder/--skip-folder flag for each
+// element in values, e.g. "--folder Inbox --folder Archive".
+
 func emitFolderArgs(args []string, flag string, values []string) []string {
 	for _, v := range values {
 		args = append(args, flag, v)
@@ -1103,16 +1124,16 @@ func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 		if req.Limit > 0 {
 			args = append(args, "--limit", strconv.Itoa(req.Limit))
 		}
-		args = emitFolderArgs(args, "--folders", req.Folders)
-		args = emitFolderArgs(args, "--skip-folders", req.SkipFolders)
+		args = emitFolderArgs(args, "--folder", req.Folders)
+		args = emitFolderArgs(args, "--skip-folder", req.SkipFolders)
 		if req.Email != "" {
 			args = append(args, req.Email)
 		}
 		return args
 	}
 	args := []string{syncIncrementalCmd.Name()}
-	args = emitFolderArgs(args, "--folders", req.Folders)
-	args = emitFolderArgs(args, "--skip-folders", req.SkipFolders)
+	args = emitFolderArgs(args, "--folder", req.Folders)
+	args = emitFolderArgs(args, "--skip-folder", req.SkipFolders)
 	if req.Email != "" {
 		args = append(args, req.Email)
 	}
@@ -1611,6 +1632,60 @@ func (a *storeAPIAdapter) PersonForParticipantsContext(
 	ctx context.Context, participantIDs []int64,
 ) (*store.Person, error) {
 	return a.store.PersonForParticipantsContext(ctx, participantIDs)
+}
+
+func (a *storeAPIAdapter) ListAttributeDefinitionsContext(
+	ctx context.Context, filter store.AttributeDefinitionFilter,
+) ([]store.AttributeDefinition, error) {
+	return a.store.ListAttributeDefinitionsContext(ctx, filter)
+}
+
+func (a *storeAPIAdapter) GetAttributeDefinitionContext(
+	ctx context.Context, id int64,
+) (*store.AttributeDefinition, error) {
+	return a.store.GetAttributeDefinitionContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) GetAttributeDefinitionBySlugContext(
+	ctx context.Context, objectType store.AttributeObjectType, slug string,
+) (*store.AttributeDefinition, error) {
+	return a.store.GetAttributeDefinitionBySlugContext(ctx, objectType, slug)
+}
+
+func (a *storeAPIAdapter) CreateAttributeDefinitionContext(
+	ctx context.Context, input store.AttributeDefinitionInput,
+) (*store.AttributeDefinition, error) {
+	return a.store.CreateAttributeDefinitionContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) UpdateAttributeDefinitionContext(
+	ctx context.Context, id, expectedRevision int64, update store.AttributeDefinitionUpdate,
+) (*store.AttributeDefinition, error) {
+	return a.store.UpdateAttributeDefinitionContext(ctx, id, expectedRevision, update)
+}
+
+func (a *storeAPIAdapter) DeleteAttributeDefinitionContext(
+	ctx context.Context, id, expectedRevision int64,
+) error {
+	return a.store.DeleteAttributeDefinitionContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) ListPersonAttributeValuesContext(
+	ctx context.Context, personID int64, query store.PersonAttributeQuery,
+) ([]store.PersonAttributeValue, error) {
+	return a.store.ListPersonAttributeValuesContext(ctx, personID, query)
+}
+
+func (a *storeAPIAdapter) SetPersonAttributeValueContext(
+	ctx context.Context, input store.PersonAttributeValueInput,
+) (*store.PersonAttributeWrite, error) {
+	return a.store.SetPersonAttributeValueContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) SupersedePersonAttributeValueContext(
+	ctx context.Context, input store.PersonAttributeSupersedeInput,
+) (*store.PersonAttributeWrite, error) {
+	return a.store.SupersedePersonAttributeValueContext(ctx, input)
 }
 
 func (a *storeAPIAdapter) ClusterMembers(id int64) ([]int64, error) {

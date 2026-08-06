@@ -50,16 +50,17 @@ func changesFeedTime(t *testing.T, value string) time.Time {
 // settleChangesFeed returns the first page whose bound has left every watermark
 // written so far. The feed withholds the instant it is bounded at -- that instant
 // can still receive commits -- so a test that seeds a row and then expects to see
-// it has to let the bound move past it. Mirrors settleChangesClock
-// (internal/api/changes_test.go:182), over HTTP, because that helper is
-// unexported in package api and this test is package cmd.
+// it has to let the bound move past it. Mirrors settleChangesClock in
+// internal/api/changes_test.go, over HTTP, because that helper is unexported in
+// package api and this test is package cmd. Named rather than pointed at by
+// line, so the reference cannot rot.
 func settleChangesFeed(t *testing.T, baseURL string) api.ChangesResponse {
 	t.Helper()
 	start := changesFeedTime(t, changesPage(t, baseURL).ServerTime)
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		page := changesPage(t, baseURL)
-		if changesFeedTime(t, page.CompleteThrough).After(start) {
+		if page.CompleteThrough != nil && changesFeedTime(t, *page.CompleteThrough).After(start) {
 			return page
 		}
 		if time.Now().After(deadline) {
@@ -112,5 +113,5 @@ func TestChangesEndpointServesThroughTheProductionAdapter(t *testing.T) {
 
 	require.Len(page.Messages, 1, "the archive's one message must appear in the feed")
 	assert.Equal(msgID, page.Messages[0].ID, "and it must be the message that was inserted")
-	assert.NotEmpty(page.NextSince, "a page carrying rows must hand back a cursor")
+	assert.NotEmpty(page.NextCursor, "a page carrying rows must hand back a cursor")
 }

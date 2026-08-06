@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"github.com/stretchr/testify/assert"
@@ -131,11 +132,12 @@ func TestGeneratedFileMetadataRequiresPresenceButAcceptsEmptyLegacyStrings(t *te
 // distinction the file-metadata models above are held to.
 //
 // A row of that feed omits every column it has nothing to say about: a live
-// message carries no deletion timestamps, a chat message carries no subject,
-// snippet, or platform id, and the first poll of an empty archive has no cursor
-// to echo. Declaring any of those required in the OpenAPI document makes this
-// validator reject them — required here means non-nil AND non-empty — so the
-// published client would refuse the server's ordinary successful responses.
+// message carries no deletion timestamps, and a chat message carries no subject,
+// snippet, or platform id. Declaring any of those required in the OpenAPI
+// document makes this validator reject them — required here means non-nil AND
+// non-empty — so the published client would refuse the server's ordinary
+// successful responses. next_cursor is the other side of that rule: the server
+// publishes one on every page, empty ones included, so it can be required.
 func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
 	const liveEmail = `{
 		"messages":[{
@@ -154,8 +156,7 @@ func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
 		}],
 		"count":1,
 		"has_more":false,
-		"next_since":"2026-07-26T10:00:00.731123Z",
-		"next_since_id":918,
+		"next_cursor":"1.eyJ0IjoiMjAyNi0wNy0yNlQxMDowMDowMC43MzExMjNaIiwiaSI6OTE4fQ",
 		"server_time":"2026-07-26T10:00:03.114500Z",
 		"complete_through":"2026-07-26T10:00:03.114488Z"
 	}`
@@ -193,8 +194,7 @@ func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
 			}],
 			"count":1,
 			"has_more":false,
-			"next_since":"2026-07-26T10:00:00.731123Z",
-			"next_since_id":7,
+			"next_cursor":"1.eyJ0IjoiMjAyNi0wNy0yNlQxMDowMDowMC43MzExMjNaIiwiaSI6N30",
 			"server_time":"2026-07-26T10:00:03.114500Z",
 			"complete_through":"2026-07-26T10:00:03.114488Z"
 		}`), &page))
@@ -208,23 +208,29 @@ func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
 		assertions.Nil(row.SourceMessageID, "source_message_id")
 	})
 
-	t.Run("empty archive page carries no cursor", func(t *testing.T) {
+	t.Run("empty archive page still carries a cursor", func(t *testing.T) {
 		assertions := assert.New(t)
 		requirements := require.New(t)
-		var page generated.ChangesResponse
-		requirements.NoError(json.Unmarshal([]byte(`{
+		const emptyArchive = `{
 			"messages":[],
 			"count":0,
 			"has_more":false,
-			"next_since_id":0,
+			"next_cursor":"1.eyJ0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpIjowfQ",
 			"server_time":"2026-07-26T10:00:03.114500Z",
 			"complete_through":"2026-07-26T10:00:03.114488Z"
-		}`), &page))
+		}`
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(emptyArchive), &page))
 		requirements.NoError(page.Validate(),
-			"a first poll of an empty archive has no last row and no request cursor "+
-				"to echo, so next_since is absent")
+			"a first poll of an empty archive has no last row, but it still hands "+
+				"back the position the caller is standing at")
 		assertions.Empty(page.Messages, "messages")
-		assertions.Nil(page.NextSince, "next_since")
+		assertions.NotEmpty(page.NextCursor, "next_cursor")
+
+		page.NextCursor = ""
+		requirements.Error(page.Validate(),
+			"next_cursor is what a consumer sends back; a page without one leaves it "+
+				"nothing to hold its place with, so required must mean non-empty here")
 	})
 
 	t.Run("a missing watermark is still rejected", func(t *testing.T) {
@@ -232,43 +238,65 @@ func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
 		var page generated.ChangesResponse
 		requirements.NoError(json.Unmarshal([]byte(liveEmail), &page))
 		requirements.Len(page.Messages, 1)
-		page.Messages[0].ContentChangedAt = ""
+		page.Messages[0].ContentChangedAt = time.Time{}
 		requirements.Error(page.Validate(),
-			"content_changed_at is the cursor: a row without it cannot be resumed "+
-				"from, so loosening the other fields must not loosen this one")
-		page.Messages[0].ContentChangedAt = "2026-07-26T10:00:00.731123Z"
-		page.ServerTime = ""
+			"content_changed_at is the row's watermark: it is what the feed orders "+
+				"by, so loosening the other fields must not loosen this one")
+		page.Messages[0].ContentChangedAt = time.Date(
+			2026, 7, 26, 10, 0, 0, 731123000, time.UTC)
+		page.ServerTime = time.Time{}
 		requirements.Error(page.Validate(),
 			"server_time is always a database clock reading")
-		page.ServerTime = "2026-07-26T10:00:03.114500Z"
-		page.CompleteThrough = ""
-		requirements.Error(page.Validate(),
-			"complete_through tells a consumer how far the feed is caught up; without "+
-				"it a feed held back by an open write transaction is indistinguishable "+
-				"from a caught-up one")
+		page.ServerTime = time.Date(2026, 7, 26, 10, 0, 3, 114500000, time.UTC)
+		page.CompleteThrough = nil
+		requirements.NoError(page.Validate(),
+			"a nil complete_through represents the valid no-bound state")
+	})
+
+	t.Run("timestamps are typed and no bound is nullable", func(t *testing.T) {
+		requirements := require.New(t)
+		assertions := assert.New(t)
+
+		var noBoundYet generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(`{
+			"messages":[],
+			"count":0,
+			"has_more":false,
+			"next_cursor":"1.eyJ0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpIjowfQ",
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":null
+		}`), &noBoundYet))
+		requirements.NoError(noBoundYet.Validate(),
+			"a server with no commit bound must still decode and validate")
+		assertions.Nil(noBoundYet.CompleteThrough)
 	})
 }
 
-// TestListChangedMessagesRoundTripsASubSecondCursor covers the half of the
-// change feed's client contract the response-model test above cannot reach:
-// that the generated client builds the request the server accepts, and that a
-// cursor survives the trip out through the generated query parameters with its
-// sub-second precision intact.
+// TestListChangedMessagesRoundTripsTheCursorVerbatim covers the half of the
+// change feed's client contract the response-model test above cannot reach: that
+// the generated client builds the request the server accepts, and that the
+// cursor survives the trip out through the generated query parameters byte for
+// byte.
 //
-// The feed's cursor carries the database's full sub-second resolution and the
-// consumer is told to send it back verbatim. A cursor truncated to whole
-// seconds on the way out sits below the watermark of the page it came from, so
-// the consumer is handed that same page on every poll, forever; one rounded the
-// other way steps over whatever was stamped in between. Neither shows up in the
-// response model — only in the query string. So this walks the loop a consumer
-// walks, taking next_since from one page and sending it as the next request,
-// and asserts on what the client actually put on the wire.
-func TestListChangedMessagesRoundTripsASubSecondCursor(t *testing.T) {
+// The cursor is opaque, so the client has no way to repair one it damaged: a
+// token altered on the way out is not a cursor this server issued and comes back
+// 400, and one silently dropped restarts the consumer at the beginning of the
+// archive. Neither shows up in the response model — only in the query string. So
+// this walks the loop a consumer walks, taking next_cursor from one page and
+// sending it as the next request, and asserts on what the client actually put on
+// the wire.
+func TestListChangedMessagesRoundTripsTheCursorVerbatim(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	const cursor = "2026-07-26T10:00:00.731123Z"
-	const cursorID = int64(918)
+	const watermark = "2026-07-26T10:00:00.731123Z"
+	// An opaque token shaped like the ones the server issues, carrying the
+	// sub-second watermark above and the id below. It is NOT one this server
+	// would accept — it names no archive, and today's server rejects a cursor
+	// that does not — which costs this test nothing: what it exercises is the
+	// generated client's query-parameter round trip, and what matters is that
+	// this exact string comes back off the wire.
+	const cursor = "1.eyJ0IjoiMjAyNi0wNy0yNlQxMDowMDowMC43MzExMjNaIiwiaSI6OTE4fQ"
 
 	var gotMethod, gotPath string
 	var gotQuery url.Values
@@ -277,7 +305,7 @@ func TestListChangedMessagesRoundTripsASubSecondCursor(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{
 			"messages":[{
-				"id":%d,
+				"id":918,
 				"source_id":1,
 				"conversation_id":44,
 				"message_type":"email",
@@ -289,19 +317,18 @@ func TestListChangedMessagesRoundTripsASubSecondCursor(t *testing.T) {
 			}],
 			"count":1,
 			"has_more":false,
-			"next_since":%q,
-			"next_since_id":%d,
+			"next_cursor":%q,
 			"server_time":"2026-07-26T10:00:03.114500Z",
 			"complete_through":"2026-07-26T10:00:03.114488Z"
-		}`, cursorID, cursor, cursor, cursorID)
+		}`, watermark, cursor)
 	}))
 	t.Cleanup(server.Close)
 
 	c, err := New(server.URL)
 	require.NoError(err, "New")
 
-	// First poll: a consumer with no cursor yet. Sending since= or since_id=0
-	// would be a different request than omitting them, so the client must omit.
+	// First poll: a consumer with no cursor yet. Sending cursor= would be a
+	// different request than omitting it, so the client must omit.
 	limit := int64(100)
 	first, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
 		Query: &generated.ListChangedMessagesQuery{Limit: &limit},
@@ -310,33 +337,121 @@ func TestListChangedMessagesRoundTripsASubSecondCursor(t *testing.T) {
 	assert.Equal(http.MethodGet, gotMethod, "method")
 	assert.Equal("/api/v1/messages/changes", gotPath, "path")
 	assert.Equal("100", gotQuery.Get("limit"), "limit query")
-	assert.NotContains(gotQuery, "since", "an absent cursor must not be sent as an empty one")
-	assert.NotContains(gotQuery, "since_id", "an absent tiebreak must not be sent as a zero one")
+	assert.NotContains(gotQuery, "cursor", "an absent cursor must not be sent as an empty one")
 
 	require.NotNil(first, "first page")
-	require.NotNil(first.NextSince, "next_since")
-	assert.Equal(cursor, *first.NextSince,
-		"the decoded cursor must keep every digit the server published")
-	assert.Equal(cursorID, first.NextSinceID, "next_since_id")
+	assert.Equal(cursor, first.NextCursor, "the cursor must decode exactly as published")
 	require.Len(first.Messages, 1, "messages")
-	assert.Equal(cursor, first.Messages[0].ContentChangedAt, "the row's watermark")
+	wantWatermark, err := time.Parse(time.RFC3339Nano, watermark)
+	require.NoError(err)
+	assert.Equal(wantWatermark, first.Messages[0].ContentChangedAt, "the row's watermark")
 
 	// Second poll: the response fed straight back, exactly as the docs tell a
 	// consumer to do it.
 	second, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
 		Query: &generated.ListChangedMessagesQuery{
-			Since:   first.NextSince,
-			SinceID: &first.NextSinceID,
-			Limit:   &limit,
+			Cursor: &first.NextCursor,
+			Limit:  &limit,
 		},
 	})
 	require.NoError(err, "ListChangedMessages second poll")
-	assert.Equal(cursor, gotQuery.Get("since"),
-		"the cursor reached the wire truncated or reformatted: a consumer that "+
-			"sends it back no longer resumes where the page ended")
-	assert.Equal("918", gotQuery.Get("since_id"), "since_id query")
+	assert.Equal(cursor, gotQuery.Get("cursor"),
+		"the cursor reached the wire altered: a token this server did not issue is "+
+			"rejected, so a consumer that sends it back can no longer resume at all")
 	assert.Equal("100", gotQuery.Get("limit"), "limit query")
 	require.NotNil(second, "second page")
+}
+
+// TestListChangedMessagesDecodesTheDocumentedErrors covers the half of the
+// contract the success paths cannot: the responses a consumer has to act on
+// differently from one another.
+//
+// The feed answers 400 for a cursor it cannot use, 401 without a usable key,
+// 429 when the caller has outrun the rate limiter, 500 when the watermark query
+// fails, and 503 where the configured store cannot serve the feed at all. Only
+// the first is recoverable, and only by restarting the sync from the beginning
+// of the archive, so a consumer has to tell it apart from the ones it should
+// retry — which means reading the `error` code out of the body. A generated
+// client that models only 200 and 500 hands back an opaque status and leaves
+// every consumer to decode the body by hand, so the codes are pinned here
+// against the client the repository actually ships.
+//
+// 429 matters most to this endpoint of all of them: a consumer of an
+// invalidation feed polls, and polling is what the limiter exists to catch.
+func TestListChangedMessagesDecodesTheDocumentedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		code    string
+		message string
+		body    func(*generated.ListChangedMessagesResp) *generated.ErrorResponse
+	}{
+		{
+			name:    "an unusable cursor",
+			status:  http.StatusBadRequest,
+			code:    "invalid_cursor",
+			message: "cursor was issued for a different archive",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON400 },
+		},
+		{
+			name:    "a missing or rejected key",
+			status:  http.StatusUnauthorized,
+			code:    "unauthorized",
+			message: "API key required",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON401 },
+		},
+		{
+			name:    "a caller that has outrun the rate limiter",
+			status:  http.StatusTooManyRequests,
+			code:    "rate_limit_exceeded",
+			message: "Too many requests. Please slow down.",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON429 },
+		},
+		{
+			name:    "a watermark query that failed",
+			status:  http.StatusInternalServerError,
+			code:    "internal_error",
+			message: "Message change query failed",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON500 },
+		},
+		{
+			name:    "a store that cannot serve the feed",
+			status:  http.StatusServiceUnavailable,
+			code:    "feature_unavailable",
+			message: "The configured store cannot serve the message change feed",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON503 },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprintf(w, `{"error":%q,"message":%q}`, tc.code, tc.message)
+			}))
+			t.Cleanup(server.Close)
+
+			c, err := New(server.URL)
+			require.NoError(err, "New")
+
+			resp, err := c.ListChangedMessagesWithResponse(
+				context.Background(), &generated.ListChangedMessagesRequestOptions{})
+			require.Error(err, "an error status must be reported as an error")
+			require.NotNil(resp, "the response is what carries the decoded body")
+			assert.Equal(tc.status, resp.StatusCode, "status code")
+
+			decoded := tc.body(resp)
+			require.NotNilf(decoded, "the client must decode the %d body: without it a "+
+				"consumer cannot tell a cursor it must abandon from a condition it should "+
+				"retry", tc.status)
+			assert.Equal(tc.code, decoded.ErrorData,
+				"the error code is what a consumer branches on")
+			require.NotNil(decoded.Message, "message")
+			assert.Equal(tc.message, *decoded.Message, "message")
+		})
+	}
 }
 
 func TestGeneratedGetAttachmentContentReturnsBinaryBytes(t *testing.T) {

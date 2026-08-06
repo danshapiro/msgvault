@@ -52,9 +52,9 @@ func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 // It is a clock, not a sequence: PostgreSQL guarantees neither that successive
 // readings differ nor that they only move forward. Ties the
 // (content_changed_at, id) cursor breaks by id. Backward movement it cannot
-// repair — a cursor only advances — and what that costs a consumer is
-// enumerated, with every other exception to what the feed delivers, in one
-// place: docs/api-server.md's delivery contract.
+// repair — a cursor only advances — and what that costs a consumer is written
+// up with the feed's other exceptions in docs/api-server.md, rather than
+// restated here.
 func (d *PostgreSQLDialect) ContentChangedNow() string { return "clock_timestamp()" }
 
 // TimestampParam returns t unchanged (as UTC): PostgreSQL's TIMESTAMPTZ
@@ -160,9 +160,8 @@ func (d *PostgreSQLDialect) TimestampParam(t time.Time) any { return t.UTC() }
 // One residual is known and not covered: a PREPARED transaction holds its locks
 // with pg_locks.pid NULL, so the join drops it from both halves. It needs
 // max_prepared_transactions > 0, which is off by default and which msgvault
-// never uses. What that costs a consumer, alongside every other exception to
-// what the feed delivers, is enumerated in one place: docs/api-server.md's
-// delivery contract.
+// never uses. What that costs a consumer is written up with the feed's other
+// exceptions in docs/api-server.md, rather than restated here.
 const pgWriteLockModes = `('RowExclusiveLock', 'ShareRowExclusiveLock', ` +
 	`'ExclusiveLock', 'AccessExclusiveLock')`
 
@@ -244,8 +243,21 @@ func (d *PostgreSQLDialect) visibilityFloor(
 	d.visibilityMu.Lock()
 	defer d.visibilityMu.Unlock()
 	if redacted == 0 {
-		d.fullyVisibleBound = bound
-		d.fullyVisibleAt = statementStart
+		// Recorded only if this reading is NEWER than the one already held.
+		// Concurrent pages read the bound at once and finish in whatever order
+		// the pool gives them, so without the comparison a reading that started
+		// first and finished last would overwrite a newer one and move the floor
+		// backwards — and the next redacted reading would publish a
+		// complete_through the feed had already passed. Each reading carries the
+		// instant its own transaction started, which is when it was taken, so
+		// that is what they are ordered by. A lower floor is never unsafe (a
+		// bound safe once is safe forever, see below); it is just stale, and
+		// making the published bound regress for no reason is not something to
+		// leave to timing.
+		if statementStart.After(d.fullyVisibleAt) {
+			d.fullyVisibleBound = bound
+			d.fullyVisibleAt = statementStart
+		}
 		return bound, nil
 	}
 	if bound.Before(d.fullyVisibleBound) {
@@ -474,10 +486,13 @@ func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 
 // FTSAvailable reports whether tsvector search is available.
 // PostgreSQL always supports tsvector — check that the column exists.
-func (d *PostgreSQLDialect) FTSAvailable(db *sql.DB) bool {
+func (d *PostgreSQLDialect) FTSAvailable(ctx context.Context, db *sql.DB) (bool, error) {
 	var count int
-	err := db.QueryRow(postgresColumnExistsSQL("messages", "search_fts")).Scan(&count)
-	return err == nil && count > 0
+	err := db.QueryRowContext(ctx, postgresColumnExistsSQL("messages", "search_fts")).Scan(&count)
+	if err != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return err == nil && count > 0, nil
 }
 
 func postgresFTSNeedsBackfillSQL() string {
@@ -632,6 +647,8 @@ func (d *PostgreSQLDialect) EnsureFTSIndex(q querier) error {
 	return nil
 }
 
+func (d *PostgreSQLDialect) ValidateMessageWatermarks(querier) error { return nil }
+
 // EnsureTriggers creates the maintenance triggers for BOTH message watermarks
 // idempotently. The two answer different questions and are deliberately scoped
 // differently.
@@ -676,7 +693,7 @@ func (d *PostgreSQLDialect) EnsureFTSIndex(q querier) error {
 //     messages): UPDATE OF scopes it to the columns a statement NAMES, which
 //     is not enough on its own — UpsertMessage's ON CONFLICT DO UPDATE
 //     re-assigns ten content columns on every re-sync of a known message — so
-//     ContentChangedValueGuard additionally requires one of them to have
+//     contentChangedValueGuard additionally requires one of them to have
 //     actually changed value. IS DISTINCT FROM makes that comparison null-safe
 //     in both directions.
 //   - trg_message_bodies_content_changed_ins / _upd (AFTER INSERT / AFTER
@@ -694,8 +711,8 @@ func (d *PostgreSQLDialect) EnsureFTSIndex(q querier) error {
 // the querier so InitSchema can route it through the maintenance transaction
 // (consistent with EnsureFTSIndex).
 func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
-	cols := ContentChangedTriggerColumnList()
-	guard := ContentChangedValueGuard("IS DISTINCT FROM")
+	cols := contentChangedTriggerColumnList()
+	guard := contentChangedValueGuard("IS DISTINCT FROM")
 	now := d.ContentChangedNow()
 	stmts := []string{
 		`CREATE OR REPLACE FUNCTION set_messages_last_modified() RETURNS trigger AS $$

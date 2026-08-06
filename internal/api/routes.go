@@ -213,6 +213,8 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	s.registerExploreRoutes(apiV1)
 	s.registerFilesRoutes(apiV1)
 	s.registerPersonProfileRoutes(apiV1)
+	s.registerAttributeDefinitionRoutes(apiV1)
+	s.registerPersonAttributeRoutes(apiV1)
 	s.registerPeopleRoutes(apiV1)
 	s.registerRelationshipRoutes(apiV1)
 	s.registerIdentityLinkRoutes(apiV1)
@@ -342,7 +344,27 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRoute[AggregateResponse](apiV1, "getAggregates", http.MethodGet, "/aggregates", "Get aggregate rows", s.handleAggregates)
 	registerAPIV1RawHumaJSONRoute[AggregateResponse](apiV1, "getSubAggregates", http.MethodGet, "/aggregates/sub", "Get nested aggregate rows", s.handleSubAggregates)
 	registerAPIV1RawHumaJSONRoute[FilteredMessagesResponse](apiV1, "filterMessages", http.MethodGet, "/messages/filter", "List filtered messages", s.handleFilteredMessages)
-	registerAPIV1RawHumaJSONRoute[ChangesResponse](apiV1, "listChangedMessages", http.MethodGet, "/messages/changes", "List messages whose content changed since a cursor", s.handleMessageChanges)
+	// The change feed's error statuses are contract, not incident: a 400 means
+	// a cursor the consumer must abandon, while 401, 429, 500 and 503 are
+	// conditions to retry from the same cursor. Declaring them keeps that
+	// distinction in the generated client rather than in every consumer's
+	// hand-written decode.
+	//
+	// 429 is on the list because it is not the handler's to raise and is
+	// reached anyway: every request passes this endpoint's dedicated limiter,
+	// including trusted loopback traffic, because its whole usage pattern is
+	// polling. Undeclared, the generated
+	// client reports it as an unexpected status and drops the body a consumer
+	// needs to tell "slow down" from "give up on this cursor".
+	registerAPIV1RawHumaJSONRouteWithErrors[ChangesResponse](
+		apiV1, "listChangedMessages", http.MethodGet, "/messages/changes",
+		"List messages whose content changed since a cursor", s.changeFeedGuard(s.handleMessageChanges),
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusServiceUnavailable,
+	)
 	registerAPIV1RawHumaJSONRoute[GmailIDsResponse](apiV1, "getGmailIDsByFilter", http.MethodGet, "/messages/gmail-ids", "List Gmail message IDs matching a filter", s.handleGmailIDsByFilter)
 	registerAPIV1RawHumaJSONRoute[TotalStatsResponse](apiV1, "getTotalStats", http.MethodGet, "/stats/total", "Get aggregate totals", s.handleTotalStats)
 	registerAPIV1RawHumaJSONRoute[FilteredMessagesResponse](apiV1, "searchMessagesByDomains", http.MethodGet, "/search/domains", "Search messages by participant domains", s.handleSearchByDomains)
@@ -391,6 +413,29 @@ func registerAPIV1RawHumaJSONRoute[T any](
 ) {
 	op := rawAPIV1Operation(operationID, method, path, summary)
 	op.Responses = jsonResponsesFor[T](api, successStatuses...)
+	registerRawHumaRoute(api, op, handler)
+}
+
+// registerAPIV1RawHumaJSONRouteWithErrors is registerAPIV1RawHumaJSONRoute for
+// an endpoint whose error statuses are part of its published contract rather
+// than incidental. Declaring them makes the generated client model each one, so
+// a consumer can branch on the `error` code in the body instead of decoding it
+// by hand off an opaque status; the catch-all `default` response stays, so a
+// status not listed here still decodes as an error.
+func registerAPIV1RawHumaJSONRouteWithErrors[T any](
+	api huma.API,
+	operationID string,
+	method string,
+	path string,
+	summary string,
+	handler http.HandlerFunc,
+	errorStatuses ...int,
+) {
+	op := rawAPIV1Operation(operationID, method, path, summary)
+	op.Responses = jsonResponsesFor[T](api)
+	for _, status := range errorStatuses {
+		op.Responses[httpStatusKey(status)] = errorResponseFor(api)
+	}
 	registerRawHumaRoute(api, op, handler)
 }
 
@@ -760,18 +805,21 @@ func messageFilterParams() []*huma.Param {
 	}
 }
 
-// changesParams documents the content-change feed's cursor. since and since_id
-// are one composite cursor: rapid writes share a watermark, so the id breaks
-// ties within an instant and neither half is useful alone.
+// changesParams documents the content-change feed's cursor. It is opaque so
+// that what the feed tracks can change without breaking consumers: nothing
+// outside this server is allowed to depend on its contents.
 func changesParams() []*huma.Param {
 	return []*huma.Param{
-		queryStringParam("since",
-			"Watermark cursor (RFC3339, or a plain YYYY-MM-DD date read as midnight UTC). "+
-				"Fractional seconds are significant and preserved; send back the next_since "+
-				"of the previous response verbatim. Omit, or send it empty, to start from "+
-				"the beginning of the archive", false),
-		queryIntegerParam("since_id",
-			"Message ID tiebreak within the same watermark instant; use the next_since_id of the previous response"),
+		queryStringParam("cursor",
+			"Opaque cursor from the next_cursor of the previous response, sent back "+
+				"verbatim. Do not parse, construct, compare, or order it; its contents may "+
+				"change without notice. Omit, or send it empty, to start from the beginning "+
+				"of the archive. The token is not authenticated: the server does not sign "+
+				"it and cannot tell one it issued from a well-formed one you built, so a "+
+				"fabricated cursor naming this archive is accepted and simply moves your "+
+				"own position. Rejected with 400 invalid_cursor, rather than read as the "+
+				"beginning: a token the server cannot read, one carrying a cursor format "+
+				"this build does not speak, and one issued against a different archive", false),
 		// No published minimum/maximum: the handler clamps rather than rejects,
 		// so a range in the schema would make a generated client refuse
 		// requests the server answers with 200 and would contradict this

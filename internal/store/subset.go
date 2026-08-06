@@ -23,6 +23,12 @@ type CopyResult struct {
 	Elapsed       time.Duration
 }
 
+// CopySubsetOptions controls optional sensitive metadata included in a subset.
+type CopySubsetOptions struct {
+	IncludeIdentity   bool
+	IncludeAttributes bool
+}
+
 // CopySubset copies rowCount most recent messages (and all referenced
 // data) from srcDBPath into a new database in dstDir. The destination
 // schema is initialized using the embedded store schema.
@@ -37,12 +43,28 @@ type CopyResult struct {
 // closure instead: participants are expanded through participant_links and
 // shared person bindings until every included cluster and person profile
 // is complete, which exposes identifiers of linked identities that have no
-// messages in the subset.
+// messages in the subset. Person attribute definitions and values are not copied;
+// callers sharing attributes must explicitly use CopySubsetWithOptions with
+// IncludeAttributes. When attributes are included, person-valued references
+// follow the same boundary: references to excluded people are omitted by
+// default, while IncludeIdentity follows references from included people and
+// copies each target's complete identity profile.
 //
 // Security: validates srcDBPath for control characters and canonicalizes
 // it before use in SQL. Callers must validate path containment.
 func CopySubset(
 	srcDBPath, dstDir string, rowCount int, includeIdentity bool,
+) (*CopyResult, error) {
+	return CopySubsetWithOptions(srcDBPath, dstDir, rowCount, CopySubsetOptions{
+		IncludeIdentity: includeIdentity,
+	})
+}
+
+// CopySubsetWithOptions copies a subset with explicitly selected sensitive
+// metadata. IncludeAttributes copies current and historical attribute values,
+// including their value content, provenance references, and actor metadata.
+func CopySubsetWithOptions(
+	srcDBPath, dstDir string, rowCount int, options CopySubsetOptions,
 ) (*CopyResult, error) {
 	if rowCount <= 0 {
 		return nil, fmt.Errorf("rowCount must be positive, got %d", rowCount)
@@ -145,7 +167,7 @@ func CopySubset(
 		return nil, fmt.Errorf("begin transaction: %w", err)
 	}
 
-	result, err := copyData(tx, rowCount, includeIdentity)
+	result, err := copyData(tx, rowCount, options)
 	if err != nil {
 		_ = tx.Rollback()
 		_, _ = db.Exec("DETACH DATABASE src")
@@ -238,7 +260,7 @@ func verifyForeignKeys(db *sql.DB) error {
 }
 
 // copyData executes INSERT INTO ... SELECT in dependency order.
-func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, error) {
+func copyData(tx *sql.Tx, rowCount int, options CopySubsetOptions) (*CopyResult, error) {
 	result := &CopyResult{}
 
 	if _, err := tx.Exec(fmt.Sprintf(`
@@ -330,11 +352,11 @@ func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, erro
 	// through the closure of link edges and shared person bindings so
 	// every included identity cluster and person profile is complete —
 	// components can pass through participants with no copied messages.
-	if includeIdentity {
+	if options.IncludeIdentity {
 		res, err = tx.Exec(`
 			INSERT INTO participants SELECT * FROM src.participants
 			WHERE id IN (
-				WITH RECURSIVE edge(a, b) AS (
+				WITH RECURSIVE symmetric_edge(a, b) AS (
 					SELECT participant_a, participant_b FROM src.participant_links
 					UNION ALL
 					SELECT pp1.participant_id, pp2.participant_id
@@ -342,17 +364,31 @@ func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, erro
 					JOIN src.person_participants pp2
 					  ON pp2.person_id = pp1.person_id
 					 AND pp2.participant_id != pp1.participant_id
+				), reference_edge(a, b) AS (
+					SELECT owner_pp.participant_id, target_pp.participant_id
+					FROM src.person_attribute_values value
+					JOIN src.person_participants owner_pp
+					  ON owner_pp.person_id = value.person_id
+					JOIN src.person_participants target_pp
+					  ON target_pp.person_id = value.value_record_id
+					WHERE value.value_record_type = 'person'
+					  AND ?
 				), identity(id) AS (
 					SELECT id FROM participants
 					UNION
-					SELECT CASE WHEN edge.a = identity.id
-					            THEN edge.b ELSE edge.a END
-					FROM edge
-					JOIN identity ON identity.id IN (edge.a, edge.b)
+					SELECT CASE WHEN symmetric_edge.a = identity.id
+					            THEN symmetric_edge.b ELSE symmetric_edge.a END
+					FROM symmetric_edge
+					JOIN identity
+					  ON identity.id IN (symmetric_edge.a, symmetric_edge.b)
+					UNION
+					SELECT reference_edge.b
+					FROM reference_edge
+					JOIN identity ON identity.id = reference_edge.a
 				)
 				SELECT id FROM identity
 			)
-			  AND id NOT IN (SELECT id FROM participants)`)
+			  AND id NOT IN (SELECT id FROM participants)`, options.IncludeAttributes)
 		if err != nil {
 			return nil, fmt.Errorf("copy identity-closure participants: %w", err)
 		}
@@ -402,6 +438,94 @@ func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, erro
 		return nil, fmt.Errorf("copy person_participants: %w", err)
 	}
 
+	if options.IncludeAttributes {
+		// Definitions are portable by universal_id, not their database-local
+		// numeric key. Reconcile every person definition into the destination,
+		// then map copied values through universal_id below.
+		if _, err := tx.Exec(`
+		INSERT INTO attribute_definitions (
+		    universal_id, object_type, slug, label, description,
+		    value_type, field_type, record_target, cardinality, display_order,
+		    is_required, ownership, ui_creatable, ui_editable, api_mutable,
+		    is_searchable, is_audited, is_deletable, history_exempt,
+		    derived_source, options, vcard_property, is_active, revision,
+		    created_at, updated_at
+		)
+		SELECT
+		    universal_id, object_type, slug, label, description,
+		    value_type, field_type, record_target, cardinality, display_order,
+		    is_required, ownership, ui_creatable, ui_editable, api_mutable,
+		    is_searchable, is_audited, is_deletable, history_exempt,
+		    derived_source, options, vcard_property, is_active, revision,
+		    created_at, updated_at
+		FROM src.attribute_definitions
+		WHERE object_type = 'person'
+		ON CONFLICT(universal_id) DO UPDATE SET
+		    object_type = excluded.object_type,
+		    slug = excluded.slug,
+		    label = excluded.label,
+		    description = excluded.description,
+		    value_type = excluded.value_type,
+		    field_type = excluded.field_type,
+		    record_target = excluded.record_target,
+		    cardinality = excluded.cardinality,
+		    display_order = excluded.display_order,
+		    is_required = excluded.is_required,
+		    ownership = excluded.ownership,
+		    ui_creatable = excluded.ui_creatable,
+		    ui_editable = excluded.ui_editable,
+		    api_mutable = excluded.api_mutable,
+		    is_searchable = excluded.is_searchable,
+		    is_audited = excluded.is_audited,
+		    is_deletable = excluded.is_deletable,
+		    history_exempt = excluded.history_exempt,
+		    derived_source = excluded.derived_source,
+		    options = excluded.options,
+		    vcard_property = excluded.vcard_property,
+		    is_active = excluded.is_active,
+		    revision = excluded.revision,
+		    created_at = excluded.created_at,
+		    updated_at = excluded.updated_at`); err != nil {
+			return nil, fmt.Errorf("copy person attribute definitions: %w", err)
+		}
+
+		// Preserve complete value history for copied people. Record references
+		// only survive when their target person crossed the selected identity
+		// boundary, preventing a subset from containing a dangling private ID.
+		if _, err := tx.Exec(`
+		INSERT INTO person_attribute_values (
+		    id, person_id, definition_id, ordinal,
+		    value_text, value_integer, value_real, value_boolean,
+		    value_date, value_timestamp, value_json,
+		    value_record_type, value_record_id,
+		    active_from, active_until, created_at, superseded_at,
+		    source, source_ref, confidence, actor
+		)
+		SELECT
+		    value.id, value.person_id, destination_definition.id, value.ordinal,
+		    value.value_text, value.value_integer, value.value_real,
+		    value.value_boolean, value.value_date, value.value_timestamp,
+		    value.value_json, value.value_record_type, value.value_record_id,
+		    value.active_from, value.active_until, value.created_at,
+		    value.superseded_at, value.source, value.source_ref,
+		    value.confidence, value.actor
+		FROM src.person_attribute_values value
+		JOIN src.attribute_definitions source_definition
+		  ON source_definition.id = value.definition_id
+		JOIN attribute_definitions destination_definition
+		  ON destination_definition.universal_id = source_definition.universal_id
+		WHERE value.person_id IN (SELECT id FROM persons)
+		  AND (
+		    value.value_record_type IS NULL
+		    OR (
+		      value.value_record_type = 'person'
+		      AND value.value_record_id IN (SELECT id FROM persons)
+		    )
+		  )`); err != nil {
+			return nil, fmt.Errorf("copy person attribute values: %w", err)
+		}
+	}
+
 	if _, err := tx.Exec(`
 		INSERT INTO participant_identifiers
 		SELECT * FROM src.participant_identifiers
@@ -436,11 +560,31 @@ func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, erro
 	// the source's own migration filled it. It is the copy that has to be
 	// closed, not the writers: this statement is the only thing standing
 	// between a single NULL anywhere upstream and a permanently unreportable
-	// message. It names only content_changed_at, so neither messages trigger
-	// fires: the content-change trigger is UPDATE OF the content columns, and
-	// the last_modified trigger is UPDATE OF every column except this one (see
-	// lastModifiedUpdateOfColumns). last_modified therefore keeps the value
-	// copied from the source, which is what a subset should carry.
+	// message.
+	//
+	// It names only content_changed_at, so no trigger on `messages` fires here:
+	// the content-change trigger is UPDATE OF the content columns, and the
+	// last_modified trigger is UPDATE OF every column except this one (see
+	// lastModifiedUpdateOfColumns).
+	//
+	// It is not, however, what decides the watermarks of a message that has a
+	// body. The `INSERT INTO message_bodies` further down fires two triggers
+	// that write the parent row directly rather than reacting to an UPDATE of
+	// it: trg_message_bodies_content_changed_ins, and schema.sql's pre-existing
+	// trg_message_bodies_last_modified_ins. So a copied message WITH a body
+	// leaves this function with both content_changed_at and last_modified set
+	// to the time of the copy; only a bodyless one keeps the source's values.
+	// (Measured: a source row stamped 2001-02-03 04:05:06 arrives copy-stamped
+	// when it has a body and unchanged when it does not.)
+	//
+	// That is left alone rather than worked around. last_modified has behaved
+	// this way for as long as those body triggers have existed, and
+	// content_changed_at now simply matches it. Neither column promises to
+	// survive a copy: a subset is a new archive, its feed consumers start from
+	// an empty cursor, and all they require of the watermark is that it is
+	// non-NULL and in the single textual shape the lexical cursor can order —
+	// which a copy-time stamp and a copied source value both satisfy.
+	// TestCopySubset_BodyTriggersRestampWatermarks pins the behaviour.
 	if _, err := tx.Exec(fmt.Sprintf(
 		`UPDATE messages SET content_changed_at = %s WHERE content_changed_at IS NULL`,
 		(&SQLiteDialect{}).ContentChangedNow())); err != nil {
@@ -519,40 +663,24 @@ func copyData(tx *sql.Tx, rowCount int, includeIdentity bool) (*CopyResult, erro
 	return result, nil
 }
 
+// errNoCommonMessageColumns reports that the source and destination messages
+// tables have no column name in common, so there is nothing to copy.
+var errNoCommonMessageColumns = errors.New(
+	"source and destination share no messages columns")
+
 // copyMessages copies the selected messages, naming the columns the source and
-// destination have in common instead of relying on `SELECT *`.
+// destination have in common, read from the two schemas at copy time.
 //
-// The destination is always built from the current schema, so a positional
-// copy requires the source to be at the current schema too: it supplies one
-// value per source column, and SQLite rejects the statement outright when the
-// counts differ ("table messages has N columns but M values were supplied").
-// Every archive written before content_changed_at existed is such a source, and
-// the whole copy fails on it — including the NULL restamp below, which never
-// gets to run because the INSERT fails first. Older source schemas are
-// supported elsewhere in this copy (see the oauth_app fallback for `sources`,
-// which names its columns and substitutes NULL for the one a legacy source
-// lacks); this is the same mechanism for a table whose column list is far too
-// long to retype, with the list read from the two schemas rather than pinned in
-// source that would rot on the next ALTER TABLE ADD COLUMN.
-//
-// Reading the list from the two schemas rather than pinning it in a constant
-// is also what keeps a column added by a LegacyColumnMigrations ALTER — one
-// that never appears in schema.sql's CREATE TABLE — from being silently
-// dropped from every subset. Do not replace this with a hand-maintained list.
-//
-// A column the source lacks is simply left out of the INSERT, so the
-// destination's own DEFAULT supplies it — for content_changed_at that is the
-// stamp ContentChangedNow writes, in the one textual shape the feed's lexical
-// cursor can order. Columns the source has and the destination does not are
-// dropped, which is the only sane reading of "copy into the current schema".
+// A column the source lacks is left out of the INSERT, so the destination's own
+// DEFAULT, where it has one, supplies it. Columns the source has and the
+// destination does not are dropped.
 func copyMessages(tx *sql.Tx) error {
 	cols, err := commonColumns(tx, "messages")
 	if err != nil {
-		return err
+		return fmt.Errorf("copy messages: %w", err)
 	}
 	if len(cols) == 0 {
-		return errors.New(
-			"copy messages: source and destination share no messages columns")
+		return fmt.Errorf("copy messages: %w", errNoCommonMessageColumns)
 	}
 	list := strings.Join(cols, ", ")
 	if _, err := tx.Exec(fmt.Sprintf(`
@@ -565,6 +693,13 @@ func copyMessages(tx *sql.Tx) error {
 
 // commonColumns returns the quoted names of the columns `table` has in both the
 // destination (main) and the attached source, in destination declaration order.
+// Names are matched the way SQLite matches identifiers — case-insensitively
+// over ASCII only, see foldIdentifier — and the destination's spelling is
+// emitted for both sides of the copy.
+//
+// A returned name is interpolated into the copy's SQL, so it goes through
+// quoteIdentifier — which quotes it and doubles any quote inside it. Names
+// outside the intersection are not interpolated and so are not rendered.
 func commonColumns(tx *sql.Tx, table string) ([]string, error) {
 	dst, err := schemaColumns(tx, "main", table)
 	if err != nil {
@@ -576,21 +711,42 @@ func commonColumns(tx *sql.Tx, table string) ([]string, error) {
 	}
 	inSrc := make(map[string]struct{}, len(src))
 	for _, name := range src {
-		inSrc[name] = struct{}{}
+		inSrc[foldIdentifier(name)] = struct{}{}
 	}
 	common := make([]string, 0, len(dst))
 	for _, name := range dst {
-		if _, ok := inSrc[name]; ok {
-			common = append(common, `"`+name+`"`)
+		if _, ok := inSrc[foldIdentifier(name)]; !ok {
+			continue
 		}
+		common = append(common, quoteIdentifier(name))
 	}
 	return common, nil
 }
 
-// schemaColumns lists a table's column names in declaration order. Names
-// containing a double quote are rejected rather than quoted: nothing in this
-// schema has one, and an identifier that cannot be quoted safely must not be
-// interpolated into SQL.
+// foldIdentifier folds an unquoted-identifier name to the form SQLite compares
+// on: A-Z map to a-z and every other byte is left alone.
+//
+// Do not "simplify" this to strings.ToLower. That applies Unicode case
+// conversion, which is strictly broader than SQLite's, whose built-in collating
+// sequences fold only ASCII (see sqlite3_stricmp). Go lowers, for example,
+// "İdentity_is_from_me" (U+0130, capital I with dot above) to
+// "identity_is_from_me", which SQLite treats as a different identifier. A
+// source-only column so named would then be misclassified as common to both
+// schemas, and the copy would name a column src.messages does not have. With
+// SQLite's default double-quoted-string misfeature the quoted name degrades to
+// a string literal and the copy silently stores that text in the destination
+// column instead of its DEFAULT; with SQLITE_DQS=0 the copy fails outright.
+func foldIdentifier(name string) string {
+	folded := []byte(name)
+	for i, c := range folded {
+		if c >= 'A' && c <= 'Z' {
+			folded[i] = c + ('a' - 'A')
+		}
+	}
+	return string(folded)
+}
+
+// schemaColumns lists a table's column names in declaration order.
 func schemaColumns(tx *sql.Tx, schema, table string) ([]string, error) {
 	rows, err := tx.Query(
 		`SELECT name FROM pragma_table_info(?, ?) ORDER BY cid`, table, schema)
@@ -604,10 +760,6 @@ func schemaColumns(tx *sql.Tx, schema, table string) ([]string, error) {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, fmt.Errorf("scan %s.%s column: %w", schema, table, err)
-		}
-		if strings.Contains(name, `"`) {
-			return nil, fmt.Errorf(
-				"%s.%s column name contains a double quote: %q", schema, table, name)
 		}
 		names = append(names, name)
 	}

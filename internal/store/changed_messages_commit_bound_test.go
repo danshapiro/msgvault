@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -43,8 +44,7 @@ const changeFeedPollLimit = 200
 // told. It advances the cursor exactly as internal/api's handler does, floor
 // included, so a loss these tests report is a loss a real client would see.
 type changeFeedConsumer struct {
-	since   time.Time
-	sinceID int64
+	cursor store.ChangedMessagesCursor
 	// subjects is the latest subject the feed reported for each message.
 	subjects map[int64]string
 	// tombstoned records the messages the feed reported as deleted at source.
@@ -77,10 +77,10 @@ func newChangeFeedConsumer() *changeFeedConsumer {
 // error instead.
 func (c *changeFeedConsumer) poll(st *store.Store) (store.ChangedMessagePage, error) {
 	c.mu.Lock()
-	since, sinceID := c.since, c.sinceID
+	since := c.cursor
 	c.mu.Unlock()
 
-	page, err := st.ListChangedMessages(context.Background(), since, sinceID, changeFeedPollLimit)
+	page, err := st.ListChangedMessages(context.Background(), since, changeFeedPollLimit)
 	if err != nil {
 		return page, fmt.Errorf("ListChangedMessages: %w", err)
 	}
@@ -111,12 +111,20 @@ func (c *changeFeedConsumer) poll(st *store.Store) (store.ChangedMessagePage, er
 	if len(page.Messages) > 0 {
 		last := page.Messages[len(page.Messages)-1]
 		next := last.ContentChangedAt
-		if next.Before(since) {
-			next = since // the handler's floor
+		if next.Before(since.At()) {
+			next = since.At() // the handler's floor
 		}
-		c.since, c.sinceID = next, last.ID
+		c.cursor = store.ChangedMessagesAfter(next, last.ID)
 	}
 	return page, nil
+}
+
+// cursorID is the id tiebreak the consumer's cursor carries, for the failure
+// messages below. A cursor standing at the start of an instant carries none and
+// reports 0.
+func (c *changeFeedConsumer) cursorID() int64 {
+	id, _ := c.cursor.AfterID()
+	return id
 }
 
 // pollInBackground polls until stop closes, recording the first failure for the
@@ -420,7 +428,7 @@ func TestListChangedMessages_SameInstantUncommittedChangeIsNotStranded(t *testin
 			"after the consumer had already been served that instant. It never came "+
 			"back: a page that publishes a cursor from an instant still open for "+
 			"commits loses every change still pending in it. Cursor is now (%s, %d)",
-		low, shared, high, consumer.since, consumer.sinceID)
+		low, shared, high, consumer.cursor.At(), consumer.cursorID())
 }
 
 // TestListChangedMessages_LaterCommitDoesNotStrandAnEarlierPendingChange is the
@@ -478,7 +486,7 @@ func TestListChangedMessages_LaterCommitDoesNotStrandAnEarlierPendingChange(t *t
 			"consumer had been served newer traffic. The feed reported %q for it "+
 			"and never corrected itself: an entire batched write is lost this way. "+
 			"Cursor is now (%s, %d)",
-		pending, pendingAt, consumer.subject(pending), consumer.since, consumer.sinceID)
+		pending, pendingAt, consumer.subject(pending), consumer.cursor.At(), consumer.cursorID())
 }
 
 // TestListChangedMessages_CompleteThroughHoldsBelowAPendingChange pins what the
@@ -886,7 +894,7 @@ func TestListChangedMessages_ConcurrentTransactionalWritersLoseNothing(t *testin
 			"tracked; complete_through %s, clock %s, cursor (%s, %d); the rows "+
 			"themselves are stamped %v",
 		consumer.pages, consumer.rows, len(want),
-		final.CompleteThrough, final.ServerTime, consumer.since, consumer.sinceID,
+		final.CompleteThrough, final.ServerTime, consumer.cursor.At(), consumer.cursorID(),
 		storedWatermarks(t, st, ids))
 }
 
@@ -929,7 +937,7 @@ func TestListChangedMessages_UnresolvableMessagesTableIsRefused(t *testing.T) {
 
 	seedFeedMessage(t, st, 1, time.Time{})
 	settleFeedClock(t, st)
-	_, err := st.ListChangedMessages(context.Background(), time.Time{}, 0, 10)
+	_, err := st.ListChangedMessages(context.Background(), store.ChangedMessagesCursor{}, 10)
 	require.NoError(err, "the feed works before the table moves out of reach")
 
 	_, err = st.DB().Exec(`ALTER TABLE messages RENAME TO messages_moved`)
@@ -939,7 +947,7 @@ func TestListChangedMessages_UnresolvableMessagesTableIsRefused(t *testing.T) {
 		require.NoError(err, "put the table back")
 	}()
 
-	_, err = st.ListChangedMessages(context.Background(), time.Time{}, 0, 10)
+	_, err = st.ListChangedMessages(context.Background(), store.ChangedMessagesCursor{}, 10)
 	require.Error(err,
 		"a bound that cannot see which transactions are writing must refuse the "+
 			"page; serving one bounded at the clock is the original data loss, "+
@@ -1003,7 +1011,7 @@ func TestListChangedMessages_BlockedFirstProbePublishesNoBound(t *testing.T) {
 			"the probe never established")
 	assert.Empty(page.Messages,
 		"a feed complete through nothing must publish nothing")
-	assert.True(consumer.since.IsZero(),
+	assert.True(consumer.cursor.At().IsZero(),
 		"and it must leave the consumer's cursor alone: an empty page is not "+
 			"evidence of being caught up")
 	assert.False(page.ServerTime.IsZero(),
@@ -1018,4 +1026,133 @@ func TestListChangedMessages_BlockedFirstProbePublishesNoBound(t *testing.T) {
 		"the first quiet moment must establish the bound and release the archive: "+
 			"a feed that never recovers from a busy start is not conservative, it is "+
 			"broken")
+}
+
+// TestListChangedMessages_ConcurrentWithActiveImportMakesProgress drives the
+// feed against the production import path rather than raw SQL. Every write here
+// goes through UpsertMessage, so it fires trg_messages_last_modified and the
+// content_changed_at trigger exactly as an import does — and the feed's
+// commit-bound probe contends with those writes for SQLite's single write lock.
+//
+// The other contention tests in this file issue direct UPDATEs or hold the lock
+// by hand. Neither shape can catch a defect that only appears when the real
+// write path holds the lock across a trigger.
+//
+// Liveness here means the feed keeps DELIVERING, not merely that the call keeps
+// returning. A build whose every BEGIN IMMEDIATE probe lost the race to the
+// importer would still return a page on every poll — server_time is read from
+// the clock unconditionally and a timed-out probe falls back rather than
+// erroring — while complete_through stayed zero and every page stayed empty for
+// the whole length of the import. That is the feature completely broken, and it
+// is the shape a poll-count-only assertion cannot see. So this asserts that the
+// bound gets established, that it advances, that pages carry rows, that those
+// rows include messages the importer wrote DURING the run, and that the
+// importer itself got writes in. Losing no row under contention is a different
+// property, and ConcurrentTransactionalWritersLoseNothing owns it.
+func TestListChangedMessages_ConcurrentWithActiveImportMakesProgress(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	// Seed so the feed has a non-empty starting point.
+	var lastSeededID int64
+	for i := 1; i <= 4; i++ {
+		lastSeededID = seedFeedMessage(t, st, i, time.Time{})
+	}
+	settleFeedClock(t, st)
+
+	stop := make(chan struct{})
+	var workers sync.WaitGroup
+
+	// Importer: the production write path, running continuously. It reports
+	// through a channel and a counter rather than asserting, because require's
+	// failure path is runtime.Goexit and that is not legal off the test's own
+	// goroutine (see insertFeedMessage).
+	importErrs := make(chan error, 1)
+	var imported atomic.Int64
+	workers.Go(func() {
+		for i := 100; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := insertFeedMessage(st, i, time.Time{}); err != nil {
+				importErrs <- fmt.Errorf("import feed message %d: %w", i, err)
+				return
+			}
+			imported.Add(1)
+		}
+	})
+
+	// Reader: drain the feed the way the handler does, cursor and all, while the
+	// import runs. Each poll takes the write lock briefly for the commit bound.
+	consumer := newChangeFeedConsumer()
+	var (
+		polls      int
+		pollErr    error
+		firstBound time.Time
+		lastBound  time.Time
+	)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		page, err := consumer.poll(st)
+		if err != nil {
+			pollErr = err
+			break
+		}
+		if page.ServerTime.IsZero() {
+			pollErr = errors.New("a poll that returns must report a server time")
+			break
+		}
+		polls++
+		if page.CompleteThrough.IsZero() {
+			continue
+		}
+		if firstBound.IsZero() {
+			firstBound = page.CompleteThrough
+		}
+		if page.CompleteThrough.After(lastBound) {
+			lastBound = page.CompleteThrough
+		}
+	}
+	close(stop)
+	workers.Wait()
+	close(importErrs)
+
+	require.NoError(<-importErrs, "the import path must not fail while the feed polls")
+	require.NoError(pollErr, "the feed must not error while an import holds the write lock")
+	require.Greaterf(polls, 10,
+		"the feed completed only %d polls in 5s against an active import; "+
+			"that is a stall, not contention", polls)
+	require.Positive(imported.Load(),
+		"the importer never completed a write in 5s, so nothing here was under "+
+			"contention and the rest of this test proves nothing")
+
+	require.Falsef(firstBound.IsZero(),
+		"not one of %d polls published a commit bound: every probe lost the write "+
+			"lock to the importer, so complete_through stayed at zero and the feed "+
+			"can never return a row while an import is running", polls)
+	assert.Truef(lastBound.After(firstBound),
+		"the commit bound stood still at %s across %d polls in 5s: a bound that "+
+			"never advances holds every later change back indefinitely", firstBound, polls)
+
+	consumer.mu.Lock()
+	rows, delivered := consumer.rows, len(consumer.subjects)
+	var fromImporter int
+	for id := range consumer.subjects {
+		if id > lastSeededID {
+			fromImporter++
+		}
+	}
+	consumer.mu.Unlock()
+
+	assert.Positive(rows,
+		"the feed returned pages but never a row while an import was writing "+
+			"continuously: a feed complete through an instant it never reaches "+
+			"delivers nothing")
+	assert.Positivef(fromImporter,
+		"the feed delivered %d messages, all of them seeded before the import "+
+			"started: none of the %d rows the importer wrote during the run ever "+
+			"reached the consumer", delivered, imported.Load())
 }

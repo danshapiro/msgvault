@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -20,8 +21,16 @@ var ErrArchiveIdentityCorrupt = errors.New("archive identity is corrupt")
 
 // ArchiveUID returns the durable identity of this archive.
 func (s *Store) ArchiveUID() (string, error) {
+	return s.ArchiveUIDContext(context.Background())
+}
+
+// ArchiveUIDContext returns the durable identity of this archive and allows a
+// caller waiting for a database connection or lock to cancel the lookup.
+func (s *Store) ArchiveUIDContext(ctx context.Context) (string, error) {
 	var uid string
-	if err := s.db.QueryRow(`SELECT value FROM archive_metadata WHERE key = ?`, archiveUIDKey).Scan(&uid); err != nil {
+	if err := s.db.QueryRowContext(
+		ctx, `SELECT value FROM archive_metadata WHERE key = ?`, archiveUIDKey,
+	).Scan(&uid); err != nil {
 		return "", fmt.Errorf("read archive UID: %w", err)
 	}
 	return uid, nil
@@ -38,7 +47,16 @@ func (s *Store) ArchiveRevision() (string, error) {
 }
 
 func (s *Store) ensureArchiveUID() error {
-	return s.withTx(func(tx *loggedTx) error {
+	return s.ensureArchiveUIDContext(context.Background())
+}
+
+// ensureArchiveUIDContext is the context-aware form of ensureArchiveUID. Its
+// transaction and every statement in it carry ctx, so an operator's SIGINT can
+// reach it: on PostgreSQL these statements queue behind any conflicting lock on
+// archive_metadata or applied_migrations, and a background context makes that
+// wait unreachable by a signal.
+func (s *Store) ensureArchiveUIDContext(ctx context.Context) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		random := make([]byte, 32)
 		if _, err := rand.Read(random); err != nil {
 			return fmt.Errorf("generate archive UID: %w", err)
@@ -50,17 +68,21 @@ func (s *Store) ensureArchiveUID() error {
 			WHERE NOT EXISTS (
 				SELECT 1 FROM applied_migrations WHERE name = ?
 			)`)
-		if _, err := tx.Exec(statement, archiveUIDKey, uid, migrationArchiveIdentity); err != nil {
+		if _, err := tx.ExecContext(ctx, statement, archiveUIDKey, uid, migrationArchiveIdentity); err != nil {
 			return fmt.Errorf("persist archive UID: %w", err)
 		}
 
 		var existing string
-		if err := tx.QueryRow(`SELECT value FROM archive_metadata WHERE key = ?`, archiveUIDKey).Scan(&existing); err != nil {
+		if err := tx.QueryRowContext(ctx,
+			`SELECT value FROM archive_metadata WHERE key = ?`, archiveUIDKey,
+		).Scan(&existing); err != nil {
 			if !errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("verify archive UID: %w", err)
 			}
 			var migrationPresent int
-			if countErr := tx.QueryRow(`SELECT COUNT(*) FROM applied_migrations WHERE name = ?`, migrationArchiveIdentity).Scan(&migrationPresent); countErr != nil {
+			if countErr := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM applied_migrations WHERE name = ?`, migrationArchiveIdentity,
+			).Scan(&migrationPresent); countErr != nil {
 				return fmt.Errorf("check archive identity migration: %w", countErr)
 			}
 			if migrationPresent > 0 {
@@ -69,7 +91,7 @@ func (s *Store) ensureArchiveUID() error {
 			return fmt.Errorf("verify archive UID: %w", err)
 		}
 		migrationSQL := s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO applied_migrations (name) VALUES (?)`)
-		if _, err := tx.Exec(migrationSQL, migrationArchiveIdentity); err != nil {
+		if _, err := tx.ExecContext(ctx, migrationSQL, migrationArchiveIdentity); err != nil {
 			return fmt.Errorf("record archive identity migration: %w", err)
 		}
 		return nil

@@ -113,6 +113,14 @@ func (g GetSubAggregatesQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type ListAttributeDefinitionsQuery struct {
+	// ObjectType Filter by object type
+	ObjectType *string `json:"object_type,omitempty"`
+
+	// IncludeHidden Include deactivated definitions
+	IncludeHidden *bool `json:"include_hidden,omitempty"`
+}
+
 type GetCLIAttachmentQuery struct {
 	// ContentHash Attachment SHA-256 content hash
 	ContentHash string `json:"content_hash" validate:"required"`
@@ -292,11 +300,8 @@ type ListMessagesQuery struct {
 }
 
 type ListChangedMessagesQuery struct {
-	// Since Watermark cursor (RFC3339, or a plain YYYY-MM-DD date read as midnight UTC). Fractional seconds are significant and preserved; send back the next_since of the previous response verbatim. Omit, or send it empty, to start from the beginning of the archive
-	Since *string `json:"since,omitempty"`
-
-	// SinceID Message ID tiebreak within the same watermark instant; use the next_since_id of the previous response
-	SinceID *int64 `json:"since_id,omitempty"`
+	// Cursor Opaque cursor from the next_cursor of the previous response, sent back verbatim. Do not parse, construct, compare, or order it; its contents may change without notice. Omit, or send it empty, to start from the beginning of the archive. The token is not authenticated: the server does not sign it and cannot tell one it issued from a well-formed one you built, so a fabricated cursor naming this archive is accepted and simply moves your own position. Rejected with 400 invalid_cursor, rather than read as the beginning: a token the server cannot read, one carrying a cursor format this build does not speak, and one issued against a different archive
+	Cursor *string `json:"cursor,omitempty"`
 
 	// Limit Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default)
 	Limit *int64 `json:"limit,omitempty"`
@@ -433,6 +438,30 @@ type GetMessageInlinePartQuery struct {
 
 func (g GetMessageInlinePartQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListPersonAttributesQuery struct {
+	// History Include superseded values
+	History *bool `json:"history,omitempty"`
+
+	// Slug Restrict the response to one definition slug
+	Slug *string `json:"slug,omitempty"`
+}
+
+type ClearPersonAttributeQuery struct {
+	// Ordinal Ordinal for a multi-valued definition
+	Ordinal *int64 `json:"ordinal,omitempty"`
+
+	// ExpectedValueID Compare-and-swap: the current value ID expected to be superseded
+	ExpectedValueID *int64 `json:"expected_value_id,omitempty"`
+
+	// DryRun Validate and preview without writing
+	DryRun *bool `json:"dry_run,omitempty"`
+}
+
+type SetPersonAttributeQuery struct {
+	// DryRun Validate and preview without writing
+	DryRun *bool `json:"dry_run,omitempty"`
 }
 
 type SearchMessagesQuery struct {

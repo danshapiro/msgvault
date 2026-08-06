@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -73,8 +75,10 @@ func (d *SQLiteDialect) TimestampParam(t time.Time) any {
 // loop cut writes to 15% of the unloaded rate, where eight clients running an
 // equivalent plain SELECT left 49%. One consumer polling once a second is free;
 // a consumer that polls as fast as it can is competing with the importer for
-// the write lock. Poll on an interval, and use has_more (not a tighter poll) to
-// drain a backlog.
+// the write lock. Poll on an interval. Drain a backlog by asking for a bigger
+// page, or by paging straight on from the last row's cursor while a full page
+// keeps coming back — not by shortening the interval, which buys nothing but
+// lock contention.
 const sqliteQuiescentProbeTimeout = 250 * time.Millisecond
 
 // ReadWatermarkBounds implements Dialect.
@@ -121,23 +125,52 @@ func (d *SQLiteDialect) ReadWatermarkBounds(
 	}
 	defer func() { _ = conn.Close() }()
 
-	quiescent, proved, err := d.probeQuiescentInstant(ctx, conn)
+	return d.proveQuiescentInstant(func() (time.Time, bool, time.Time, error) {
+		quiescent, proved, err := d.probeQuiescentInstant(ctx, conn)
+		if err != nil {
+			return time.Time{}, false, time.Time{}, err
+		}
+		// A successful probe already read the clock, under the write lock; that
+		// reading is this call's server_time as much as a bare SELECT would be,
+		// and reusing it keeps Now and CommitBound from disagreeing by a
+		// millisecond for no reason. Only a probe that timed out needs the clock
+		// separately.
+		now := quiescent
+		if !proved {
+			if now, err = d.readClock(ctx, conn); err != nil {
+				return time.Time{}, false, time.Time{}, err
+			}
+		}
+		return quiescent, proved, now, nil
+	})
+}
+
+// proveQuiescentInstant runs one probe and folds its result into the remembered
+// proof, and it holds quiescentMu across BOTH — which is the whole point.
+//
+// The probe proves its instant under the database's write lock, so concurrent
+// pages prove instants in a definite order; but two of them can return from the
+// probe in one order and reach this state in the other, storing an older proof
+// over a newer one. Nothing unsafe follows — an instant proved quiescent stays
+// proved — but the published complete_through would regress, which a consumer
+// is entitled to never see. Taking this lock before the probe makes the order
+// proofs are stored in the order they were proved in: the write lock and this
+// mutex are then acquired in the same sequence.
+//
+// Serialising costs nothing real. The probe's own work is already serialised by
+// the write lock it takes, so a caller that waits here is a caller that would
+// have waited on the database instead — and waiting here does not hold a
+// database lock while it does.
+func (d *SQLiteDialect) proveQuiescentInstant(
+	probe func() (quiescent time.Time, proved bool, now time.Time, err error),
+) (WatermarkBounds, error) {
+	d.quiescentMu.Lock()
+	defer d.quiescentMu.Unlock()
+
+	quiescent, proved, now, err := probe()
 	if err != nil {
 		return WatermarkBounds{}, err
 	}
-	// A successful probe already read the clock, under the write lock; that
-	// reading is this call's server_time as much as a bare SELECT would be, and
-	// reusing it keeps Now and CommitBound from disagreeing by a millisecond
-	// for no reason. Only a probe that timed out needs the clock separately.
-	now := quiescent
-	if !proved {
-		if now, err = d.readClock(ctx, conn); err != nil {
-			return WatermarkBounds{}, err
-		}
-	}
-
-	d.quiescentMu.Lock()
-	defer d.quiescentMu.Unlock()
 	if proved {
 		// The MOST RECENT proof, not the greatest one. They differ only if the
 		// database clock steps backwards, and there the greatest is the wrong
@@ -221,7 +254,24 @@ func (d *SQLiteDialect) useProbeBusyTimeout(ctx context.Context, conn *sql.Conn)
 	return func() {
 		// WithoutCancel: the connection must be handed back with its own
 		// timeout even when the caller's context has already expired.
-		_ = set(context.WithoutCancel(ctx), configured)
+		if err := set(context.WithoutCancel(ctx), configured); err != nil {
+			// This is a connection-local setting, on a connection already in
+			// hand, run on a context that cannot be cancelled — so it fails
+			// only when the connection itself is no longer usable, and then the
+			// statements that would inherit the probe's timeout cannot run on
+			// it either. Retiring the connection here is possible (conn.Raw
+			// returning driver.ErrBadConn discards one rather than pooling it),
+			// but it closes the *sql.Conn the caller still holds and may still
+			// use. So report rather than act: if the connection does see
+			// further use, every statement that borrows it gives up on a busy
+			// database after the probe's timeout rather than the configured
+			// one, and a "database is locked" from an unrelated query is
+			// otherwise unexplainable.
+			slog.Warn("change-feed watermark probe could not restore the connection's busy timeout",
+				slog.Int64("configured_ms", configured),
+				slog.Int64("left_at_ms", min(configured, sqliteQuiescentProbeTimeout.Milliseconds())),
+				slog.Any("error", err))
+		}
 	}, nil
 }
 
@@ -387,10 +437,13 @@ func (d *SQLiteDialect) FTSBackfillBatchSQL() string {
 // FTSAvailable probes for FTS5 by querying the virtual table.
 // Checking sqlite_master alone is insufficient: a binary built without FTS5
 // support will fail with "no such module: fts5" even if the table exists.
-func (d *SQLiteDialect) FTSAvailable(db *sql.DB) bool {
+func (d *SQLiteDialect) FTSAvailable(ctx context.Context, db *sql.DB) (bool, error) {
 	var probe int
-	err := db.QueryRowContext(context.Background(), "SELECT 1 FROM messages_fts LIMIT 1").Scan(&probe)
-	return err == nil || errors.Is(err, sql.ErrNoRows)
+	err := db.QueryRowContext(ctx, "SELECT 1 FROM messages_fts LIMIT 1").Scan(&probe)
+	if err != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return err == nil || errors.Is(err, sql.ErrNoRows), nil
 }
 
 // FTSNeedsBackfill reports whether the FTS5 table needs population.
@@ -480,6 +533,11 @@ func (d *SQLiteDialect) FTSRebuildSchema(ctx context.Context, q contextQuerier) 
 // not a post-migration step (cr2-10).
 func (d *SQLiteDialect) EnsureFTSIndex(querier) error { return nil }
 
+func (d *SQLiteDialect) ValidateMessageWatermarks(q querier) error {
+	_, err := d.contentChangedAtDefaultStamps(q)
+	return err
+}
+
 // EnsureTriggers creates the content_changed_at maintenance triggers and
 // re-scopes the messages last_modified trigger (see lastModifiedUpdateOfColumns
 // for why the latter cannot stay a blanket AFTER UPDATE in schema.sql).
@@ -495,8 +553,8 @@ func (d *SQLiteDialect) EnsureFTSIndex(querier) error { return nil }
 // The same DROP + CREATE is what lets the re-scoped last_modified trigger reach
 // an archive that already carries schema.sql's older, blanket definition.
 func (d *SQLiteDialect) EnsureTriggers(q querier) error {
-	cols := ContentChangedTriggerColumnList()
-	guard := ContentChangedValueGuard("IS NOT")
+	cols := contentChangedTriggerColumnList()
+	guard := contentChangedValueGuard("IS NOT")
 	now := d.ContentChangedNow()
 	insertStampedByDefault, err := d.contentChangedAtDefaultStamps(q)
 	if err != nil {
@@ -516,10 +574,20 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		// (schema.sql) instead and this trigger is NOT created at all: SQLite
 		// triggers cannot assign to NEW, so the stamp has to be a second
 		// UPDATE of the row just inserted, and merely HAVING a row trigger on
-		// messages forces SQLite to open a statement journal for every INSERT
-		// -- measured at 6.4s versus 1.1s for a 100k-row bulk insert, with the
-		// trigger body never once executing. The WHEN guard yields to an
-		// explicit write in the INSERT rather than clobbering it.
+		// messages makes SQLite compile a trigger subprogram into every INSERT
+		// and open a statement journal for it whether or not the body runs.
+		// That cost lands on inserts that SHARE a transaction, and only on
+		// those. Measured on this project's schema with the trigger present and
+		// its WHEN guard never once satisfied (verified: the body never ran),
+		// Linux, WAL, synchronous=FULL and again at synchronous=OFF with the
+		// same result: 100k rows inserted inside ONE transaction took 7.3s with
+		// the trigger against 1.4s without, while 20k messages persisted one
+		// transaction each (PersistMessage, the per-message path) showed no
+		// measurable difference at all -- 12.9s with against 13.2s without.
+		// The paths that pay are therefore the bulk ones: internal/fakevault's
+		// INSERT ... SELECT generator and subset.go's message copy. The WHEN
+		// guard yields to an explicit write in the INSERT rather than
+		// clobbering it.
 		stmts = append(stmts, fmt.Sprintf(`CREATE TRIGGER trg_messages_content_changed_ins
 		    AFTER INSERT ON messages FOR EACH ROW
 		    WHEN NEW.content_changed_at IS NULL
@@ -575,16 +643,6 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 	return nil
 }
 
-// contentChangedAtDefaultStamps reports whether messages.content_changed_at
-// carries exactly the DEFAULT that ContentChangedNow writes, which is the case
-// on a database created from schema.sql and impossible on one upgraded by
-// ALTER TABLE ADD COLUMN.
-//
-// The comparison is exact rather than "has some default" on purpose: the INSERT
-// trigger is only safe to omit when the DEFAULT produces the identical stamp
-// format, since the change feed's cursor comparison is lexical. A default that
-// has drifted from ContentChangedNow leaves the trigger in place, trading speed
-// for a watermark the feed can still sort.
 // lastModifiedUpdateOfColumns renders every live column of `messages` EXCEPT
 // content_changed_at, for the last_modified trigger's `UPDATE OF` clause.
 //
@@ -605,22 +663,69 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 // MessagesNonContentColumns so it cannot drift from the real schema and so
 // PostgreSQL-only columns (search_fts) are naturally absent. EnsureTriggers
 // runs after LegacyColumnMigrations, so every column already exists.
+//
+// The names are read as SEPARATE VALUES and quoted individually, because they
+// are interpolated into DDL and the ARCHIVE supplies them: SQLite accepts any
+// text as a column name when it is quoted, so a name can itself be a second
+// statement, and go-sqlite3 executes every statement in a string it is handed.
+// A raw group_concat list therefore made any archive able to run arbitrary SQL
+// at open. quoteIdentifier is the same contract commonColumns applies to the
+// subset copy's column list: render every name quoted, doubling any quote
+// inside it. commonColumns itself is not reusable here — it takes
+// a *sql.Tx with a second schema ATTACHed and returns the intersection of the
+// two, and neither exists on this path.
+//
+// json_group_array rather than group_concat because the separator has to be one
+// no column name can contain, and rather than a rows loop because querier
+// deliberately exposes only QueryRow (its two implementations return different
+// concrete row types and cannot be unified behind one interface). JSON1 is
+// built into the bundled SQLite and this project already relies on it.
 func (d *SQLiteDialect) lastModifiedUpdateOfColumns(q querier) (string, error) {
-	var cols sql.NullString
+	var encoded sql.NullString
 	err := q.QueryRow(
-		`SELECT group_concat(name, ', ') FROM pragma_table_info('messages')
-		 WHERE name <> 'content_changed_at'`,
-	).Scan(&cols)
+		`SELECT json_group_array(name) FROM (
+		     SELECT name FROM pragma_table_info('messages')
+		     WHERE name <> 'content_changed_at' ORDER BY cid)`,
+	).Scan(&encoded)
 	if err != nil {
 		return "", fmt.Errorf("read messages columns for last_modified trigger: %w", err)
 	}
-	if !cols.Valid || cols.String == "" {
+	var names []string
+	if encoded.Valid {
+		if err := json.Unmarshal([]byte(encoded.String), &names); err != nil {
+			return "", fmt.Errorf("read messages columns for last_modified trigger: %w", err)
+		}
+	}
+	if len(names) == 0 {
 		return "", errors.New(
 			"cannot scope the last_modified trigger: messages has no columns")
 	}
-	return cols.String, nil
+	return strings.Join(quoteIdentifiers(names), ", "), nil
 }
 
+// contentChangedAtDefaultStamps reports whether messages.content_changed_at
+// carries exactly the DEFAULT that ContentChangedNow writes, which is the case
+// on a database created from schema.sql. It returns false, and no error, when
+// the column has NO default — the shape an ALTER TABLE ADD COLUMN upgrade
+// produces, where the INSERT trigger is the only writer.
+//
+// A default that is neither of those is REJECTED: EnsureTriggers fails and the
+// archive does not open.
+//
+// Rejecting rather than tolerating, because the INSERT trigger cannot rescue
+// such an archive. The trigger fires only WHEN NEW.content_changed_at IS NULL,
+// and SQLite applies a non-NULL column DEFAULT BEFORE the trigger runs, so a
+// drifted default stays authoritative and goes on writing timestamps of its own
+// SHAPE. The change feed compares SQLite timestamps LEXICALLY, so once two
+// shapes are in the table ("2026-08-03 22:10:04" against
+// "2026-08-03 22:10:04.731") a cursor sorts rows into the wrong place and
+// silently skips or repeats changes, with nothing reporting it. An archive that
+// refuses to open, naming the column and both defaults, is strictly better than
+// a feed that quietly loses records.
+//
+// This costs no legitimate archive anything: SQLite has no ALTER COLUMN and
+// refuses a non-constant DEFAULT in ADD COLUMN, so neither a fresh nor an
+// upgraded archive can reach this state. Only a hand-rewritten schema can.
 func (d *SQLiteDialect) contentChangedAtDefaultStamps(q querier) (bool, error) {
 	var dflt sql.NullString
 	err := q.QueryRow(
@@ -634,7 +739,19 @@ func (d *SQLiteDialect) contentChangedAtDefaultStamps(q querier) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read messages.content_changed_at default: %w", err)
 	}
-	return dflt.Valid && dflt.String == d.ContentChangedNow(), nil
+	switch {
+	case !dflt.Valid || dflt.String == "":
+		return false, nil
+	case dflt.String == d.ContentChangedNow():
+		return true, nil
+	}
+	return false, fmt.Errorf(
+		"messages.content_changed_at carries the DEFAULT %s, but this build stamps "+
+			"the change-feed watermark with %s. The two produce timestamps of "+
+			"different shapes, and the feed orders them lexically, so mixing them "+
+			"silently skips or repeats changes. Repair the column default to %s "+
+			"before opening this archive",
+		dflt.String, d.ContentChangedNow(), d.ContentChangedNow())
 }
 
 // LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that

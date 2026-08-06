@@ -316,7 +316,8 @@ func TestListChangedMessages_UntrustedBoundIsRefusedOnAFreshProcess(t *testing.T
 	// A restarted server: a new store, so a new dialect with no remembered
 	// reading from a time when every backend was visible.
 	fresh := f.openStore(t)
-	_, err := fresh.ListChangedMessages(context.Background(), stamp.Add(-time.Microsecond), 0, 100)
+	_, err := fresh.ListChangedMessages(context.Background(),
+		store.ChangedMessagesFrom(stamp.Add(-time.Microsecond)), 100)
 	require.Error(err,
 		"with an invisible writer holding a stamp and no earlier fully-visible reading "+
 			"to fall back to, there is no bound this page can trust; serving one anyway "+
@@ -328,7 +329,7 @@ func TestListChangedMessages_UntrustedBoundIsRefusedOnAFreshProcess(t *testing.T
 	_, commitErr := peer.ExecContext(context.Background(), "COMMIT")
 	require.NoError(commitErr, "the peer commits")
 	consumer := newChangeFeedConsumer()
-	consumer.since = stamp.Add(-time.Microsecond)
+	consumer.cursor = store.ChangedMessagesFrom(stamp.Add(-time.Microsecond))
 	require.True(
 		consumer.drainUntil(t, fresh, func() bool { return consumer.subject(held) == byPeer }),
 		"refusing must be a pause, not a wedge: once the invisible writer commits the "+

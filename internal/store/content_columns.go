@@ -10,18 +10,23 @@ import (
 // content_changed_at triggers on both backends.
 //
 // The invariant tying this list to the change feed is one-directional: every
-// field the feed returns must appear here, EXCEPT id, source_id, and
-// content_changed_at (immutable identity and the watermark itself — see
-// TestChangesResponseFieldsAreAllTracked's exempt list). Any other field the
-// endpoint reports but the trigger ignores would be cached stale by a
-// consumer forever. The converse does not hold. This list also covers columns the feed does not
-// return — sender_id and metadata are tracked because changing either means
-// "re-read this message", yet neither is in the response — and that is correct:
-// tracking a column the feed omits costs a redundant re-read, while omitting a
-// column the feed returns costs silent staleness.
-// TestChangesResponseFieldsAreAllTracked asserts the direction that matters;
-// TestMessagesColumnClassificationIsExhaustive asserts every real column is
-// classified.
+// field ChangedMessage carries must appear here, EXCEPT id, source_id, and
+// content_changed_at (immutable identity and the watermark itself). Any other
+// field the feed reports but the trigger ignores would be cached stale by a
+// consumer forever. The converse does not hold. This list also covers columns
+// the feed does not return — sender_id and metadata are tracked because
+// changing either means "re-read this message", yet neither is in the response
+// — and that is correct: tracking a column the feed omits costs a redundant
+// re-read, while omitting a column the feed returns costs silent staleness.
+//
+// That direction is enforced by TestChangesResponseFieldsAreAllTracked
+// (internal/api/changes_test.go), which reflects over the feed's HTTP response
+// type and requires every field it carries to appear in this list. The response
+// type arrives with the HTTP endpoint, later in this change, so the test is not
+// in the tree at this commit; until it lands the direction is held by review
+// against ChangedMessage. TestMessagesColumnClassificationIsExhaustive already
+// asserts the other half — that every real column of `messages` is classified
+// here or in MessagesNonContentColumns.
 //
 // last_modified is NOT this list. That column is a true row-level watermark
 // that bumps on any change and stays that way -- the embed worker relies on it
@@ -31,8 +36,8 @@ import (
 // MessagesNonContentColumns fails TestMessagesColumnClassificationIsExhaustive.
 var MessagesContentColumns = []string{
 	// source_message_id is NOT immutable, despite reading like a natural key:
-	// UpdateMessageOnDedup (messages.go:447) rewrites it on a cross-mailbox
-	// RFC822 dedup match and MigrateSourceMessageID (messages.go:465) rewrites
+	// UpdateMessageOnDedup (messages.go) rewrites it on a cross-mailbox
+	// RFC822 dedup match and MigrateSourceMessageID rewrites
 	// it when a message moves between source locations. The feed returns it, so
 	// leaving it untracked would strand a consumer on a stale source ID.
 	"source_message_id",
@@ -86,58 +91,33 @@ var MessagesNonContentColumns = []string{
 	"search_fts",          // PostgreSQL-only tsvector, maintained by the FTS path
 }
 
-// ContentChangedTriggerColumnList renders MessagesContentColumns for a
+// contentChangedTriggerColumnList renders MessagesContentColumns for a
 // `... UPDATE OF <cols> ON messages ...` clause. Both dialects call this, so
 // their trigger definitions cannot disagree.
-func ContentChangedTriggerColumnList() string {
+func contentChangedTriggerColumnList() string {
 	return strings.Join(MessagesContentColumns, ", ")
 }
 
-// ContentChangedValueGuard renders the "did any content column actually change
+// contentChangedValueGuard renders the "did any content column actually change
 // value?" half of the trigger's WHEN clause.
 //
 // The column list alone is not enough. Both backends fire `UPDATE OF` on the
 // columns a statement NAMES, regardless of whether the value changed (measured
-// on both), and UpsertMessage's `ON CONFLICT ... DO UPDATE SET`
-// (messages.go:581-606) unconditionally re-assigns ten content columns on
-// every re-sync of a known message. Without this guard every message a sync
+// on both), and the `ON CONFLICT ... DO UPDATE SET` of UpsertMessage's
+// statement (upsertMessageSQL in messages.go) unconditionally re-assigns ten
+// content columns on every re-sync of a known message. Without this guard every message a sync
 // touches reports as changed and the feed carries no information.
 //
 // The comparison is null-safe both ways, so NULL->value and value->NULL count
 // as changes and NULL->NULL does not. This mirrors the idiom the upsert already
-// uses at messages.go:592 to decide whether a subject really changed.
+// uses to decide whether a subject really changed (the embed_gen CASE in that
+// same ON CONFLICT clause).
 //
 // distinctOp is "IS NOT" for SQLite, "IS DISTINCT FROM" for PostgreSQL.
-func ContentChangedValueGuard(distinctOp string) string {
+func contentChangedValueGuard(distinctOp string) string {
 	clauses := make([]string, 0, len(MessagesContentColumns))
 	for _, c := range MessagesContentColumns {
 		clauses = append(clauses, fmt.Sprintf("OLD.%s %s NEW.%s", c, distinctOp, c))
 	}
 	return "(" + strings.Join(clauses, " OR ") + ")"
-}
-
-// MessagesTableColumns returns the live column names of the messages table on
-// whichever backend the store uses. Kept beside the lists it guards.
-func MessagesTableColumns(s *Store) ([]string, error) {
-	q := `SELECT name FROM pragma_table_info('messages')`
-	if s.IsPostgreSQL() {
-		q = `SELECT column_name FROM information_schema.columns
-		     WHERE table_name = 'messages' AND table_schema = current_schema()
-		     ORDER BY ordinal_position`
-	}
-	rows, err := s.db.Query(q)
-	if err != nil {
-		return nil, fmt.Errorf("read messages columns: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var cols []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan messages column: %w", err)
-		}
-		cols = append(cols, name)
-	}
-	return cols, rows.Err()
 }

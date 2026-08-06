@@ -1,10 +1,12 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,24 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func subsetPersonDefinition(slug string) AttributeDefinitionInput {
+	return AttributeDefinitionInput{
+		UniversalID: "test-" + slug,
+		ObjectType:  AttributeObjectPerson,
+		Slug:        slug,
+		Label:       "Test " + slug,
+		ValueType:   AttributeValueText,
+		FieldType:   AttributeFieldText,
+		Cardinality: AttributeCardinalitySingle,
+		Ownership:   AttributeOwnershipUser,
+		UICreatable: true,
+		UIEditable:  true,
+		APIMutable:  true,
+		IsAudited:   true,
+		IsDeletable: true,
+	}
+}
 
 // createTestSourceDB creates a source database with schema and test
 // data. Returns the path to the database.
@@ -291,6 +311,186 @@ func TestCopySubset_PreservesPersonProfiles(t *testing.T) {
 	assert.Equal(person.DisplayName, copied.DisplayName)
 	assert.Equal(person.Revision, copied.Revision)
 	assert.Equal(person.ParticipantIDs, copied.ParticipantIDs)
+}
+
+func TestCopySubset_AttributesRequireExplicitOptIn(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := context.Background()
+	srcDB := createTestSourceDB(t, t.TempDir(), 5)
+	source, err := Open(srcDB)
+	require.NoError(err)
+	person, _, err := source.CreatePersonFromParticipant(2)
+	require.NoError(err)
+
+	input := subsetPersonDefinition("synthetic_preference")
+	input.UniversalID = "test-synthetic-preference"
+	input.FieldType = AttributeFieldSelect
+	input.Options = &AttributeOptions{Choices: []AttributeChoice{
+		{Value: "alpha", Label: "Alpha"},
+		{Value: "beta", Label: "Beta"},
+	}}
+	definition, err := source.CreateAttributeDefinitionContext(ctx, input)
+	require.NoError(err)
+	_, err = source.db.Exec(
+		`UPDATE attribute_definitions SET id = 42 WHERE id = ?`, definition.ID)
+	require.NoError(err)
+
+	firstAt := time.Date(2026, 7, 29, 8, 0, 0, 0, time.UTC)
+	sourceRef := "fixture:synthetic-preference"
+	actor := "synthetic-agent"
+	confidence := 0.75
+	first, err := source.SetPersonAttributeValueContext(ctx, PersonAttributeValueInput{
+		PersonID: person.ID, DefinitionSlug: input.Slug,
+		Value:      AttributeValue{Type: AttributeValueText, Text: new("alpha")},
+		ActiveFrom: &firstAt, Source: ProvenanceExtraction,
+		SourceRef: &sourceRef, Confidence: &confidence, Actor: &actor,
+	})
+	require.NoError(err)
+	secondAt := firstAt.Add(24 * time.Hour)
+	_, err = source.SetPersonAttributeValueContext(ctx, PersonAttributeValueInput{
+		PersonID: person.ID, DefinitionSlug: input.Slug,
+		Value:      AttributeValue{Type: AttributeValueText, Text: new("beta")},
+		ActiveFrom: &secondAt, Source: ProvenanceUser,
+		ExpectedValueID: &first.Value.ID,
+	})
+	require.NoError(err)
+	require.NoError(source.Close())
+
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	_, err = CopySubset(srcDB, dstDir, 5, false)
+	require.NoError(err)
+	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = destination.Close() })
+
+	_, err = destination.GetAttributeDefinitionBySlugContext(
+		ctx, AttributeObjectPerson, input.Slug)
+	require.ErrorIs(err, ErrAttributeDefinitionNotFound,
+		"shared subsets must not copy person attribute definitions by default")
+
+	history, err := destination.ListPersonAttributeValuesContext(
+		ctx, person.ID, PersonAttributeQuery{
+			DefinitionSlug: input.Slug,
+			IncludeHistory: true,
+		})
+	require.NoError(err)
+	assert.Empty(history,
+		"shared subsets must not copy current or historical person attribute values by default")
+
+	attributesDir := filepath.Join(t.TempDir(), "attributes")
+	_, err = CopySubsetWithOptions(srcDB, attributesDir, 5, CopySubsetOptions{
+		IncludeAttributes: true,
+	})
+	require.NoError(err)
+	withAttributes, err := Open(filepath.Join(attributesDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = withAttributes.Close() })
+
+	copiedDefinition, err := withAttributes.GetAttributeDefinitionBySlugContext(
+		ctx, AttributeObjectPerson, input.Slug)
+	require.NoError(err)
+	assert.Equal(input.UniversalID, copiedDefinition.UniversalID)
+	assert.NotEqual(int64(42), copiedDefinition.ID,
+		"destination definition ID must be local rather than copied from the source")
+	assert.Equal(input.Slug, copiedDefinition.Slug)
+	require.NotNil(copiedDefinition.Options)
+	assert.Equal(input.Options.Choices, copiedDefinition.Options.Choices)
+
+	history, err = withAttributes.ListPersonAttributeValuesContext(
+		ctx, person.ID, PersonAttributeQuery{
+			DefinitionSlug: input.Slug,
+			IncludeHistory: true,
+		})
+	require.NoError(err)
+	require.Len(history, 2)
+	assert.Equal(copiedDefinition.ID, history[0].DefinitionID)
+	assert.Equal("beta", *history[0].Value.Text)
+	assert.Equal(copiedDefinition.ID, history[1].DefinitionID)
+	assert.Equal("alpha", *history[1].Value.Text)
+	assert.Equal(ProvenanceExtraction, history[1].Source)
+	assert.Equal(sourceRef, *history[1].SourceRef)
+	assert.InDelta(confidence, *history[1].Confidence, 0)
+	assert.Equal(actor, *history[1].Actor)
+	require.NotNil(history[1].ActiveUntil)
+	require.NotNil(history[1].SupersededAt)
+}
+
+func TestCopySubset_RecordReferencesFollowIdentityPolicy(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := context.Background()
+	srcDB := createTestSourceDB(t, t.TempDir(), 5)
+	source, err := Open(srcDB)
+	require.NoError(err)
+	owner, _, err := source.CreatePersonFromParticipant(2)
+	require.NoError(err)
+	targetParticipant, err := source.EnsureParticipant(
+		"attribute-target@example.com", "attribute target", "example.com")
+	require.NoError(err)
+	target, _, err := source.CreatePersonFromParticipant(targetParticipant)
+	require.NoError(err)
+
+	input := subsetPersonDefinition("synthetic_person_reference")
+	input.UniversalID = "test-synthetic-person-reference"
+	input.ValueType = AttributeValueRecordReference
+	input.FieldType = AttributeFieldPerson
+	input.RecordTarget = new("person")
+	_, err = source.CreateAttributeDefinitionContext(ctx, input)
+	require.NoError(err)
+	write, err := source.SetPersonAttributeValueContext(ctx, PersonAttributeValueInput{
+		PersonID: owner.ID, DefinitionSlug: input.Slug,
+		Value: AttributeValue{
+			Type:       AttributeValueRecordReference,
+			RecordType: new("person"),
+			RecordID:   &target.ID,
+		},
+		Source: ProvenanceUser,
+	})
+	require.NoError(err)
+	require.NoError(source.Close())
+
+	defaultDir := filepath.Join(t.TempDir(), "default")
+	_, err = CopySubset(srcDB, defaultDir, 5, false)
+	require.NoError(err)
+	defaultSubset, err := Open(filepath.Join(defaultDir, "msgvault.db"))
+	require.NoError(err)
+	defer func() { _ = defaultSubset.Close() }()
+	_, err = defaultSubset.GetPerson(owner.ID)
+	require.NoError(err, "message-derived owner remains included")
+	_, err = defaultSubset.GetPerson(target.ID)
+	require.ErrorIs(err, ErrPersonNotFound,
+		"off-message record target stays outside the default identity boundary")
+	defaultValues, err := defaultSubset.ListPersonAttributeValuesContext(
+		ctx, owner.ID, PersonAttributeQuery{
+			DefinitionSlug: input.Slug,
+			IncludeHistory: true,
+		})
+	require.NoError(err)
+	assert.Empty(defaultValues,
+		"record references to excluded identities must not dangle in the subset")
+
+	identityDir := filepath.Join(t.TempDir(), "identity")
+	_, err = CopySubsetWithOptions(srcDB, identityDir, 5, CopySubsetOptions{
+		IncludeIdentity:   true,
+		IncludeAttributes: true,
+	})
+	require.NoError(err)
+	identitySubset, err := Open(filepath.Join(identityDir, "msgvault.db"))
+	require.NoError(err)
+	defer func() { _ = identitySubset.Close() }()
+	copiedTarget, err := identitySubset.GetPerson(target.ID)
+	require.NoError(err)
+	assert.Equal(target.ParticipantIDs, copiedTarget.ParticipantIDs)
+	identityValues, err := identitySubset.ListPersonAttributeValuesContext(
+		ctx, owner.ID, PersonAttributeQuery{
+			DefinitionSlug: input.Slug,
+			IncludeHistory: true,
+		})
+	require.NoError(err)
+	require.Len(identityValues, 1)
+	assert.Equal(write.Value.ID, identityValues[0].ID)
+	assert.Equal(target.ID, *identityValues[0].Value.RecordID)
 }
 
 // TestCopySubset_IncludeIdentityPreservesClusters covers a promoted linked
@@ -1163,6 +1363,279 @@ func TestCopySubset_ControlCharInPath(t *testing.T) {
 	}
 }
 
+// TestCopySubset_LegacySourceMissingAttributionColumns covers a source archive
+// whose messages table lacks a column the destination schema has.
+//
+// source_is_from_me and identity_is_from_me are both added to older archives
+// by SQLiteDialect.LegacyColumnMigrations(), so an archive written before
+// those migrations legitimately lacks them. The copy intersects the source and
+// destination messages columns at run time, so such an archive copies the
+// columns the two schemas share and leaves the absent ones at the
+// destination's own default.
+//
+// TestCopySubset_LegacySourceWithoutOAuthApp rebuilds its table via CREATE
+// TABLE ... AS SELECT to avoid ALTER TABLE ... DROP COLUMN, which SQLite only
+// added in 3.35; this test does use DROP COLUMN and so needs SQLite 3.35 or
+// newer. The messages table cannot be rebuilt the other way: the triggers
+// trg_message_bodies_last_modified_upd and trg_message_bodies_last_modified_ins
+// update messages, which resolves to main.messages, so the rename back — ALTER
+// TABLE ... RENAME TO messages — fails its schema reparse with "error in
+// trigger trg_message_bodies_last_modified_upd: no such table: main.messages".
+// Neither attribution column is indexed or named by any trigger or view, so
+// ALTER TABLE ... DROP COLUMN works directly.
+func TestCopySubset_LegacySourceMissingAttributionColumns(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "dst")
+
+	srcDB := createTestSourceDB(t, srcDir, 3)
+
+	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	require.NoError(err, "open source db")
+
+	for _, col := range []string{"source_is_from_me", "identity_is_from_me"} {
+		_, err = db.Exec(
+			`ALTER TABLE messages DROP COLUMN ` + col,
+		)
+		require.NoError(err, "drop messages.%s", col)
+	}
+
+	var srcCount int
+	require.NoError(db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&srcCount),
+		"count source messages")
+	require.Equal(3, srcCount, "source messages")
+	require.NoError(db.Close(), "close source db")
+
+	result, err := CopySubset(srcDB, dstDir, 100, false)
+	require.NoError(err, "CopySubset from a source missing attribution columns")
+	assert.Equal(int64(srcCount), result.Messages, "Messages")
+
+	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination db")
+	defer func() { _ = dstDB.Close() }()
+
+	var dstCount int
+	require.NoError(
+		dstDB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&dstCount),
+		"count destination messages")
+	assert.Equal(srcCount, dstCount, "destination message count")
+
+	// The absent columns take the destination schema's defaults:
+	// source_is_from_me has none (NULL), identity_is_from_me defaults to FALSE.
+	var sourceDefaults int
+	require.NoError(dstDB.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE source_is_from_me IS NULL`,
+	).Scan(&sourceDefaults), "count source_is_from_me defaults")
+	assert.Equal(dstCount, sourceDefaults,
+		"source_is_from_me should hold its schema default (NULL)")
+
+	var identityDefaults int
+	require.NoError(dstDB.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 0`,
+	).Scan(&identityDefaults), "count identity_is_from_me defaults")
+	assert.Equal(dstCount, identityDefaults,
+		"identity_is_from_me should hold its schema default (FALSE)")
+}
+
+// TestCopySubset_SourceOnlyColumnWithQuoteInName covers a source archive whose
+// messages table carries a column the destination schema does not have, and
+// whose name contains a double quote. The column falls outside the two
+// schemas' intersection, so it is never interpolated into the copy's SQL and
+// the copy proceeds without it.
+func TestCopySubset_SourceOnlyColumnWithQuoteInName(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "dst")
+
+	srcDB := createTestSourceDB(t, srcDir, 3)
+
+	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	require.NoError(err, "open source db")
+	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN "we""ird" TEXT`)
+	require.NoError(err, `add messages."we""ird"`)
+	require.NoError(db.Close(), "close source db")
+
+	result, err := CopySubset(srcDB, dstDir, 100, false)
+	require.NoError(err, "CopySubset from a source with a quoted column name")
+	assert.Equal(int64(3), result.Messages, "Messages")
+
+	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination db")
+	defer func() { _ = dstDB.Close() }()
+
+	var dstCount int
+	require.NoError(
+		dstDB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&dstCount),
+		"count destination messages")
+	assert.Equal(3, dstCount, "destination message count")
+}
+
+// TestCopySubset_CommonColumnWithQuoteIsEscapedAndCopied covers a column
+// present in both schemas whose name contains a double quote. That name is
+// interpolated into the copy's SQL, so commonColumns escapes it — doubling the
+// quote, the way SQL escapes one inside a quoted identifier — rather than
+// refusing the copy. The name also carries an injection payload, which the
+// escaping renders inert.
+func TestCopySubset_CommonColumnWithQuoteIsEscapedAndCopied(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.db")
+	dstPath := filepath.Join(dir, "dst.db")
+
+	// Closes the identifier, ends the statement, drops the table, and comments
+	// out whatever the interpolator appends after it.
+	const hostile = `we"ird" ); DROP TABLE t; --`
+	quoted := `"` + strings.ReplaceAll(hostile, `"`, `""`) + `"`
+
+	for _, path := range []string{srcPath, dstPath} {
+		db, err := sql.Open("sqlite3", path)
+		require.NoError(err, "open %s", path)
+		_, err = db.Exec(`CREATE TABLE t (id INTEGER, ` + quoted + ` TEXT)`)
+		require.NoError(err, "create t in %s", path)
+		require.NoError(db.Close(), "close %s", path)
+	}
+
+	srcDB, err := sql.Open("sqlite3", srcPath)
+	require.NoError(err, "open source db")
+	_, err = srcDB.Exec(`INSERT INTO t (id, ` + quoted + `) VALUES (1, 'carried')`)
+	require.NoError(err, "seed source row")
+	require.NoError(srcDB.Close(), "close source db")
+
+	db, err := sql.Open("sqlite3", dstPath)
+	require.NoError(err, "open destination db")
+	defer func() { _ = db.Close() }()
+	_, err = db.Exec(fmt.Sprintf("ATTACH DATABASE '%s' AS src", srcPath))
+	require.NoError(err, "attach source db")
+
+	tx, err := db.Begin()
+	require.NoError(err, "begin transaction")
+	defer func() { _ = tx.Rollback() }()
+
+	cols, err := commonColumns(tx, "t")
+	require.NoError(err, "commonColumns must render a quoted column name, not refuse it")
+	assert.Equal([]string{`"id"`, quoted}, cols,
+		"the embedded quote must be doubled, not dropped and not rejected")
+
+	// The rendered list is what the copy interpolates, so run the copy it feeds.
+	list := strings.Join(cols, ", ")
+	_, err = tx.Exec(fmt.Sprintf(
+		`INSERT INTO t (%s) SELECT %s FROM src.t`, list, list))
+	require.NoError(err, "copy through the escaped column list")
+
+	var carried string
+	require.NoError(tx.QueryRow(`SELECT `+quoted+` FROM t WHERE id = 1`).Scan(&carried),
+		"read the copied value")
+	assert.Equal("carried", carried, "the copy must carry the oddly named column's value")
+
+	var tables int
+	require.NoError(tx.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 't'`).Scan(&tables),
+		"read sqlite_master")
+	assert.Equal(1, tables, "the payload riding in the column name must not have executed")
+}
+
+// TestCopySubset_SourceColumnCaseDiffers covers a source archive that declares
+// a messages column in a different case than the destination schema. SQLite
+// compares identifiers case-insensitively, so the two are the same column and
+// its values must be copied rather than left at the destination's default.
+func TestCopySubset_SourceColumnCaseDiffers(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "dst")
+
+	srcDB := createTestSourceDB(t, srcDir, 3)
+
+	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	require.NoError(err, "open source db")
+	_, err = db.Exec(`ALTER TABLE messages DROP COLUMN identity_is_from_me`)
+	require.NoError(err, "drop messages.identity_is_from_me")
+	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN Identity_Is_From_Me BOOLEAN`)
+	require.NoError(err, "add messages.Identity_Is_From_Me")
+	_, err = db.Exec(`UPDATE messages SET Identity_Is_From_Me = TRUE`)
+	require.NoError(err, "set messages.Identity_Is_From_Me")
+	require.NoError(db.Close(), "close source db")
+
+	result, err := CopySubset(srcDB, dstDir, 100, false)
+	require.NoError(err, "CopySubset from a source whose column case differs")
+	assert.Equal(int64(3), result.Messages, "Messages")
+
+	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination db")
+	defer func() { _ = dstDB.Close() }()
+
+	var copied int
+	require.NoError(dstDB.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 1`,
+	).Scan(&copied), "count copied identity_is_from_me")
+	assert.Equal(3, copied,
+		"identity_is_from_me should carry the source's values, not the default")
+}
+
+// TestCopySubset_SourceOnlyColumnUnicodeLookalike covers a source archive whose
+// messages table carries a source-only column whose name differs from a
+// destination column's only under Unicode case conversion: "İ" (U+0130, capital
+// I with dot above) where the destination has ASCII "i".
+//
+// SQLite folds identifiers over ASCII only, so İdentity_is_from_me and
+// identity_is_from_me are two different columns and the source simply lacks the
+// destination's. Go's strings.ToLower folds them together, which would put
+// identity_is_from_me in the copy's column list and make the copy select a
+// column src.messages does not have; SQLite's double-quoted-string misfeature
+// would then read that name as a string literal and store the text
+// "identity_is_from_me" in every destination row. The destination's own default
+// (FALSE) must win instead.
+//
+// This is the non-ASCII counterpart to
+// TestCopySubset_SourceColumnCaseDiffers, which covers the ordinary ASCII case
+// where the two spellings are the same column.
+func TestCopySubset_SourceOnlyColumnUnicodeLookalike(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "dst")
+
+	srcDB := createTestSourceDB(t, srcDir, 3)
+
+	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	require.NoError(err, "open source db")
+	_, err = db.Exec(`ALTER TABLE messages DROP COLUMN identity_is_from_me`)
+	require.NoError(err, "drop messages.identity_is_from_me")
+	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN "İdentity_is_from_me" TEXT`)
+	require.NoError(err, "add messages.İdentity_is_from_me")
+	_, err = db.Exec(`UPDATE messages SET "İdentity_is_from_me" = 'source value'`)
+	require.NoError(err, "set messages.İdentity_is_from_me")
+	require.NoError(db.Close(), "close source db")
+
+	result, err := CopySubset(srcDB, dstDir, 100, false)
+	require.NoError(err, "CopySubset from a source with a Unicode-lookalike column")
+	assert.Equal(int64(3), result.Messages, "Messages")
+
+	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination db")
+	defer func() { _ = dstDB.Close() }()
+
+	var defaulted int
+	require.NoError(dstDB.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 0`,
+	).Scan(&defaulted), "count identity_is_from_me defaults")
+	assert.Equal(3, defaulted,
+		"identity_is_from_me should hold the destination default (FALSE), "+
+			"the source not having that column")
+
+	// Name the failure the Unicode fold produces: the quoted column name
+	// degrading to a string literal writes its own text into every row.
+	var literals int
+	require.NoError(dstDB.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 'identity_is_from_me'`,
+	).Scan(&literals), "count identity_is_from_me string literals")
+	assert.Equal(0, literals,
+		"identity_is_from_me must not hold its own name as a string")
+}
+
 // TestCopySubset_NullWatermarkIsRestamped covers what the positional copy can
 // carry through that no other write path can.
 //
@@ -1327,4 +1800,109 @@ func TestCopySubset_LegacySourceWithoutContentChangedAt(t *testing.T) {
 		Scan(&sourceMessageID, &subject), "read a copied row")
 	assert.Equal("msg_1", sourceMessageID, "source_message_id")
 	assert.Equal("Subject B", subject, "subject")
+}
+
+// TestCopySubset_BodyTriggersRestampWatermarks pins what the copy actually does
+// to the two watermarks, which is not what the restamp statement alone suggests.
+//
+// The restamp names only content_changed_at, so it fires no trigger on
+// `messages`. But the `INSERT INTO message_bodies` that follows it fires
+// trg_message_bodies_content_changed_ins and schema.sql's pre-existing
+// trg_message_bodies_last_modified_ins, and both of those write the parent row
+// directly. The result is a split: a copied message that HAS a body carries
+// copy-time values for both columns, and a bodyless one carries the source's.
+//
+// That split is accepted, not repaired — a subset is a new archive whose feed
+// consumers start from an empty cursor, and last_modified has behaved this way
+// since long before content_changed_at existed. It is pinned here because it is
+// invisible from the copy statement and a reader would otherwise conclude, as
+// the code comment once did, that a subset preserves the source's watermarks.
+func TestCopySubset_BodyTriggersRestampWatermarks(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "dst")
+
+	const (
+		srcLastModified      = "2001-02-03 04:05:06"
+		srcContentChangedAt  = "2001-02-03 04:05:06.000"
+		bodylessMessageID    = 99
+		messageWithBodyID    = 1
+		messagesWithBodyLast = 2
+	)
+
+	srcPath := createTestSourceDB(t, srcDir, messagesWithBodyLast)
+	srcDB, err := sql.Open("sqlite3", srcPath+"?_foreign_keys=OFF")
+	require.NoError(err, "open source")
+
+	// createTestSourceDB gives every message a body. Add one without, because
+	// the presence of a body is the whole variable here.
+	_, err = srcDB.Exec(`
+		INSERT INTO messages
+			(id, conversation_id, source_id, source_message_id, message_type, subject)
+		VALUES (?, 1, 1, 'msg_bodyless', 'email', 'No body')`, bodylessMessageID)
+	require.NoError(err, "insert a message with no body")
+
+	// Force both watermarks to a known instant far in the past, so a copy-time
+	// stamp is unmistakable.
+	_, err = srcDB.Exec(
+		`UPDATE messages SET last_modified = ?, content_changed_at = ?`,
+		srcLastModified, srcContentChangedAt)
+	require.NoError(err, "age the source watermarks")
+	require.NoError(srcDB.Close(), "close source")
+
+	_, err = CopySubset(srcPath, dstDir, 100, false)
+	require.NoError(err, "CopySubset")
+
+	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination")
+	defer func() { _ = dstDB.Close() }()
+
+	// Read the stored text, not the scanned value: go-sqlite3 converts a
+	// DATETIME column to time.Time on the way out, which would hide the exact
+	// stored form the feed compares lexically.
+	read := func(id int64) (lastModified, contentChangedAt string) {
+		t.Helper()
+		require.NoError(dstDB.QueryRow(`
+			SELECT CAST(last_modified AS TEXT), CAST(content_changed_at AS TEXT)
+			FROM messages WHERE id = ?`, id).Scan(&lastModified, &contentChangedAt),
+			"read the copied watermarks for message %d", id)
+		return lastModified, contentChangedAt
+	}
+
+	bodylessLM, bodylessCC := read(bodylessMessageID)
+	assert.Equal(srcLastModified, bodylessLM,
+		"a message with no body has nothing to fire the message_bodies triggers, "+
+			"so its last_modified is the source's")
+	assert.Equal(srcContentChangedAt, bodylessCC,
+		"and so is its content_changed_at: the restamp only fills NULLs, and this "+
+			"one was not NULL")
+
+	for id := int64(messageWithBodyID); id <= messagesWithBodyLast; id++ {
+		withBodyLM, withBodyCC := read(id)
+		assert.NotEqualf(srcLastModified, withBodyLM,
+			"message %d has a body, so trg_message_bodies_last_modified_ins rewrote "+
+				"last_modified when the body was copied; a subset does not preserve it", id)
+		assert.NotEqualf(srcContentChangedAt, withBodyCC,
+			"message %d has a body, so trg_message_bodies_content_changed_ins rewrote "+
+				"content_changed_at when the body was copied", id)
+
+		_, parseErr := time.Parse(SQLiteTimestampLayout, withBodyCC)
+		require.NoErrorf(parseErr,
+			"the rewritten watermark %q on message %d must still be in the format "+
+				"SQLiteDialect.ContentChangedNow writes, or the feed's lexical cursor "+
+				"orders it wrong", withBodyCC, id)
+		assert.Greaterf(withBodyCC, srcContentChangedAt,
+			"a copy-time stamp must sort ABOVE the source value it replaced (%q vs %q) "+
+				"on message %d", withBodyCC, srcContentChangedAt, id)
+	}
+
+	// Whatever the split, no row may leave the copy unwatermarked: the feed's
+	// range predicate excludes NULL and nothing in the destination would ever
+	// stamp it later.
+	var missing int64
+	require.NoError(dstDB.QueryRow(
+		"SELECT COUNT(*) FROM messages WHERE content_changed_at IS NULL").Scan(&missing),
+		"count unwatermarked messages")
+	assert.Zero(missing, "every copied message must carry a watermark")
 }

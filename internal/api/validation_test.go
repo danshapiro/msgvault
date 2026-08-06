@@ -69,11 +69,10 @@ func TestInvalidQueryParamsReturn400(t *testing.T) {
 		{"filter direction bogus", "/api/v1/messages/filter?direction=sideways", "invalid_direction", "direction"},
 		{"filter empty_targets bogus", "/api/v1/messages/filter?empty_targets=bogusview", "invalid_empty_targets", "empty_targets"},
 		{"filter after not a date", "/api/v1/messages/filter?after=not-a-date", "invalid_after", "after"},
-		// The changes feed rejects a malformed cursor before it consults the
-		// store, so these stay 400 on the mock store used here instead of being
-		// masked by the feed's feature-unavailable 503.
-		{"changes since not a date", "/api/v1/messages/changes?since=not-a-date", "invalid_since", "since"},
-		{"changes since_id not numeric", "/api/v1/messages/changes?since_id=abc", "invalid_since_id", "since_id"},
+		// The changes feed rejects a cursor it did not issue before it consults
+		// the store, so these stay 400 on the mock store used here instead of
+		// being masked by the feed's feature-unavailable 503.
+		{"changes cursor not a token", "/api/v1/messages/changes?cursor=not-a-cursor!!", "invalid_cursor", "cursor"},
 		{"changes limit not numeric", "/api/v1/messages/changes?limit=xyz", "invalid_limit", "limit"},
 		{"messages page not numeric", "/api/v1/messages?page=abc", "invalid_page", "page"},
 		{"messages page_size not numeric", "/api/v1/messages?page_size=xyz", "invalid_page_size", "page_size"},

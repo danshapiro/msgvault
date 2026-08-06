@@ -48,10 +48,9 @@ type ColumnMigration struct {
 // uncommitted stamp is at or above that instant. The one write this cannot
 // cover is a PostgreSQL prepared transaction, which holds its locks with no
 // owning session and so exposes no start time to be the oldest. That residual
-// and every other exception to what the feed delivers are enumerated in one
-// place, docs/api-server.md's delivery contract; this comment names only the
-// exception that bears on CommitBound and deliberately does not restate the
-// list, because a list kept in two places drifts.
+// and the feed's other exceptions are written up in docs/api-server.md; this
+// comment names only the exception that bears on CommitBound and deliberately
+// does not restate the list, because a list kept in two places drifts.
 //
 // CommitBound is never after Now, and while a write transaction is in flight it
 // lags Now. That lag is the feature's cost: while a connection sits idle inside
@@ -180,7 +179,15 @@ type Dialect interface {
 	// FTSAvailable reports whether full-text search is available for this database.
 	// For SQLite this probes the FTS5 virtual table; for PostgreSQL it checks
 	// that the tsvector column exists.
-	FTSAvailable(db *sql.DB) bool
+	//
+	// A probe that fails reports "unavailable" with a nil error — that is the
+	// answer for a binary built without FTS5, and it is the whole point of
+	// probing rather than asking the schema. The error is reserved for ctx: a
+	// cancelled probe has no answer at all, and reporting one as `false` would
+	// turn an operator's SIGINT into a store that silently believes search is
+	// gone. Implementations must bind the probe to ctx and must not reach around
+	// it to a contextless handle.
+	FTSAvailable(ctx context.Context, db *sql.DB) (bool, error)
 
 	// FTSNeedsBackfill reports whether the FTS index needs to be populated.
 	FTSNeedsBackfill(db *sql.DB) bool
@@ -226,20 +233,41 @@ type Dialect interface {
 	// Takes a querier (not *sql.DB) so InitSchema can run it on the
 	// maintenance transaction whose statement_timeout has been disabled —
 	// the GIN build over a populated messages table can exceed the pool-wide
-	// 30s timeout on a large archive (finding S1).
+	// 30s timeout on a large archive (finding S1). As with EnsureTriggers,
+	// InitSchema passes one BOUND to its context, so an implementation
+	// inherits cancellation from every statement it runs through q and must
+	// not reach around it to a contextless handle: with no statement_timeout
+	// left on the transaction, an index build blocked on a table lock would
+	// otherwise ignore SIGINT and SIGTERM indefinitely.
 	EnsureFTSIndex(q querier) error
 
-	// EnsureTriggers idempotently creates the database-maintained triggers
-	// that bump messages.last_modified on any change to a message or its
-	// body row. Called by InitSchema after LegacyColumnMigrations (which add
-	// the last_modified column on legacy DBs), so the column is guaranteed
-	// present. SQLite is a no-op: its triggers are `CREATE TRIGGER IF NOT
-	// EXISTS` in schema.sql, re-exec'd idempotently by InitSchema. PostgreSQL
-	// creates them here because CREATE TRIGGER is not idempotent before PG14,
-	// so the impl wraps each in `DROP TRIGGER IF EXISTS ...; CREATE TRIGGER`.
+	// ValidateMessageWatermarks checks cheap, backend-specific invariants that
+	// must hold on every open even when the versioned trigger migration is
+	// already applied.
+	ValidateMessageWatermarks(q querier) error
+
+	// EnsureTriggers idempotently creates the database-maintained triggers on
+	// both message watermarks: last_modified, which bumps on any change to a
+	// message or its body row, and content_changed_at, the change feed's
+	// watermark, which bumps only when tracked content actually changes.
+	// Called by InitSchema after LegacyColumnMigrations (which add both
+	// columns on legacy DBs), so both are guaranteed present.
+	//
+	// Both dialects DROP and CREATE rather than create-if-absent, so a change
+	// to the tracked-column list reaches an existing archive. On SQLite that
+	// includes trg_messages_last_modified, whose `UPDATE OF` scope has to be
+	// built from the live column list and so cannot be static SQL; only the
+	// message_bodies last_modified pair still rides schema.sql. On PostgreSQL
+	// it covers every trigger, because CREATE TRIGGER is not idempotent
+	// before PG14.
 	//
 	// Takes a querier (not *sql.DB) so InitSchema can run it on the
-	// maintenance transaction (consistent with EnsureFTSIndex).
+	// maintenance transaction (consistent with EnsureFTSIndex). InitSchema
+	// passes one BOUND to its context, so an implementation inherits
+	// cancellation from every statement it runs through q and must not reach
+	// around it to a contextless handle: the maintenance transaction has no
+	// statement_timeout, so a DDL statement blocked on a table lock would
+	// otherwise ignore SIGINT and SIGTERM indefinitely.
 	EnsureTriggers(q querier) error
 
 	// LegacyColumnMigrations returns ALTER TABLE ADD COLUMN statements to
