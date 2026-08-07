@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -18,6 +19,8 @@ import (
 const daemonOwnerLockFile = "daemon.lock"
 
 type serveOwnership struct {
+	mu            sync.Mutex
+	closed        bool
 	dataDir       string
 	shutdownToken string
 	record        daemon.RuntimeRecord
@@ -70,6 +73,11 @@ func (o *serveOwnership) SetStartupPhase(phase string) error {
 	if o == nil {
 		return nil
 	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return nil
+	}
 	rec := o.record
 	metadata := maps.Clone(rec.Metadata)
 	if metadata == nil {
@@ -92,6 +100,12 @@ func (o *serveOwnership) Close() error {
 	if o == nil {
 		return nil
 	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return nil
+	}
+	o.closed = true
 	removeDaemonRuntime(o.dataDir)
 	return errors.Join(o.lock.Close(), o.daemonLock.Close())
 }
@@ -107,6 +121,11 @@ const daemonRuntimeHeartbeatInterval = 30 * time.Second
 // daemon self-heal instead of staying undiscoverable until it restarts.
 func (o *serveOwnership) EnsureRuntimeRecord() error {
 	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
 		return nil
 	}
 	store := daemonRuntimeStore(o.dataDir)
@@ -127,13 +146,9 @@ func (o *serveOwnership) EnsureRuntimeRecord() error {
 
 // runtimeRecordHeartbeat republishes the runtime record until ctx is
 // cancelled. Failures are retried on the next tick rather than surfaced:
-// the daemon keeps serving even when the record cannot be rewritten. A
-// final tick racing shutdown can at worst leave a record naming a dead
-// PID, which CleanupDead reaps conservatively on the next CLI run. If
-// that PID is recycled before then, the file lingers (ProcessAlive sees
-// it alive) but is never trusted: it still carries the old daemon's
-// create_time, so the identity check filters it, and a new daemon is
-// unaffected (ownership is gated by the daemon.lock flock).
+// the daemon keeps serving even when the record cannot be rewritten.
+// serveOwnership serializes heartbeats with startup-phase updates and
+// closure so a tick cannot republish the record after shutdown removes it.
 func runtimeRecordHeartbeat(ctx context.Context, ownership *serveOwnership, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -154,6 +169,28 @@ type daemonOwnerLock struct {
 
 func daemonOwnerLockPath(dataDir string) string {
 	return filepath.Join(dataDir, daemonOwnerLockFile)
+}
+
+// daemonOwnerLockHeld reports whether another process currently owns the
+// archive's daemon lease. A missing lock is cleanly unheld; other filesystem
+// errors are returned so safety-critical callers can fail closed. The lease
+// can establish that daemon startup is in progress even when process
+// create-time reads are temporarily inconsistent; it does not authenticate a
+// runtime record's PID or HTTP endpoint.
+func daemonOwnerLockHeld(dataDir string) (bool, error) {
+	path := daemonOwnerLockPath(dataDir)
+	lock := flock.New(path, flock.SetFlag(os.O_RDWR))
+	locked, err := lock.TryLock()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("probe daemon lock %s: %w", path, err)
+	}
+	if err := lock.Close(); err != nil {
+		return false, fmt.Errorf("close daemon lock probe %s: %w", path, err)
+	}
+	return !locked, nil
 }
 
 func tryAcquireDaemonOwnerLock(dataDir string) (*daemonOwnerLock, error) {

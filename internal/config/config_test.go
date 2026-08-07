@@ -1051,15 +1051,26 @@ mcp_enabled = true
 }
 
 func TestNewDefaultConfig(t *testing.T) {
+	assert := assert.New(t)
 	// Use a temp directory as MSGVAULT_HOME
 	tmpDir := t.TempDir()
 	t.Setenv("MSGVAULT_HOME", tmpDir)
 
 	cfg := NewDefaultConfig()
 
-	assert.Equal(t, tmpDir, cfg.HomeDir)
-	assert.Equal(t, tmpDir, cfg.Data.DataDir)
-	assert.Equal(t, 5, cfg.Sync.RateLimitQPS)
+	assert.Equal(tmpDir, cfg.HomeDir)
+	assert.Equal(tmpDir, cfg.Data.DataDir)
+	assert.False(cfg.Data.LooseAttachments)
+	assert.Equal(5, cfg.Sync.RateLimitQPS)
+}
+
+func TestDataLooseAttachmentsConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte("[data]\nloose_attachments = true\n"), 0o600))
+
+	cfg, err := Load(path, "")
+	require.NoError(t, err)
+	assert.True(t, cfg.Data.LooseAttachments)
 }
 
 func TestSaveAndLoad_RoundTrip(t *testing.T) {
@@ -1098,21 +1109,25 @@ func TestSaveAndLoad_RoundTrip(t *testing.T) {
 	assert.Equal("user@gmail.com", loaded.Accounts[0].Email)
 }
 
-func TestSave_CreatesFileWithSecurePermissions(t *testing.T) {
+func TestConfigFileModeOnSave(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cfg := NewDefaultConfig()
 	cfg.HomeDir = tmpDir
+	cfg.Fastmail = []FastmailSource{{
+		SourceID: 14,
+		APIToken: "fm_test_file_mode",
+	}}
 
 	require.NoError(t, cfg.Save(), "Save()")
 
 	info, err := os.Stat(cfg.ConfigFilePath())
 	require.NoError(t, err, "Stat config")
 
-	// Should have no group/other permissions (0600 or stricter)
+	// The config may contain provider API tokens, so its Unix mode must be exact.
 	// Windows doesn't support Unix file permissions.
 	if runtime.GOOS != "windows" {
-		assert.Zero(t, info.Mode().Perm()&0077, "config perm = %04o, want no group/other access", info.Mode().Perm())
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 	}
 }
 

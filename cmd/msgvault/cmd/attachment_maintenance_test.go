@@ -43,7 +43,7 @@ func newAttachmentMaintenanceFixture(t *testing.T) *attachmentMaintenanceFixture
 	dir := t.TempDir()
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	maintenance, err := newAttachmentMaintenance(storeFixture.Store, dir, logger)
+	maintenance, err := newAttachmentMaintenance(storeFixture.Store, dir, logger, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, maintenance.close(), "close attachment maintenance") })
 	return &attachmentMaintenanceFixture{
@@ -63,7 +63,7 @@ func newFailingAttachmentMaintenance(t *testing.T) (*attachmentMaintenance, *byt
 	attachmentsPath := filepath.Join(t.TempDir(), "attachments")
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	maintenance, err := newAttachmentMaintenance(storeFixture.Store, attachmentsPath, logger)
+	maintenance, err := newAttachmentMaintenance(storeFixture.Store, attachmentsPath, logger, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, maintenance.close(), "close attachment maintenance") })
 	require.NoError(t, storeFixture.Store.Close(), "close catalog to inject maintenance failure")
@@ -191,6 +191,27 @@ func TestAutomaticAttachmentMaintenancePacksBoundedAndLogsCompleteStats(t *testi
 	} {
 		assert.Contains(logOutput, field, "complete stats field %q", field)
 	}
+}
+
+func TestLooseAttachmentModeSkipsAutomaticPackingAndRejectsPackCreation(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+	f.maintenance.packCreationEnabled = false
+	hash := f.addLoose([]byte("remain loose when attachment packing is disabled"))
+
+	err := f.maintenance.runAutomaticPack(context.Background(), nil)
+	require.NoError(err)
+	assert.Nil(f.packedEntry(hash))
+	assert.Contains(f.logs.String(), "automatic attachment packing disabled")
+
+	_, err = f.maintenance.pack(context.Background(), 0)
+	require.Error(err)
+	assert.Contains(err.Error(), "[data].loose_attachments")
+
+	_, err = f.maintenance.repack(context.Background(), 0)
+	require.Error(err)
+	assert.Contains(err.Error(), "[data].loose_attachments")
 }
 
 func TestAutomaticAttachmentMaintenanceCancellationIsInformational(t *testing.T) {

@@ -170,7 +170,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("claim daemon ownership: %w", err)
 	}
+	heartbeatCtx, stopHeartbeat := context.WithCancel(cmd.Context())
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		runtimeRecordHeartbeat(heartbeatCtx, ownership, daemonRuntimeHeartbeatInterval)
+	}()
 	defer func() {
+		stopHeartbeat()
+		<-heartbeatDone
 		if err := ownership.Close(); err != nil {
 			logger.Warn("release daemon ownership failed", "error", err)
 		}
@@ -221,7 +229,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	operationGate := api.NewSerialOperationGate()
 	// Closed on shutdown so cached pack readers don't hold attachment pack
 	// files open past the daemon's lifetime (blocks deletion on Windows).
-	attachmentMaint, err := newAttachmentMaintenance(s, cfg.AttachmentsDir(), logger)
+	attachmentMaint, err := newAttachmentMaintenance(
+		s, cfg.AttachmentsDir(), logger, !cfg.Data.LooseAttachments,
+	)
 	if err != nil {
 		return fmt.Errorf("open attachment maintenance: %w", err)
 	}
@@ -496,11 +506,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		go idleTracker.Run(ctx)
 		logger.Info("background daemon idle shutdown enabled", "timeout", cfg.Server.DaemonIdleTimeout)
 	}
-
-	// Self-heal the runtime record: an external process with a skewed view
-	// of process identity can wrongly prune it, leaving a healthy daemon
-	// undiscoverable until restart. The check is a stat per tick.
-	go runtimeRecordHeartbeat(ctx, ownership, daemonRuntimeHeartbeatInterval)
 
 	vectorInit := startVectorInit(
 		ctx, s, dbPath,
@@ -868,6 +873,7 @@ type storeAPIAdapter struct {
 
 var _ api.MessageStore = (*storeAPIAdapter)(nil)
 var _ api.CtxMessageStore = (*storeAPIAdapter)(nil)
+var _ api.MessageIdentityStore = (*storeAPIAdapter)(nil)
 var _ api.MeetingImporter = (*storeAPIAdapter)(nil)
 var _ api.SourceStatusStore = (*storeAPIAdapter)(nil)
 var _ api.CLIStore = (*storeAPIAdapter)(nil)
@@ -1572,6 +1578,21 @@ func (a *storeAPIAdapter) ListAccountIdentitiesContext(
 	return a.store.ListAccountIdentitiesContext(ctx, sourceID)
 }
 
+func (a *storeAPIAdapter) ResolveAccountIdentityContext(
+	ctx context.Context,
+	sourceID int64,
+	identifier string,
+) (store.ResolvedAccountIdentity, error) {
+	return a.store.ResolveAccountIdentityContext(ctx, sourceID, identifier)
+}
+
+func (a *storeAPIAdapter) MatchMessageIdentitiesContext(
+	ctx context.Context,
+	messageIDs []int64,
+) (map[int64]store.MessageIdentityMatch, error) {
+	return a.store.MatchMessageIdentitiesContext(ctx, messageIDs)
+}
+
 func (a *storeAPIAdapter) AddAccountIdentity(sourceID int64, address, signal string) error {
 	return a.store.AddAccountIdentity(sourceID, address, signal)
 }
@@ -1594,6 +1615,45 @@ func (a *storeAPIAdapter) RemoveAccountIdentityContext(
 	address string,
 ) (int64, error) {
 	return a.store.RemoveAccountIdentityContext(ctx, sourceID, address)
+}
+
+func (a *storeAPIAdapter) CountIdentityDiscoveryMessagesContext(
+	ctx context.Context,
+	sourceID int64,
+) (int64, error) {
+	return a.store.CountIdentityDiscoveryMessagesContext(ctx, sourceID)
+}
+
+func (a *storeAPIAdapter) ScanIdentityDiscoveryPageContext(
+	ctx context.Context,
+	sourceID, afterID int64,
+	limit int,
+) (store.IdentityDiscoveryPage, error) {
+	return a.store.ScanIdentityDiscoveryPageContext(ctx, sourceID, afterID, limit)
+}
+
+func (a *storeAPIAdapter) ScanIdentityObservationsForSourceMessageIDsContext(
+	ctx context.Context,
+	sourceID int64,
+	sourceMessageIDs []string,
+) ([]store.IdentityObservation, error) {
+	return a.store.ScanIdentityObservationsForSourceMessageIDsContext(ctx, sourceID, sourceMessageIDs)
+}
+
+func (a *storeAPIAdapter) AddAccountIdentitiesBatchContext(
+	ctx context.Context,
+	sourceID int64,
+	candidates []store.IdentityConfirmation,
+) ([]store.IdentityConfirmationOutcome, error) {
+	return a.store.AddAccountIdentitiesBatchContext(ctx, sourceID, candidates)
+}
+
+func (a *storeAPIAdapter) MergeConfirmedAccountIdentitySignalsContext(
+	ctx context.Context,
+	sourceID int64,
+	candidates []store.IdentityConfirmation,
+) ([]store.IdentityConfirmationOutcome, error) {
+	return a.store.MergeConfirmedAccountIdentitySignalsContext(ctx, sourceID, candidates)
 }
 
 func (a *storeAPIAdapter) LinkParticipants(participantA, participantB int64) (int64, error) {
@@ -1995,7 +2055,7 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	opts := sync.DefaultOptions()
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 
-	syncer := sync.New(client, s, opts).WithLogger(logger)
+	syncer := newMessageSyncer(client, s, opts).WithLogger(logger)
 
 	source, err := s.GetOrCreateSource(sourceTypeGmail, email)
 	if err != nil {
@@ -2049,7 +2109,7 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 	opts.NoResume = true
 
-	syncer := sync.New(apiClient, s, opts).WithLogger(logger)
+	syncer := newMessageSyncer(apiClient, s, opts).WithLogger(logger)
 
 	// runPostSourceCreateMigrations is keyed off Gmail-only legacy
 	// state, so it's a no-op for fresh IMAP installs; we still call it

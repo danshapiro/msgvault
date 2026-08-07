@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonauth"
 	"go.kenn.io/msgvault/internal/update"
 	"golang.org/x/crypto/argon2"
 )
@@ -41,6 +43,12 @@ const (
 const daemonStartupPhaseInitial = "starting up"
 
 var daemonAuthFingerprintSalt = []byte("msgvault-daemon-auth-fingerprint-v1")
+
+var localDaemonHTTPClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 type DaemonRuntime struct {
 	Record           daemon.RuntimeRecord
@@ -160,6 +168,50 @@ func findIncompatibleDaemonRuntime(dataDir string) (*DaemonRuntime, bool, error)
 	return nil, false, nil
 }
 
+// findLegacyDaemonRuntimeForLifecycle recognizes daemons from the transition
+// period before /api/daemon/identity existed. It is intentionally restricted
+// to lifecycle decisions: the ownership lock and a matching public ping show
+// that a daemon still owns the data directory, but do not authorize sending an
+// API key or signaling its PID.
+func findLegacyDaemonRuntimeForLifecycle(dataDir string) (*DaemonRuntime, bool, error) {
+	ownershipHeld, err := daemonOwnerLockHeld(dataDir)
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect daemon ownership: %w", err)
+	}
+	if !ownershipHeld {
+		return nil, false, nil
+	}
+	records, err := listLiveDaemonRuntimeRecords(dataDir)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx := context.Background()
+	for _, rec := range records {
+		identity := runtimeRecordIdentity(rec)
+		if identity != createTimeSkew && identity != createTimeUnknown {
+			continue
+		}
+		proof, proofErr := probeDaemonRuntimeIdentity(ctx, rec)
+		if proofErr != nil || proof != daemonIdentityUnsupported {
+			continue
+		}
+		info, probeErr := probeDaemonRuntimeRecord(ctx, rec)
+		if probeErr != nil || info.PID != rec.PID {
+			continue
+		}
+		ownershipHeld, ownershipErr := daemonOwnerLockHeld(dataDir)
+		if ownershipErr != nil {
+			return nil, false, fmt.Errorf("recheck daemon ownership: %w", ownershipErr)
+		}
+		if !ownershipHeld {
+			continue
+		}
+		rt := daemonRuntimeFromRecord(rec)
+		return rt, true, daemonRuntimeCompatibilityError(rt)
+	}
+	return nil, false, nil
+}
+
 func findRespondingDaemonRuntime(
 	ctx context.Context,
 	dataDir string,
@@ -176,6 +228,22 @@ func findRespondingDaemonRuntime(
 		return nil, false, err
 	}
 	for _, rec := range records {
+		switch runtimeRecordIdentity(rec) {
+		case createTimeMatch:
+		case createTimeMismatch:
+			continue
+		case createTimeSkew, createTimeUnknown:
+			proved, proofErr := proveDaemonRuntimeIdentity(ctx, rec)
+			if proofErr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, false, ctxErr
+				}
+				continue
+			}
+			if !proved {
+				continue
+			}
+		}
 		info, err := probeDaemonRuntimeRecord(ctx, rec)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -202,6 +270,10 @@ func listLiveDaemonRuntimeRecords(dataDir string) ([]daemon.RuntimeRecord, error
 	if err != nil {
 		return nil, fmt.Errorf("list daemon runtimes: %w", err)
 	}
+	ownershipHeld, err := daemonOwnerLockHeld(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("inspect daemon ownership: %w", err)
+	}
 	alive := make([]daemon.RuntimeRecord, 0, len(records))
 	for _, rec := range records {
 		if rec.Service != "" && rec.Service != daemonService {
@@ -210,7 +282,8 @@ func listLiveDaemonRuntimeRecords(dataDir string) ([]daemon.RuntimeRecord, error
 		if !daemon.ProcessAlive(rec.PID) {
 			continue
 		}
-		if runtimeRecordIdentityMismatched(context.Background(), rec) {
+		if runtimeRecordIdentityMismatched(rec) &&
+			(!ownershipHeld || rec.Metadata[runtimeStartupPhase] == "") {
 			continue
 		}
 		alive = append(alive, rec)
@@ -312,34 +385,86 @@ func probeDaemonRuntimeRecord(ctx context.Context, rec daemon.RuntimeRecord) (da
 	})
 }
 
+type daemonIdentityProofResult int
+
+const (
+	daemonIdentityUnverified daemonIdentityProofResult = iota
+	daemonIdentityVerified
+	daemonIdentityUnsupported
+)
+
+// probeDaemonRuntimeIdentity verifies possession of the private runtime secret
+// without transmitting that secret or the configured API key. Unsupported is
+// reserved for a definite 404/405 from a reachable endpoint so callers can
+// distinguish an older daemon from a failed or rejected proof.
+func probeDaemonRuntimeIdentity(ctx context.Context, rec daemon.RuntimeRecord) (daemonIdentityProofResult, error) {
+	if rec.Metadata == nil || rec.Metadata[runtimeShutdownToken] == "" {
+		return daemonIdentityUnverified, nil
+	}
+	url := urlFromDaemonRuntime(daemonRuntimeFromRecord(rec))
+	if url == "" {
+		return daemonIdentityUnverified, nil
+	}
+	challenge, err := daemonauth.NewChallenge()
+	if err != nil {
+		return daemonIdentityUnverified, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	proofCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(proofCtx, http.MethodGet, url+api.DaemonIdentityPath, nil)
+	if err != nil {
+		return daemonIdentityUnverified, fmt.Errorf("create daemon identity request: %w", err)
+	}
+	req.Header.Set(api.DaemonIdentityChallengeHeader, challenge)
+	resp, err := localDaemonHTTPClient.Do(req)
+	if err != nil {
+		return daemonIdentityUnverified, fmt.Errorf("send daemon identity request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return daemonIdentityUnsupported, nil
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		return daemonIdentityUnverified, nil
+	}
+	if !daemonauth.VerifyProof(
+		rec.Metadata[runtimeShutdownToken],
+		challenge,
+		rec.PID,
+		resp.Header.Get(api.DaemonIdentityProofHeader),
+	) {
+		return daemonIdentityUnverified, nil
+	}
+	return daemonIdentityVerified, nil
+}
+
+// proveDaemonRuntimeIdentity is the strict identity gate used before any
+// authenticated API request. Legacy capability detection is intentionally not
+// accepted here because it does not prove endpoint possession.
+func proveDaemonRuntimeIdentity(ctx context.Context, rec daemon.RuntimeRecord) (bool, error) {
+	result, err := probeDaemonRuntimeIdentity(ctx, rec)
+	return result == daemonIdentityVerified, err
+}
+
 // runtimeRecordIdentityMismatched reports whether rec.PID demonstrably
 // belongs to a different process than the daemon that wrote the record
-// (PID reuse). The create-time comparison alone is unreliable — container
-// boot-time reads jitter by whole seconds and gopsutil can fail
-// transiently — so an indeterminate comparison keeps the record, and a
-// beyond-tolerance mismatch is only trusted after the daemon also fails
-// an HTTP probe of its recorded address. This function never deletes the
-// record file: genuinely dead PIDs are reaped by CleanupDead, and
-// anything else is left in place for inspection.
-func runtimeRecordIdentityMismatched(ctx context.Context, rec daemon.RuntimeRecord) bool {
-	if rec.Metadata == nil {
-		return false
+// (PID reuse). An indeterminate or tolerance-skewed comparison keeps the
+// record, but an affirmative mismatch is never overridden by the
+// unauthenticated HTTP ping at the recorded address. This function never
+// deletes the record file: genuinely dead PIDs are reaped by CleanupDead,
+// and anything else is left in place for inspection.
+func runtimeRecordIdentityMismatched(rec daemon.RuntimeRecord) bool {
+	return runtimeRecordIdentity(rec) == createTimeMismatch
+}
+
+func runtimeRecordIdentity(rec daemon.RuntimeRecord) createTimeComparison {
+	if rec.Metadata == nil || rec.Metadata[runtimeCreateTime] == "" {
+		return createTimeUnknown
 	}
-	recorded := rec.Metadata[runtimeCreateTime]
-	if recorded == "" {
-		return false
-	}
-	if compareProcessCreateTime(rec.PID, recorded) != createTimeMismatch {
-		return false
-	}
-	// Genuine mismatch: give the daemon the chance to prove itself over
-	// HTTP — the authoritative liveness signal — before distrusting the
-	// record. The probe costs at most 500ms and only runs on mismatch.
-	info, err := probeDaemonRuntimeRecord(ctx, rec)
-	if err != nil {
-		return true
-	}
-	return info.PID != rec.PID
+	return compareProcessCreateTime(rec.PID, rec.Metadata[runtimeCreateTime])
 }
 
 // processCreateTimeMillisForRun is swappable in tests to simulate gopsutil
@@ -362,25 +487,27 @@ func processCreateTimeMillis(pid int) (int64, bool) {
 	return created, true
 }
 
-// createTimeComparison is the three-state outcome of comparing a recorded
-// process create time against a live re-read. "Unknown" is deliberately
-// distinct from "mismatch": gopsutil can fail transiently (permission
-// denied on /proc, hidepid, namespace quirks), and treating those failures
-// as a mismatch is what allowed live daemons' runtime records to be pruned.
+// createTimeComparison distinguishes exact process identity from tolerated
+// create-time jitter. Skew is sufficient to keep a record live, but only an
+// exact match may authorize an OS signal. "Unknown" remains distinct from
+// "mismatch": gopsutil can fail transiently (permission denied on /proc,
+// hidepid, namespace quirks), and treating those failures as a mismatch is
+// what allowed live daemons' runtime records to be pruned.
 type createTimeComparison int
 
 const (
 	createTimeMatch createTimeComparison = iota
+	createTimeSkew
 	createTimeMismatch
 	createTimeUnknown
 )
 
-// createTimeToleranceMillis absorbs whole-second jitter in create-time
-// reads. gopsutil derives a process's create time from the boot time, and
-// on Linux the boot-time read is recomputed per call with one-second
-// granularity (in container guests it is now-minus-uptime, truncated), so
-// two reads of the same live process legitimately differ by up to a whole
-// second in either direction.
+// createTimeToleranceMillis classifies whole-second jitter separately from a
+// process-identity mismatch. gopsutil derives a process's create time from the
+// boot time, and on Linux the boot-time read is recomputed per call with
+// one-second granularity (in container guests it is now-minus-uptime,
+// truncated), so two reads of the same live process legitimately differ by up
+// to a whole second in either direction.
 const createTimeToleranceMillis int64 = 2000
 
 func compareProcessCreateTime(pid int, recordedMillis string) createTimeComparison {
@@ -396,17 +523,20 @@ func compareProcessCreateTime(pid int, recordedMillis string) createTimeComparis
 	if delta < 0 {
 		delta = -delta
 	}
-	if delta <= createTimeToleranceMillis {
+	if delta == 0 {
 		return createTimeMatch
+	}
+	if delta <= createTimeToleranceMillis {
+		return createTimeSkew
 	}
 	return createTimeMismatch
 }
 
 // processCreateTimeMatches reports whether the recorded create time
-// affirmatively matches the live process. Indeterminate reads report
-// false: callers use a positive match as permission to act on the PID
-// (for example to signal it during daemon stop), so "unknown" must stay
-// conservative.
+// exactly matches the live process. Tolerance-only skew and indeterminate
+// reads report false: callers use a positive match as permission to act on
+// the PID (for example to signal it during daemon stop), so every non-exact
+// state must stay conservative.
 func processCreateTimeMatches(pid int, recordedMillis string) bool {
 	return compareProcessCreateTime(pid, recordedMillis) == createTimeMatch
 }

@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonauth"
 )
 
 func TestWriteDaemonRuntimePublishesKitRecord(t *testing.T) {
@@ -91,6 +94,7 @@ func TestFindDaemonRuntimeRequiresLiveMsgvaultPing(t *testing.T) {
 			runtimeHost:       host,
 			runtimePort:       portText,
 			runtimeAPIVersion: strconv.Itoa(daemonAPIVersion),
+			runtimeCreateTime: matchingProcessCreateTime(t),
 		},
 	})
 	require.NoError(err, "write runtime record")
@@ -129,6 +133,118 @@ func TestFindDaemonRuntimeRejectsWrongServicePing(t *testing.T) {
 	require.NoError(err, "write runtime record")
 
 	assert.Nil(findDaemonRuntime(dataDir), "wrong service ping must not match")
+}
+
+func TestFindDaemonRuntimeRejectsUnauthenticatedPingWithoutExactCreateTime(t *testing.T) {
+	tests := []struct {
+		name     string
+		live     int64
+		liveOK   bool
+		recorded string
+	}{
+		{name: "unknown create time", liveOK: false, recorded: "1234567890123"},
+		{name: "tolerance-only skew", live: 5_000, liveOK: true, recorded: "6000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			dataDir := t.TempDir()
+			stubProcessCreateTimeMillis(t, func(int) (int64, bool) { return tt.live, tt.liveOK })
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == daemon.DefaultPingPath {
+					daemon.NewPingHandler(daemon.PingHandlerOptions{
+						Service: daemonService,
+						Version: "v-test",
+					}).ServeHTTP(w, r)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(server.Close)
+			host, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+			require.NoError(err, "split listener address")
+
+			_, err = daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
+				PID:     os.Getpid(),
+				Network: daemon.NetworkTCP,
+				Address: net.JoinHostPort(host, portText),
+				Service: daemonService,
+				Version: "v-test",
+				Metadata: map[string]string{
+					runtimeHost:             host,
+					runtimePort:             portText,
+					runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+					runtimeAPISchemaVersion: api.APISchemaVersion,
+					runtimeCreateTime:       tt.recorded,
+					runtimeShutdownToken:    "private-runtime-secret",
+				},
+			})
+			require.NoError(err, "write runtime record")
+
+			rt, found, err := findRespondingDaemonRuntime(context.Background(), dataDir,
+				func(*DaemonRuntime, error) bool { return true })
+
+			require.NoError(err, "find responding runtime")
+			assert.False(found, "an unauthenticated ping cannot prove process identity")
+			assert.Nil(rt, "unproven endpoint must not become discoverable")
+		})
+	}
+}
+
+func TestFindDaemonRuntimeAcceptsRuntimeSecretProofWhenCreateTimeUnknown(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dataDir := t.TempDir()
+	stubProcessCreateTimeMillis(t, func(int) (int64, bool) { return 0, false })
+	const runtimeSecret = "private-runtime-secret"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case api.DaemonIdentityPath:
+			proof, err := daemonauth.Proof(runtimeSecret,
+				r.Header.Get(api.DaemonIdentityChallengeHeader), os.Getpid())
+			if err != nil {
+				http.Error(w, "invalid challenge", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set(api.DaemonIdentityProofHeader, proof)
+			w.WriteHeader(http.StatusNoContent)
+		case daemon.DefaultPingPath:
+			daemon.NewPingHandler(daemon.PingHandlerOptions{
+				Service: daemonService,
+				Version: "v-test",
+			}).ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	host, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(err, "split listener address")
+
+	_, err = daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
+		PID:     os.Getpid(),
+		Network: daemon.NetworkTCP,
+		Address: net.JoinHostPort(host, portText),
+		Service: daemonService,
+		Version: "v-test",
+		Metadata: map[string]string{
+			runtimeHost:             host,
+			runtimePort:             portText,
+			runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+			runtimeAPISchemaVersion: api.APISchemaVersion,
+			runtimeCreateTime:       "1234567890123",
+			runtimeShutdownToken:    runtimeSecret,
+		},
+	})
+	require.NoError(err, "write runtime record")
+
+	rt := findDaemonRuntime(dataDir)
+
+	require.NotNil(rt, "runtime secret proof recovers an indeterminate identity")
+	assert.Equal(os.Getpid(), rt.Record.PID, "pid")
 }
 
 func TestListLiveDaemonRuntimeRecordsFiltersServiceAndDeadProcesses(t *testing.T) {
@@ -310,6 +426,13 @@ func stubProcessCreateTimeMillis(t *testing.T, fn func(int) (int64, bool)) {
 	t.Cleanup(func() { processCreateTimeMillisForRun = prev })
 }
 
+func matchingProcessCreateTime(t *testing.T) string {
+	t.Helper()
+	created, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok, "read current process create time")
+	return strconv.FormatInt(created, 10)
+}
+
 func assertRuntimeRecordFileExists(t *testing.T, dataDir string) {
 	t.Helper()
 	path, err := daemonRuntimeStore(dataDir).Path(os.Getpid())
@@ -358,8 +481,8 @@ func TestCompareProcessCreateTime(t *testing.T) {
 		want     createTimeComparison
 	}{
 		{name: "exact match", recorded: "1000000000000", live: base, liveOK: true, want: createTimeMatch},
-		{name: "skew below tolerance", recorded: "999999999000", live: base, liveOK: true, want: createTimeMatch},
-		{name: "skew at tolerance boundary", recorded: "1000000002000", live: base, liveOK: true, want: createTimeMatch},
+		{name: "skew below tolerance", recorded: "999999999000", live: base, liveOK: true, want: createTimeSkew},
+		{name: "skew at tolerance boundary", recorded: "1000000002000", live: base, liveOK: true, want: createTimeSkew},
 		{name: "skew beyond tolerance", recorded: "999999997999", live: base, liveOK: true, want: createTimeMismatch},
 		{name: "unparseable recorded value", recorded: "not-a-number", live: base, liveOK: true, want: createTimeUnknown},
 		{name: "gopsutil failure", recorded: "1000000000000", live: 0, liveOK: false, want: createTimeUnknown},
@@ -379,7 +502,8 @@ func TestProcessCreateTimeMatchesRequiresAffirmativeMatch(t *testing.T) {
 	assert := assert.New(t)
 	stubProcessCreateTimeMillis(t, func(int) (int64, bool) { return 5_000, true })
 
-	assert.True(processCreateTimeMatches(os.Getpid(), "6000"), "within tolerance matches")
+	assert.True(processCreateTimeMatches(os.Getpid(), "5000"), "exact create time matches")
+	assert.False(processCreateTimeMatches(os.Getpid(), "6000"), "tolerance-only skew is not authoritative")
 	assert.False(processCreateTimeMatches(os.Getpid(), "10000"), "beyond tolerance does not match")
 	assert.False(processCreateTimeMatches(os.Getpid(), "bogus"), "indeterminate comparison does not match")
 }
@@ -429,7 +553,7 @@ func TestListLiveDaemonRuntimeRecordsKeepsRecordWhenCreateTimeUnknown(t *testing
 	})
 }
 
-func TestListLiveDaemonRuntimeRecordsTrustsRespondingDaemonOverCreateTime(t *testing.T) {
+func TestFindDaemonRuntimeRejectsRespondingEndpointWithMismatchedCreateTime(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -444,9 +568,9 @@ func TestListLiveDaemonRuntimeRecordsTrustsRespondingDaemonOverCreateTime(t *tes
 	live, ok := processCreateTimeMillis(os.Getpid())
 	require.True(ok, "read live create time")
 
-	// Ten minutes of skew is a genuine mismatch, but the daemon answering
-	// on its recorded address with the recorded PID is the authoritative
-	// liveness signal and must win.
+	// A responding endpoint is not process-identity proof. Once the local
+	// create time confirms PID reuse, an unauthenticated ping must not make
+	// the stale record discoverable.
 	_, err = daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
 		PID:     os.Getpid(),
 		Network: daemon.NetworkTCP,
@@ -454,18 +578,18 @@ func TestListLiveDaemonRuntimeRecordsTrustsRespondingDaemonOverCreateTime(t *tes
 		Service: daemonService,
 		Version: "v-test",
 		Metadata: map[string]string{
-			runtimeHost:       host,
-			runtimePort:       portText,
-			runtimeCreateTime: strconv.FormatInt(live+10*60*1000, 10),
+			runtimeHost:             host,
+			runtimePort:             portText,
+			runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+			runtimeAPISchemaVersion: api.APISchemaVersion,
+			runtimeCreateTime:       strconv.FormatInt(live+10*60*1000, 10),
 		},
 	})
 	require.NoError(err, "write runtime record")
 
-	records, err := listLiveDaemonRuntimeRecords(dataDir)
+	rt := findDaemonRuntime(dataDir)
 
-	require.NoError(err, "list live records")
-	require.Len(records, 1, "responding daemon outweighs create-time mismatch")
-	assert.Equal(os.Getpid(), records[0].PID, "pid")
+	assert.Nil(rt, "mismatched process identity must outweigh an unauthenticated ping")
 	assertRuntimeRecordFileExists(t, dataDir)
 }
 
