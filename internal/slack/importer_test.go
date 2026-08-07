@@ -14,21 +14,39 @@ import (
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
-// tsBase anchors test message times ~25h in the past: recent enough that
-// thread roots stay inside the 30-day tracking lookback, old enough that
-// offsets up to a few hours never land in the future.
-var tsBase = testNow().Add(-25 * time.Hour).UTC().Truncate(time.Second)
-
-// ts renders a Slack ts for offset minutes after tsBase.
-func ts(minutes int) string {
-	return strconv.FormatInt(tsBase.Add(time.Duration(minutes)*time.Minute).Unix(), 10) + ".000100"
+// tsBaseAt derives the message-time anchor for clock base `base`: ~25h in
+// the past — recent enough that thread roots stay inside the 30-day tracking
+// lookback, old enough that offsets up to a few hours never land in the
+// future.
+func tsBaseAt(base time.Time) time.Time {
+	return base.Add(-25 * time.Hour).UTC().Truncate(time.Second)
 }
 
-// tsFresh renders a Slack ts a few seconds in the future — a message created
+// fixtureClockBase is the package-clock read the non-pinned fixture helpers
+// anchor at, captured once at init so every ts() read agrees.
+var fixtureClockBase = testNow()
+
+// tsAt renders a Slack ts for offset minutes after tsBaseAt(base).
+func tsAt(base time.Time, minutes int) string {
+	return strconv.FormatInt(tsBaseAt(base).Add(time.Duration(minutes)*time.Minute).Unix(), 10) + ".000100"
+}
+
+// ts renders a Slack ts for offset minutes after tsBaseAt(fixtureClockBase)
+// — tsAt anchored at the package clock's init read.
+func ts(minutes int) string {
+	return tsAt(fixtureClockBase, minutes)
+}
+
+// tsFreshAt renders a Slack ts a few seconds after base — a message created
 // "now", strictly after any backfill pin or sweep watermark taken earlier in
 // the test (real replies are always created at post time, never back-dated).
+func tsFreshAt(base time.Time, offsetSeconds int) string {
+	return strconv.FormatInt(base.Add(time.Duration(2+offsetSeconds)*time.Second).Unix(), 10) + ".000100"
+}
+
+// tsFresh is tsFreshAt anchored at a live package-clock read.
 func tsFresh(offsetSeconds int) string {
-	return strconv.FormatInt(testNow().Add(time.Duration(2+offsetSeconds)*time.Second).Unix(), 10) + ".000100"
+	return tsFreshAt(testNow(), offsetSeconds)
 }
 
 // testWorkspace builds a fake workspace exercising every persist path:
@@ -542,17 +560,24 @@ func TestImportLimitLeavesBackfillResumable(t *testing.T) {
 // come from mechanisms that key on the REPLY's creation time.
 func oldThreadWorkspace(t *testing.T) (*fakeSlack, string) {
 	t.Helper()
+	return oldThreadWorkspaceAt(t, fixtureClockBase)
+}
+
+// oldThreadWorkspaceAt is oldThreadWorkspace with every timestamp derived
+// from base (via tsAt) rather than from the package clock.
+func oldThreadWorkspaceAt(t *testing.T, base time.Time) (*fakeSlack, string) {
+	t.Helper()
 	f := newFakeSlack(t)
 	f.users = []map[string]any{
 		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
 	}
-	rootTS := ts(-14400) // ~10 days before tsBase
+	rootTS := tsAt(base, -14400) // ~10 days before tsBaseAt(base)
 	f.convs = []*fakeConv{{
 		ID: "C09", Name: "archive", Kind: "public", Members: []string{"UME"},
 		Msgs: []fakeMsg{
 			{TS: rootTS, User: "UME", Text: "ancient root",
-				Replies: []fakeMsg{{TS: ts(-14390), ThreadTS: rootTS, User: "UME", Text: "ancient reply"}}},
-			{TS: ts(0), User: "UME", Text: "recent chatter"},
+				Replies: []fakeMsg{{TS: tsAt(base, -14390), ThreadTS: rootTS, User: "UME", Text: "ancient reply"}}},
+			{TS: tsAt(base, 0), User: "UME", Text: "recent chatter"},
 		},
 	}}
 	return f, rootTS
@@ -1799,16 +1824,66 @@ func TestRepairCompletesDespiteDepartedConversations(t *testing.T) {
 		"a conversation that left the eligible set must not hold the repair session open")
 }
 
+// midnightPinnedBases pin the factored sweep-convergence test bodies hard
+// against a UTC day boundary, independent of the wall clock. The bases come
+// from the verified failure-window matrix in
+// docs/plans/2026-08-07-slack-sweep-utc-flake.md §1 (reports/V4.md, measured
+// by re-basing the whole package clock; the pinned subtests reproduce that
+// regime per invocation):
+//
+//	base (UTC)            §1/V4 matrix
+//	2026-08-06T23:59:50Z  PASS — last measured passing base before the
+//	                      pre-midnight failure onset at 23:59:54Z, so this
+//	                      subtest carries ≈3–4s of in-run drift budget;
+//	                      per-invocation anchoring plus offset-derived
+//	                      fixtures spend almost none of it. If the -race
+//	                      verify ever approaches that budget, move this base
+//	                      earlier (e.g. 23:59:40Z), re-verify 5/5, and record
+//	                      the measured margin here.
+//	2026-08-06T00:10:30Z  PASS — just past the [midnight, midnight+10min]
+//	                      band where production's --limit 1 sweep genuinely
+//	                      parks (00:05:00 and 00:09:58 bases FAIL; that
+//	                      production bug is §2 of the plan).
+var midnightPinnedBases = []struct {
+	name string
+	base time.Time
+}{
+	{"pre-midnight-23:59:50Z", time.Date(2026, 8, 6, 23, 59, 50, 0, time.UTC)},
+	{"post-midnight-00:10:30Z", time.Date(2026, 8, 6, 0, 10, 30, 0, time.UTC)},
+}
+
 func TestLimitOneSweepConverges(t *testing.T) {
+	// Parent: today's package clock — same instantaneous value and advance
+	// rate as before the factoring.
+	limitOneSweepConvergesAt(t, testNow())
+	for _, tc := range midnightPinnedBases {
+		t.Run(tc.name, func(t *testing.T) {
+			limitOneSweepConvergesAt(t, tc.base)
+		})
+	}
+}
+
+// limitOneSweepConvergesAt runs TestLimitOneSweepConverges's body with the
+// importer clock and every fixture timestamp anchored at base.
+// Per-invocation anchoring: the clock re-bases to base at entry (drift ≈0 at
+// test start — the regime the §1/V4 matrix measured), and fixtures are pure
+// offsets from base, leaving imp.now()'s own advance during the run as the
+// only elapsed-time sensitivity.
+func limitOneSweepConvergesAt(t *testing.T, base time.Time) {
+	t.Helper()
 	require := require.New(t)
-	f, rootTS := oldThreadWorkspace(t)
+	anchor := time.Now()
+	now := func() time.Time { return base.Add(time.Since(anchor)) }
+
+	f, rootTS := oldThreadWorkspaceAt(t, base)
 	imp, opts := testImporter(t, f)
+	imp.now = now
 	st := imp.store
 
 	_, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 
-	lateReply := tsFresh(0)
+	lateReply := tsFreshAt(base, 0)
 	f.mu.Lock()
 	root := f.conv("C09").findRoot(rootTS)
 	root.Replies = append(root.Replies, fakeMsg{TS: lateReply, ThreadTS: rootTS, User: "UME", Text: "late reply"})
@@ -1817,7 +1892,7 @@ func TestLimitOneSweepConverges(t *testing.T) {
 	// Guaranteed-first-unit rule: at --limit 1 the sweep's day-charge alone
 	// exhausts the budget, so without the progress guarantee every run
 	// would park at the same boundary before its first fetch, forever.
-	imp.now = func() time.Time { return testNow().Add(time.Minute) }
+	imp.now = func() time.Time { return now().Add(time.Minute) }
 	limited := opts
 	limited.Limit = 1
 	for range 3 {
@@ -2088,16 +2163,36 @@ func TestSweepTruncatedDayFailsOnceAndConvergesViaCatchUp(t *testing.T) {
 }
 
 func TestSweepLimitOneConvergesPastTruncatedDayOverlap(t *testing.T) {
+	// Parent: today's package clock — same instantaneous value and advance
+	// rate as before the factoring.
+	sweepLimitOneConvergesPastTruncatedDayOverlapAt(t, testNow())
+	for _, tc := range midnightPinnedBases {
+		t.Run(tc.name, func(t *testing.T) {
+			sweepLimitOneConvergesPastTruncatedDayOverlapAt(t, tc.base)
+		})
+	}
+}
+
+// sweepLimitOneConvergesPastTruncatedDayOverlapAt runs
+// TestSweepLimitOneConvergesPastTruncatedDayOverlap's body with the importer
+// clock and every fixture timestamp anchored at base (see
+// limitOneSweepConvergesAt for the per-invocation anchoring contract).
+func sweepLimitOneConvergesPastTruncatedDayOverlapAt(t *testing.T, base time.Time) {
+	t.Helper()
 	require := require.New(t)
 	assert := assert.New(t)
-	f, rootTS := oldThreadWorkspace(t)
+	anchor := time.Now()
+	now := func() time.Time { return base.Add(time.Since(anchor)) }
+
+	f, rootTS := oldThreadWorkspaceAt(t, base)
 	imp, opts := testImporter(t, f)
+	imp.now = now
 	st := imp.store
 
 	_, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 
-	unreachable := tsFresh(5)
+	unreachable := tsFreshAt(base, 5)
 	f.mu.Lock()
 	f.conv("C09").findRoot(rootTS).Replies = append(f.conv("C09").findRoot(rootTS).Replies,
 		fakeMsg{TS: unreachable, ThreadTS: rootTS, User: "UME", Text: "beyond the ceiling"})
@@ -2114,7 +2209,7 @@ func TestSweepLimitOneConvergesPastTruncatedDayOverlap(t *testing.T) {
 
 	limited := opts
 	limited.Limit = 1
-	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return now().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), limited)
 	require.Error(err, "the first truncated search must remain caller-visible")
 
@@ -3258,7 +3353,7 @@ func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
 	// The root predates the maintenance rescan window by a wide margin:
 	// selecting threads through the history window alone can never reach
 	// it, even though its reply — and the reply's later edit — are recent.
-	ancientRoot := ts(-57600) // ~40 days before tsBase
+	ancientRoot := ts(-57600) // ~40 days before the message-time anchor
 	f.convs = []*fakeConv{{
 		ID: "C95", Name: "annals", Kind: "public", Members: []string{"UME"},
 		Msgs: []fakeMsg{
