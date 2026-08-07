@@ -14,21 +14,39 @@ import (
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
-// tsBase anchors test message times ~25h in the past: recent enough that
-// thread roots stay inside the 30-day tracking lookback, old enough that
-// offsets up to a few hours never land in the future.
-var tsBase = time.Now().Add(-25 * time.Hour).UTC().Truncate(time.Second)
-
-// ts renders a Slack ts for offset minutes after tsBase.
-func ts(minutes int) string {
-	return strconv.FormatInt(tsBase.Add(time.Duration(minutes)*time.Minute).Unix(), 10) + ".000100"
+// tsBaseAt derives the message-time anchor for clock base `base`: ~25h in
+// the past — recent enough that thread roots stay inside the 30-day tracking
+// lookback, old enough that offsets up to a few hours never land in the
+// future.
+func tsBaseAt(base time.Time) time.Time {
+	return base.Add(-25 * time.Hour).UTC().Truncate(time.Second)
 }
 
-// tsFresh renders a Slack ts a few seconds in the future — a message created
+// fixtureClockBase is the package-clock read the non-pinned fixture helpers
+// anchor at, captured once at init so every ts() read agrees.
+var fixtureClockBase = testNow()
+
+// tsAt renders a Slack ts for offset minutes after tsBaseAt(base).
+func tsAt(base time.Time, minutes int) string {
+	return strconv.FormatInt(tsBaseAt(base).Add(time.Duration(minutes)*time.Minute).Unix(), 10) + ".000100"
+}
+
+// ts renders a Slack ts for offset minutes after tsBaseAt(fixtureClockBase)
+// — tsAt anchored at the package clock's init read.
+func ts(minutes int) string {
+	return tsAt(fixtureClockBase, minutes)
+}
+
+// tsFreshAt renders a Slack ts a few seconds after base — a message created
 // "now", strictly after any backfill pin or sweep watermark taken earlier in
 // the test (real replies are always created at post time, never back-dated).
+func tsFreshAt(base time.Time, offsetSeconds int) string {
+	return strconv.FormatInt(base.Add(time.Duration(2+offsetSeconds)*time.Second).Unix(), 10) + ".000100"
+}
+
+// tsFresh is tsFreshAt anchored at a live package-clock read.
 func tsFresh(offsetSeconds int) string {
-	return strconv.FormatInt(time.Now().Add(time.Duration(2+offsetSeconds)*time.Second).Unix(), 10) + ".000100"
+	return tsFreshAt(testNow(), offsetSeconds)
 }
 
 // testWorkspace builds a fake workspace exercising every persist path:
@@ -98,6 +116,7 @@ func testImporter(t *testing.T, f *fakeSlack) (*Importer, ImportOptions) {
 	client.disableRateLimits()
 	st := testutil.NewTestStore(t)
 	imp := NewImporter(st, client, "T01")
+	imp.now = testNow
 	return imp, ImportOptions{TeamID: "T01", UserID: "UME", NoMedia: true}
 }
 
@@ -284,7 +303,7 @@ func TestImportIncrementalCatchesNewMessagesAndLateReplies(t *testing.T) {
 	root.Replies = append(root.Replies, fakeMsg{TS: lateReply, ThreadTS: root.TS, User: "UALICE", Text: "late reply"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	sum, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 	assert.Equal(1, sum.RepliesFetched, "only the late reply is new; earlier replies are behind the thread cursor")
@@ -317,7 +336,7 @@ func TestReplySweepPersistsDirectChatRecipients(t *testing.T) {
 		fakeMsg{TS: mpimReply, ThreadTS: mpimRoot.TS, User: "UALICE", Text: "late group reply"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -360,7 +379,7 @@ func TestImportIncrementalMidWindowFailureDoesNotAdvanceCursor(t *testing.T) {
 	f.failHistoryContinuations = true
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "a run with fetch errors must not report success")
 
@@ -541,17 +560,24 @@ func TestImportLimitLeavesBackfillResumable(t *testing.T) {
 // come from mechanisms that key on the REPLY's creation time.
 func oldThreadWorkspace(t *testing.T) (*fakeSlack, string) {
 	t.Helper()
+	return oldThreadWorkspaceAt(t, fixtureClockBase)
+}
+
+// oldThreadWorkspaceAt is oldThreadWorkspace with every timestamp derived
+// from base (via tsAt) rather than from the package clock.
+func oldThreadWorkspaceAt(t *testing.T, base time.Time) (*fakeSlack, string) {
+	t.Helper()
 	f := newFakeSlack(t)
 	f.users = []map[string]any{
 		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
 	}
-	rootTS := ts(-14400) // ~10 days before tsBase
+	rootTS := tsAt(base, -14400) // ~10 days before tsBaseAt(base)
 	f.convs = []*fakeConv{{
 		ID: "C09", Name: "archive", Kind: "public", Members: []string{"UME"},
 		Msgs: []fakeMsg{
 			{TS: rootTS, User: "UME", Text: "ancient root",
-				Replies: []fakeMsg{{TS: ts(-14390), ThreadTS: rootTS, User: "UME", Text: "ancient reply"}}},
-			{TS: ts(0), User: "UME", Text: "recent chatter"},
+				Replies: []fakeMsg{{TS: tsAt(base, -14390), ThreadTS: rootTS, User: "UME", Text: "ancient reply"}}},
+			{TS: tsAt(base, 0), User: "UME", Text: "recent chatter"},
 		},
 	}}
 	return f, rootTS
@@ -654,7 +680,7 @@ func TestSweepOverlapRecoversLateIndexedReplies(t *testing.T) {
 	f.searchIndexedThrough = tsMinusMicro(lateReply) // index lag: hit not served yet
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	sum, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -669,7 +695,7 @@ func TestSweepOverlapRecoversLateIndexedReplies(t *testing.T) {
 	f.mu.Lock()
 	f.searchIndexedThrough = ""
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(2 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(2 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	require.NoError(st.DB().QueryRow(st.Rebind(
@@ -696,7 +722,7 @@ func TestCanonicalThreadAuditRecoversReplyNeverServedBySearch(t *testing.T) {
 	f.searchIndexedThrough = tsMinusMicro(lateReply)
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(8 * 24 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(8 * 24 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -704,7 +730,7 @@ func TestCanonicalThreadAuditRecoversReplyNeverServedBySearch(t *testing.T) {
 		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "C09:"+lateReply).Scan(&n))
 	require.Zero(n, "test setup: search must still hide the reply when the periodic audit is scheduled")
 
-	imp.now = func() time.Time { return time.Now().Add(8*24*time.Hour + time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(8*24*time.Hour + time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	require.NoError(st.DB().QueryRow(st.Rebind(
@@ -722,7 +748,7 @@ func TestWindowOverlapAbsorbsClockSkew(t *testing.T) {
 	// Run 1's clock runs 5 minutes AHEAD of Slack's: the window pin (our
 	// clock) lands above message ts values (Slack's clock) that don't exist
 	// yet. A message then arrives with a ts BELOW the stored pin.
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	_, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -733,7 +759,7 @@ func TestWindowOverlapAbsorbsClockSkew(t *testing.T) {
 
 	// The next window's floor overlaps back by the lag margin, so a
 	// message hidden under the pin by clock skew is still fetched.
-	imp.now = func() time.Time { return time.Now().Add(6 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(6 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -1084,7 +1110,7 @@ func TestSweepDebtSurvivesDeletedAnchorReply(t *testing.T) {
 
 	// Discovery run: --limit 1 exhausts on the day-charge, so the debt is
 	// recorded but undrained; the watermark advances well past both hits.
-	imp.now = func() time.Time { return time.Now().Add(15 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(15 * time.Minute) }
 	limited := opts
 	limited.Limit = 1
 	_, err = imp.Import(context.Background(), limited)
@@ -1102,10 +1128,10 @@ func TestSweepDebtSurvivesDeletedAnchorReply(t *testing.T) {
 	root.Replies = append(root.Replies, fakeMsg{TS: r2, ThreadTS: rootTS, User: "UME", Text: "second"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(16 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(16 * time.Minute) }
 	_, err = imp.Import(context.Background(), limited)
 	require.NoError(err)
-	imp.now = func() time.Time { return time.Now().Add(17 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(17 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -1156,7 +1182,7 @@ func TestGapRecoveryResetsInFlightCatchUp(t *testing.T) {
 	f.mu.Lock()
 	f.conv("G05").Msgs = append(f.conv("G05").Msgs, fakeMsg{TS: newRoot, User: "UME", Text: "root above pin"})
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(20 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(20 * time.Minute) }
 	_, err = imp.Import(context.Background(), limited)
 	require.NoError(err)
 
@@ -1166,7 +1192,7 @@ func TestGapRecoveryResetsInFlightCatchUp(t *testing.T) {
 	f.mu.Unlock()
 	excluded := opts
 	excluded.ExcludeChannels = []string{"legacy"}
-	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(time.Hour) }
 	_, err = imp.Import(context.Background(), excluded)
 	require.NoError(err)
 
@@ -1174,10 +1200,10 @@ func TestGapRecoveryResetsInFlightCatchUp(t *testing.T) {
 	// It must RESET the walk — resumed under its original pin, the walk
 	// would never anchor the new root, then clear the flag as if done,
 	// and the stamped-forward boundary would certify the reply covered.
-	imp.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(2 * time.Hour) }
 	_, err = imp.Import(context.Background(), limited)
 	require.NoError(err)
-	imp.now = func() time.Time { return time.Now().Add(3 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(3 * time.Hour) }
 	for range 8 {
 		_, err = imp.Import(context.Background(), opts)
 		require.NoError(err)
@@ -1258,12 +1284,12 @@ func TestCatchUpDebtNotStarvedBySaturatedWindows(t *testing.T) {
 	for k := 1; k <= 8; k++ {
 		f.mu.Lock()
 		for i := range 4 {
-			arrival := tsFormat(time.Now().Add(time.Duration(k-1)*time.Minute + time.Duration(10+i)*time.Second))
+			arrival := tsFormat(testNow().Add(time.Duration(k-1)*time.Minute + time.Duration(10+i)*time.Second))
 			f.conv("C70").Msgs = append(f.conv("C70").Msgs, fakeMsg{TS: arrival, User: "UME", Text: "arrival"})
 		}
 		f.mu.Unlock()
 		warp := time.Duration(k) * time.Minute
-		imp.now = func() time.Time { return time.Now().Add(warp) }
+		imp.now = func() time.Time { return testNow().Add(warp) }
 		_, err = imp.Import(context.Background(), limited)
 		require.NoError(err)
 	}
@@ -1317,7 +1343,7 @@ func TestCrashBeforeSweepStampsCoverage(t *testing.T) {
 	f.mu.Unlock()
 	require.NoError(st.InitSchema())
 
-	imp.now = func() time.Time { return time.Now().Add(20 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(20 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -1348,15 +1374,15 @@ func TestLegacyStampLessStateTriggersCatchUp(t *testing.T) {
 	legacy := NewSyncState()
 	lcs := legacy.EnsureConv("C09")
 	lcs.Done = true
-	lcs.Cursor = tsFormat(time.Now().Add(30 * time.Minute))
+	lcs.Cursor = tsFormat(testNow().Add(30 * time.Minute))
 	runA, err := st.StartSync(src.ID, "slack")
 	require.NoError(err)
 	require.NoError(st.CompleteSync(runA, mustMarshal(t, legacy)))
 
-	imp.now = func() time.Time { return time.Now().Add(31 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(31 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
-	imp.now = func() time.Time { return time.Now().Add(32 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(32 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -1469,11 +1495,11 @@ func TestFirstReplyToUnthreadedMessageRecoveredByCatchUp(t *testing.T) {
 	f.mu.Lock()
 	f.conv("C60").findRoot(ts(0)).Replies = []fakeMsg{{TS: firstReply, ThreadTS: ts(0), User: "UME", Text: "first ever reply"}}
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(20 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(20 * time.Minute) }
 	_, err = imp.Import(context.Background(), noThreads)
 	require.NoError(err)
 
-	imp.now = func() time.Time { return time.Now().Add(21 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(21 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -1516,7 +1542,7 @@ func TestFailedRunPersistsFinalState(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "the reactions write failure is fatal")
 
@@ -1561,12 +1587,12 @@ func TestInitialWalkPinPersistsAcrossResumedRuns(t *testing.T) {
 
 	// Later resumes run 20+ minutes on: a refreshed pin would place the
 	// adopted boundary (minus the overlap margin) above the reply.
-	imp.now = func() time.Time { return time.Now().Add(20 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(20 * time.Minute) }
 	for range 8 {
 		_, err = imp.Import(context.Background(), limited)
 		require.NoError(err)
 	}
-	imp.now = func() time.Time { return time.Now().Add(21 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(21 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -1597,7 +1623,7 @@ func TestStoreWriteFailureHoldsCursorAndResumes(t *testing.T) {
 	_, err = st.DB().Exec(`DROP TABLE reactions`)
 	require.NoError(err)
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "a failed auxiliary store write must fail the run, not count and continue")
 
@@ -1640,7 +1666,7 @@ func TestAttachmentRowFailureFailsRun(t *testing.T) {
 	_, err = st.DB().Exec(`DROP TABLE attachments`)
 	require.NoError(err)
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "a failed attachment row write must fail the run — the marker was never durable")
 
@@ -1734,7 +1760,7 @@ func TestLimitedSweepDrainsBigTailAcrossRuns(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	limited := opts
 	limited.Limit = 4
 	_, err = imp.Import(context.Background(), limited)
@@ -1798,16 +1824,66 @@ func TestRepairCompletesDespiteDepartedConversations(t *testing.T) {
 		"a conversation that left the eligible set must not hold the repair session open")
 }
 
+// midnightPinnedBases pin the factored sweep-convergence test bodies hard
+// against a UTC day boundary, independent of the wall clock. The bases come
+// from the verified failure-window matrix in
+// docs/plans/2026-08-07-slack-sweep-utc-flake.md §1 (reports/V4.md, measured
+// by re-basing the whole package clock; the pinned subtests reproduce that
+// regime per invocation):
+//
+//	base (UTC)            §1/V4 matrix
+//	2026-08-06T23:59:50Z  PASS — last measured passing base before the
+//	                      pre-midnight failure onset at 23:59:54Z, so this
+//	                      subtest carries ≈3–4s of in-run drift budget;
+//	                      per-invocation anchoring plus offset-derived
+//	                      fixtures spend almost none of it. If the -race
+//	                      verify ever approaches that budget, move this base
+//	                      earlier (e.g. 23:59:40Z), re-verify 5/5, and record
+//	                      the measured margin here.
+//	2026-08-06T00:10:30Z  PASS — just past the [midnight, midnight+10min]
+//	                      band where production's --limit 1 sweep genuinely
+//	                      parks (00:05:00 and 00:09:58 bases FAIL; that
+//	                      production bug is §2 of the plan).
+var midnightPinnedBases = []struct {
+	name string
+	base time.Time
+}{
+	{"pre-midnight-23:59:50Z", time.Date(2026, 8, 6, 23, 59, 50, 0, time.UTC)},
+	{"post-midnight-00:10:30Z", time.Date(2026, 8, 6, 0, 10, 30, 0, time.UTC)},
+}
+
 func TestLimitOneSweepConverges(t *testing.T) {
+	// Parent: today's package clock — same instantaneous value and advance
+	// rate as before the factoring.
+	limitOneSweepConvergesAt(t, testNow())
+	for _, tc := range midnightPinnedBases {
+		t.Run(tc.name, func(t *testing.T) {
+			limitOneSweepConvergesAt(t, tc.base)
+		})
+	}
+}
+
+// limitOneSweepConvergesAt runs TestLimitOneSweepConverges's body with the
+// importer clock and every fixture timestamp anchored at base.
+// Per-invocation anchoring: the clock re-bases to base at entry (drift ≈0 at
+// test start — the regime the §1/V4 matrix measured), and fixtures are pure
+// offsets from base, leaving imp.now()'s own advance during the run as the
+// only elapsed-time sensitivity.
+func limitOneSweepConvergesAt(t *testing.T, base time.Time) {
+	t.Helper()
 	require := require.New(t)
-	f, rootTS := oldThreadWorkspace(t)
+	anchor := time.Now()
+	now := func() time.Time { return base.Add(time.Since(anchor)) }
+
+	f, rootTS := oldThreadWorkspaceAt(t, base)
 	imp, opts := testImporter(t, f)
+	imp.now = now
 	st := imp.store
 
 	_, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 
-	lateReply := tsFresh(0)
+	lateReply := tsFreshAt(base, 0)
 	f.mu.Lock()
 	root := f.conv("C09").findRoot(rootTS)
 	root.Replies = append(root.Replies, fakeMsg{TS: lateReply, ThreadTS: rootTS, User: "UME", Text: "late reply"})
@@ -1816,7 +1892,7 @@ func TestLimitOneSweepConverges(t *testing.T) {
 	// Guaranteed-first-unit rule: at --limit 1 the sweep's day-charge alone
 	// exhausts the budget, so without the progress guarantee every run
 	// would park at the same boundary before its first fetch, forever.
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return now().Add(time.Minute) }
 	limited := opts
 	limited.Limit = 1
 	for range 3 {
@@ -1943,7 +2019,7 @@ func TestSweepProcessesUnarchivedParent(t *testing.T) {
 	f.failHistory["C09"] = true
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "the failed window walk keeps the run partial")
 
@@ -1980,7 +2056,7 @@ func TestSoloSweepEntryReanchorsToTrueRoot(t *testing.T) {
 	f.searchOmitThreadTS = true
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "the failed window walk keeps the run partial")
 
@@ -2014,7 +2090,7 @@ func TestSweepFetchDoesNotRefreshArchivedParent(t *testing.T) {
 	root.Replies = append(root.Replies, fakeMsg{TS: lateReply, ThreadTS: rootTS, User: "UME", Text: "late reply"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -2052,7 +2128,7 @@ func TestSweepTruncatedDayFailsOnceAndConvergesViaCatchUp(t *testing.T) {
 	f.searchTruncateDays[tsTime(unreachable).UTC().Format("2006-01-02")] = true
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	sum, err := imp.Import(context.Background(), opts)
 	require.Error(err, "a truncated sweep day must fail the run loudly")
 	assert.Positive(sum.FetchErrors)
@@ -2071,10 +2147,10 @@ func TestSweepTruncatedDayFailsOnceAndConvergesViaCatchUp(t *testing.T) {
 	// certify it without re-querying, and the catch-up walk recovers the
 	// reply search could never serve. The tool converges with NO manual
 	// --full.
-	imp.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(25 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err, "the converted day must not fail again on its overlap retry")
-	imp.now = func() time.Time { return time.Now().Add(26 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(26 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err, "past the truncated day the sweep must converge without --full")
 	require.NoError(st.DB().QueryRow(st.Rebind(
@@ -2087,16 +2163,36 @@ func TestSweepTruncatedDayFailsOnceAndConvergesViaCatchUp(t *testing.T) {
 }
 
 func TestSweepLimitOneConvergesPastTruncatedDayOverlap(t *testing.T) {
+	// Parent: today's package clock — same instantaneous value and advance
+	// rate as before the factoring.
+	sweepLimitOneConvergesPastTruncatedDayOverlapAt(t, testNow())
+	for _, tc := range midnightPinnedBases {
+		t.Run(tc.name, func(t *testing.T) {
+			sweepLimitOneConvergesPastTruncatedDayOverlapAt(t, tc.base)
+		})
+	}
+}
+
+// sweepLimitOneConvergesPastTruncatedDayOverlapAt runs
+// TestSweepLimitOneConvergesPastTruncatedDayOverlap's body with the importer
+// clock and every fixture timestamp anchored at base (see
+// limitOneSweepConvergesAt for the per-invocation anchoring contract).
+func sweepLimitOneConvergesPastTruncatedDayOverlapAt(t *testing.T, base time.Time) {
+	t.Helper()
 	require := require.New(t)
 	assert := assert.New(t)
-	f, rootTS := oldThreadWorkspace(t)
+	anchor := time.Now()
+	now := func() time.Time { return base.Add(time.Since(anchor)) }
+
+	f, rootTS := oldThreadWorkspaceAt(t, base)
 	imp, opts := testImporter(t, f)
+	imp.now = now
 	st := imp.store
 
 	_, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
 
-	unreachable := tsFresh(5)
+	unreachable := tsFreshAt(base, 5)
 	f.mu.Lock()
 	f.conv("C09").findRoot(rootTS).Replies = append(f.conv("C09").findRoot(rootTS).Replies,
 		fakeMsg{TS: unreachable, ThreadTS: rootTS, User: "UME", Text: "beyond the ceiling"})
@@ -2113,7 +2209,7 @@ func TestSweepLimitOneConvergesPastTruncatedDayOverlap(t *testing.T) {
 
 	limited := opts
 	limited.Limit = 1
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return now().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), limited)
 	require.Error(err, "the first truncated search must remain caller-visible")
 
@@ -2189,7 +2285,7 @@ func TestTruncatedSweepDuringRepairUnwedgesSession(t *testing.T) {
 
 	full := opts
 	full.Full = true
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), full)
 	require.Error(err, "the truncated day fails the repair run loudly")
 	src, err := st.GetOrCreateSource("slack", "T01:UME")
@@ -2198,9 +2294,9 @@ func TestTruncatedSweepDuringRepairUnwedgesSession(t *testing.T) {
 
 	// Plain runs continue the session. Once the truncated day is behind
 	// the boundary, a clean pass pays the catch-up debt and closes it.
-	imp.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(25 * time.Hour) }
 	_, _ = imp.Import(context.Background(), opts)
-	imp.now = func() time.Time { return time.Now().Add(26 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(26 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err, "the session must converge; a permanently re-truncating sweep wedges RepairPending forever")
 	state := requireResumeState(t, imp, src.ID)
@@ -2236,7 +2332,7 @@ func TestSweepRecoversGapForReIncludedChannel(t *testing.T) {
 	root.Replies = append(root.Replies, fakeMsg{TS: gapReply, ThreadTS: rootTS, User: "UME", Text: "reply while excluded"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(time.Hour) }
 	excluded := opts
 	excluded.ExcludeChannels = []string{"archive"}
 	_, err = imp.Import(context.Background(), excluded)
@@ -2253,7 +2349,7 @@ func TestSweepRecoversGapForReIncludedChannel(t *testing.T) {
 	// Re-included: the channel re-enters certified behind the watermark; a
 	// channel-scoped gap sweep must recover the reply that the workspace
 	// sweep — floored at the watermark — will never revisit.
-	imp.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(2 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	require.NoError(st.DB().QueryRow(st.Rebind(
@@ -2372,7 +2468,7 @@ func TestGapCatchUpCoversPostBackfillRoots(t *testing.T) {
 		Replies: []fakeMsg{{TS: gapReply, ThreadTS: gapRoot, User: "UME", Text: "reply while excluded"}}})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(time.Hour) }
 	excluded := opts
 	excluded.ExcludeChannels = []string{"legacy"}
 	_, err = imp.Import(context.Background(), excluded)
@@ -2384,10 +2480,10 @@ func TestGapCatchUpCoversPostBackfillRoots(t *testing.T) {
 
 	// Re-entry flags the gap as thread debt; the following run's catch-up
 	// walk must cover roots created AFTER the original backfill pin.
-	imp.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(2 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
-	imp.now = func() time.Time { return time.Now().Add(3 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(3 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -2632,7 +2728,7 @@ func TestImportLimitedRunsDrainIncrementalBacklog(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	limited := opts
 	limited.Limit = 2
 	limited.NoThreads = true
@@ -2762,7 +2858,7 @@ func TestImportChannelFilters(t *testing.T) {
 // tsAgo renders a Slack ts for a moment shortly in the past — close enough
 // to "now" that the next run's clock-skew window overlap re-covers it.
 func tsAgo(d time.Duration) string {
-	return strconv.FormatInt(time.Now().Add(-d).Unix(), 10) + ".000100"
+	return strconv.FormatInt(testNow().Add(-d).Unix(), 10) + ".000100"
 }
 
 // tombstoneWorkspace is a channel whose root (reactions, a reply) sits
@@ -2826,21 +2922,21 @@ func TestTombstoneNeverOverwritesArchivedOriginal(t *testing.T) {
 	}
 
 	// Incremental: the window's clock-skew overlap re-serves the root.
-	imp.now = func() time.Time { return time.Now().Add(1 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(1 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	checkIntact("incremental overlap")
 
 	full := opts
 	full.Full = true
-	imp.now = func() time.Time { return time.Now().Add(2 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(2 * time.Minute) }
 	_, err = imp.Import(context.Background(), full)
 	require.NoError(err)
 	checkIntact("--full")
 
 	maint := opts
 	maint.Maintenance = true
-	imp.now = func() time.Time { return time.Now().Add(3 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(3 * time.Minute) }
 	_, err = imp.Import(context.Background(), maint)
 	require.NoError(err)
 	checkIntact("--maintenance")
@@ -2876,7 +2972,7 @@ func TestTombstonePlaceholderKeepsOrphanedReplies(t *testing.T) {
 	assert.Equal(1, linked, "the orphaned reply must link to the tombstone placeholder")
 
 	// Re-reads of the placeholder skip like any other archived tombstone.
-	imp.now = func() time.Time { return time.Now().Add(1 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(1 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -2936,7 +3032,7 @@ func TestMessageReappearanceClearsSlackTombstone(t *testing.T) {
 	rootID := "C80:" + rootTS
 	require.NoError(st.MarkMessageDeleted(sum.SourceID, rootID))
 
-	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -3005,7 +3101,7 @@ func TestLateIndexedReplyMovesParkedDrainBackward(t *testing.T) {
 	f.searchHidden[r1] = true
 	f.failReplies[rootTS] = true
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "the parked drain is a fetch failure; the run must not report success")
 
@@ -3014,7 +3110,7 @@ func TestLateIndexedReplyMovesParkedDrainBackward(t *testing.T) {
 	f.mu.Lock()
 	delete(f.searchHidden, r1)
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(20 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(20 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err)
 
@@ -3023,7 +3119,7 @@ func TestLateIndexedReplyMovesParkedDrainBackward(t *testing.T) {
 	f.mu.Lock()
 	delete(f.failReplies, rootTS)
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(40 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(40 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -3080,7 +3176,7 @@ func TestCatchUpFullDrainOverridesParkedTailSeed(t *testing.T) {
 	limited := opts
 	limited.Limit = 1
 	for i := range 4 {
-		imp.now = func() time.Time { return time.Now().Add(time.Duration(5+i) * time.Minute) }
+		imp.now = func() time.Time { return testNow().Add(time.Duration(5+i) * time.Minute) }
 		// Partial failures are expected while the drain fetch fails; every
 		// run still persists its state (FailSyncWithCheckpoint).
 		_, _ = imp.Import(context.Background(), limited)
@@ -3089,7 +3185,7 @@ func TestCatchUpFullDrainOverridesParkedTailSeed(t *testing.T) {
 	f.mu.Lock()
 	delete(f.failReplies, rootTS)
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(10 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(10 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -3134,7 +3230,7 @@ func TestSweepSmallPagesBeyondWalkBoundRecordedAsDebt(t *testing.T) {
 	other.Replies = append(other.Replies, fakeMsg{TS: beyondWalk, ThreadTS: ts(0), User: "UME", Text: "past the page walk"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "a day the pager cannot fully consume must fail loudly, not certify past unserved hits")
 	src, err := st.GetOrCreateSource("slack", "T01:UME")
@@ -3144,9 +3240,9 @@ func TestSweepSmallPagesBeyondWalkBoundRecordedAsDebt(t *testing.T) {
 
 	// The catch-up walk recovers the reply the pager could never serve;
 	// once the day is behind the boundary the sweep runs clean again.
-	imp.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(25 * time.Hour) }
 	_, _ = imp.Import(context.Background(), opts)
-	imp.now = func() time.Time { return time.Now().Add(26 * time.Hour) }
+	imp.now = func() time.Time { return testNow().Add(26 * time.Hour) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -3235,7 +3331,7 @@ func TestSweepPagesServeOneSnapshotDespiteMidWalkDeletion(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -3257,7 +3353,7 @@ func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
 	// The root predates the maintenance rescan window by a wide margin:
 	// selecting threads through the history window alone can never reach
 	// it, even though its reply — and the reply's later edit — are recent.
-	ancientRoot := ts(-57600) // ~40 days before tsBase
+	ancientRoot := ts(-57600) // ~40 days before the message-time anchor
 	f.convs = []*fakeConv{{
 		ID: "C95", Name: "annals", Kind: "public", Members: []string{"UME"},
 		Msgs: []fakeMsg{
@@ -3279,10 +3375,10 @@ func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
 	root := f.conv("C95").findRoot(ancientRoot)
 	root.Replies = append(root.Replies, fakeMsg{TS: reply, ThreadTS: ancientRoot, User: "UME", Text: "recent reply"})
 	f.mu.Unlock()
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(5 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
-	imp.now = func() time.Time { return time.Now().Add(20 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(20 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 
@@ -3299,7 +3395,7 @@ func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
 			JOIN messages m ON m.id = mb.message_id WHERE m.source_message_id = ?`), replyID).Scan(&body))
 		return body
 	}
-	imp.now = func() time.Time { return time.Now().Add(31 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(31 * time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	assert.Equal("recent reply", readBody(), "plain runs ignore post-capture reply edits")
@@ -3308,7 +3404,7 @@ func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
 	// contract keys on message age — the root's age must not matter.
 	maint := opts
 	maint.Maintenance = true
-	imp.now = func() time.Time { return time.Now().Add(32 * time.Minute) }
+	imp.now = func() time.Time { return testNow().Add(32 * time.Minute) }
 	_, err = imp.Import(context.Background(), maint)
 	require.NoError(err)
 	assert.Equal("recent reply (stealth edit)", readBody(),
