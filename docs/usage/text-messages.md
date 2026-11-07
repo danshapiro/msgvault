@@ -60,7 +60,11 @@ unresolved identity, failed item, interrupted run, or `--limit` produces a
 partial result and a nonzero exit status. Successfully imported records remain
 in the archive and a later import safely upserts them. Group administrators
 can be promoted on reimport; the importer does not remove members or demote
-roles based on an incomplete roster. The current roster's rank and pending
+roles based on an incomplete roster. Group-roster status describes source-read
+coverage only: stored membership also includes historical senders and may retain
+departed members or stale administrator roles. Hidden-chat messages are excluded
+and counted; messages without a matching chat make the import partial. The
+current roster's rank and pending
 interpretation is corroborated by an [independent importer](https://github.com/akhil-dara/WAInsight/blob/main/backend/app/ingestion/chat_ingester.py),
 not by an official WhatsApp schema specification.
 

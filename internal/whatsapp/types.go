@@ -137,7 +137,7 @@ type ImportSummary struct {
 	MediaCopied       int64
 	Participants      int64
 	Errors            int64
-	GroupRoster       string // complete, partial, or unavailable
+	GroupRoster       string // source roster read coverage: complete, partial, or unavailable
 	ErrorCounts       map[string]int64
 	SkippedCounts     map[string]int64
 }

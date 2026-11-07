@@ -125,6 +125,34 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 		return nil, fmt.Errorf("fetch chats: %w", err)
 	}
 
+	// Rows outside visible chats must not disappear from accounting.
+	hiddenCount, orphanCount, err := countUnprocessedMessages(waDB)
+	if err != nil {
+		reportError("message_coverage", err)
+	} else {
+		summary.MessagesProcessed += hiddenCount + orphanCount
+		summary.MessagesSkipped += hiddenCount + orphanCount
+		if hiddenCount > 0 {
+			summary.SkippedCounts["hidden_chat"] += hiddenCount
+		}
+		if orphanCount > 0 {
+			summary.SkippedCounts["missing_chat"] += orphanCount
+			summary.Errors += orphanCount
+			summary.ErrorCounts["message_orphan_chat"] += orphanCount
+			imp.progress.OnError(fmt.Errorf("%d messages have no usable chat identity", orphanCount))
+		}
+	}
+
+	// A group row with no JID cannot be reached by a per-chat lookup.
+	if count, err := countOrphanRosterGroups(waDB); err != nil {
+		reportError("group_roster_query", err)
+	} else if count > 0 {
+		summary.GroupRoster = "partial"
+		summary.Errors += count
+		summary.ErrorCounts["group_roster_orphan_group"] += count
+		imp.progress.OnError(fmt.Errorf("group roster has %d entries with a missing group identity", count))
+	}
+
 	// Load lid → phone mapping for resolving "lid" senders.
 	lidMap, err := fetchLidMap(waDB)
 	if err != nil {
@@ -386,7 +414,12 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 				}
 				// Build and upsert the message.
 				msg := mapMessage(waMsg, conversationID, source.ID, senderID)
-				messageID, err := imp.store.UpsertMessage(&msg)
+				var messageID int64
+				if senderID.Valid {
+					messageID, err = imp.store.UpsertMessage(&msg)
+				} else {
+					messageID, err = imp.store.UpsertMessagePreservingAttribution(&msg)
+				}
 				if err != nil {
 					reportError("message", fmt.Errorf("upsert message %s: %w", waMsg.KeyID, err))
 					continue
@@ -402,6 +435,17 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 				}
 				chatAdded++
 				totalAdded++
+
+				// Body updates can invalidate FTS, so capture the prior sender
+				// before writing if this source no longer resolves its identity.
+				var priorSearchSender string
+				var priorSearchErr error
+				if !senderID.Valid && existingMessageID != 0 {
+					priorSearchSender, priorSearchErr = imp.store.PreviousFTSSender(messageID)
+					if priorSearchErr != nil {
+						reportError("search_index", fmt.Errorf("preserve previous search sender: %w", priorSearchErr))
+					}
+				}
 
 				// Store message body.
 				bodyText := sql.NullString{}
@@ -571,8 +615,13 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					} else if waMsg.SenderUser.Valid {
 						senderAddr = normalizePhone(waMsg.SenderUser.String, waMsg.SenderServer.String)
 					}
-					if err := imp.store.UpsertFTS(messageID, "", bodyText.String, senderAddr, "", ""); err != nil {
-						reportError("search_index", fmt.Errorf("index message: %w", err))
+					if !senderID.Valid && existingMessageID != 0 {
+						senderAddr = priorSearchSender
+					}
+					if priorSearchErr == nil {
+						if err := imp.store.UpsertFTS(messageID, "", bodyText.String, senderAddr, "", ""); err != nil {
+							reportError("search_index", fmt.Errorf("index message: %w", err))
+						}
 					}
 				}
 			}

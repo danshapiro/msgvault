@@ -285,3 +285,118 @@ func TestImportCancellationAfterFinalChatMarksSyncFailed(t *testing.T) {
 	require.NoError(t, st.DB().QueryRow(`SELECT status FROM sync_runs`).Scan(&status))
 	assert.Equal(t, "failed", status)
 }
+
+func TestOrphanRosterReferencesAreNotSilent(t *testing.T) {
+	cases := []struct{ name, roster string }{
+		{"modern", modernRoster + `INSERT INTO group_participant_user VALUES (3, 999, 2, 0, 0); INSERT INTO group_participant_user VALUES (4, 1, 999, 0, 0);`},
+		{"legacy", `CREATE TABLE group_participants(gjid TEXT, jid TEXT, admin INTEGER);
+		INSERT INTO group_participants VALUES ('missing@g.us', '15550001111@s.whatsapp.net', 0);
+		INSERT INTO group_participants VALUES ('12345@g.us', 'missing@s.whatsapp.net', 0);`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backup := testBackup(t, tc.roster)
+			st := testutil.NewTestStore(t)
+			opts := DefaultOptions()
+			opts.Phone = "+15550002222"
+			result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+			require.NoError(t, err)
+			assert.Equal(t, "partial", result.GroupRoster)
+			assert.EqualValues(t, 1, result.ErrorCounts["group_roster_orphan_group"])
+			assert.EqualValues(t, 1, result.ErrorCounts["group_roster_unresolved"])
+			assert.EqualValues(t, 2, result.MessagesAdded)
+			var status string
+			require.NoError(t, st.DB().QueryRow(`SELECT status FROM sync_runs`).Scan(&status))
+			assert.Equal(t, "failed", status)
+		})
+	}
+}
+
+func TestHiddenAndOrphanChatMessagesAreCounted(t *testing.T) {
+	backup := testBackup(t, modernRoster+`
+	INSERT INTO jid VALUES (7, '12346', 'g.us', '12346@g.us');
+	INSERT INTO chat VALUES (20, 7, 1, 'Hidden group', 1700000002000, 1);
+	INSERT INTO message VALUES (3, 20, 0, 'hidden-message', 2, 1700000002000, 0, 'not imported', 0, 0);
+	INSERT INTO message VALUES (4, 999, 0, 'orphan-message', 2, 1700000003000, 0, 'not routed', 0, 0);
+	INSERT INTO chat VALUES (21, 998, 0, 'Missing JID', 1700000004000, 1);
+	INSERT INTO message VALUES (5, 21, 0, 'orphan-jid-message', 2, 1700000004000, 0, 'not routed', 0, 0);`)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.EqualValues(t, 5, result.MessagesProcessed)
+	assert.EqualValues(t, 2, result.MessagesAdded)
+	assert.EqualValues(t, 3, result.MessagesSkipped)
+	assert.EqualValues(t, 1, result.SkippedCounts["hidden_chat"])
+	assert.EqualValues(t, 2, result.SkippedCounts["missing_chat"])
+	assert.EqualValues(t, 2, result.ErrorCounts["message_orphan_chat"])
+}
+
+func TestUnresolvedReimportPreservesPreviousSenderAttributionAndSearch(t *testing.T) {
+	testutil.SkipIfPostgres(t, "direct FTS5 inspection")
+	backup := testBackup(t, modernRoster)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	imp := NewImporter(st, nil)
+	_, err := imp.Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	// An independently confirmed identity need not still be resolvable in a
+	// later snapshot. Preserve every attribution flag on the unresolved update.
+	_, err = st.DB().Exec(`UPDATE messages SET is_from_me=1, source_is_from_me=1, identity_is_from_me=1 WHERE source_message_id='message-1'`)
+	require.NoError(t, err)
+	var senderBefore int64
+	var fromBefore string
+	require.NoError(t, st.DB().QueryRow(`SELECT sender_id FROM messages WHERE source_message_id='message-1'`).Scan(&senderBefore))
+	require.NoError(t, st.DB().QueryRow(`SELECT f.from_addr FROM messages_fts f JOIN messages m ON m.id=f.message_id WHERE m.source_message_id='message-1'`).Scan(&fromBefore))
+	assert.Equal(t, "+15550001111", fromBefore)
+	// Existing index text can differ from the participant's current phone.
+	// A partial reimport must preserve that exact sender search value.
+	_, err = st.DB().Exec(`UPDATE messages_fts SET from_addr='previous-index-sender' WHERE message_id=(SELECT id FROM messages WHERE source_message_id='message-1')`)
+	require.NoError(t, err)
+	fromBefore = "previous-index-sender"
+	db, err := sql.Open("sqlite3", backup)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM jid_map WHERE lid_row_id=2; UPDATE message SET text_data='updated searchable body' WHERE _id=1`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	result, err := imp.Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, result.ErrorCounts["sender_unresolved"])
+	var senderAfter int64
+	var isFrom, sourceFrom, identityFrom bool
+	require.NoError(t, st.DB().QueryRow(`SELECT sender_id,is_from_me,source_is_from_me,identity_is_from_me FROM messages WHERE source_message_id='message-1'`).Scan(&senderAfter, &isFrom, &sourceFrom, &identityFrom))
+	assert.Equal(t, senderBefore, senderAfter)
+	assert.True(t, isFrom)
+	assert.True(t, sourceFrom)
+	assert.True(t, identityFrom)
+	var fromAfter string
+	require.NoError(t, st.DB().QueryRow(`SELECT f.from_addr FROM messages_fts f JOIN messages m ON m.id=f.message_id WHERE m.source_message_id='message-1'`).Scan(&fromAfter))
+	assert.Equal(t, fromBefore, fromAfter)
+	var indexedBody string
+	require.NoError(t, st.DB().QueryRow(`SELECT f.body FROM messages_fts f JOIN messages m ON m.id=f.message_id WHERE m.source_message_id='message-1'`).Scan(&indexedBody))
+	assert.Equal(t, "updated searchable body", indexedBody)
+}
+
+func TestRosterCoverageDoesNotClaimHistoricalMembershipIsCurrent(t *testing.T) {
+	backup := testBackup(t, modernRoster)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	imp := NewImporter(st, nil)
+	_, err := imp.Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	db, err := sql.Open("sqlite3", backup)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM group_participant_user WHERE user_jid_row_id=2`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	result, err := imp.Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.Equal(t, "complete", result.GroupRoster, "coverage describes source read, not stored current membership")
+	var role string
+	err = st.DB().QueryRow(`SELECT cp.role FROM conversation_participants cp JOIN participant_identifiers pi ON pi.participant_id=cp.participant_id WHERE pi.identifier_value=?`, "+15550001111").Scan(&role)
+	require.NoError(t, err)
+	assert.Equal(t, "admin", role, "historical role is retained pending source-aware reconciliation")
+}

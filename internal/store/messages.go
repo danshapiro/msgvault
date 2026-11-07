@@ -736,7 +736,19 @@ func (s *Store) EnsureConversation(sourceID int64, sourceConversationID, title s
 }
 
 // upsertMessageSQL returns the message upsert SQL with dialect-specific timestamp.
-func upsertMessageSQL(now string) string {
+func upsertMessageSQL(now string, preserveMissingSender bool) string {
+	attributionUpdate := `sender_id = excluded.sender_id,
+		is_from_me = excluded.is_from_me,
+		source_is_from_me = excluded.source_is_from_me,
+		identity_is_from_me = excluded.identity_is_from_me`
+	if preserveMissingSender {
+		// A missing sender is not evidence that previously known attribution
+		// disappeared. Apply this atomically on conflict, without a read/write race.
+		attributionUpdate = `sender_id = CASE WHEN excluded.sender_id IS NULL THEN messages.sender_id ELSE excluded.sender_id END,
+		is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.is_from_me ELSE excluded.is_from_me END,
+		source_is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.source_is_from_me ELSE excluded.source_is_from_me END,
+		identity_is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.identity_is_from_me ELSE excluded.identity_is_from_me END`
+	}
 	return fmt.Sprintf(`
 	WITH attribution AS (
 		SELECT
@@ -789,15 +801,12 @@ func upsertMessageSQL(now string) string {
 		sent_at = excluded.sent_at,
 		received_at = excluded.received_at,
 		internal_date = excluded.internal_date,
-		sender_id = excluded.sender_id,
-		is_from_me = excluded.is_from_me,
-		source_is_from_me = excluded.source_is_from_me,
-		identity_is_from_me = excluded.identity_is_from_me,
+		%s,
 		subject = excluded.subject,
 		snippet = excluded.snippet,
 		size_estimate = excluded.size_estimate,
 		has_attachments = excluded.has_attachments,
-		attachment_count = excluded.attachment_count`, now)
+		attachment_count = excluded.attachment_count`, now, attributionUpdate)
 }
 
 // UpsertMessage inserts or updates a message.
@@ -805,8 +814,18 @@ func (s *Store) UpsertMessage(msg *Message) (int64, error) {
 	return upsertMessageWith(s.db, s.dialect, msg)
 }
 
+// UpsertMessagePreservingAttribution retains an existing message's sender and
+// attribution when the new source record cannot resolve its sender.
+func (s *Store) UpsertMessagePreservingAttribution(msg *Message) (int64, error) {
+	return upsertMessageWithMode(s.db, s.dialect, msg, true)
+}
+
 func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
-	sql := upsertMessageSQL(d.Now())
+	return upsertMessageWithMode(q, d, msg, false)
+}
+
+func upsertMessageWithMode(q querier, d Dialect, msg *Message, preserveMissingSender bool) (int64, error) {
+	sql := upsertMessageSQL(d.Now(), preserveMissingSender)
 	sourceIsFromMe := msg.IsFromMe && !msg.IdentityDerivedIsFromMe
 	identityIsFromMe := msg.IsFromMe && msg.IdentityDerivedIsFromMe
 	args := []any{
@@ -2240,6 +2259,29 @@ func (s *Store) UpsertFTS(messageID int64, subject, bodyText, fromAddr, toAddrs,
 		ToAddrs:   toAddrs,
 		CcAddrs:   ccAddrs,
 	})
+}
+
+// PreviousFTSSender returns the last indexed sender before body updates can
+// invalidate the search document. SQLite keeps the exact source text;
+// PostgreSQL reconstructs it from the retained participant.
+func (s *Store) PreviousFTSSender(messageID int64) (string, error) {
+	if !s.fts5Available {
+		return "", nil
+	}
+	var fromAddr sql.NullString
+	if !s.IsPostgreSQL() {
+		err := s.db.QueryRow(`SELECT from_addr FROM messages_fts WHERE rowid = ?`, messageID).Scan(&fromAddr)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("read previous search sender: %w", err)
+		}
+	}
+	if !fromAddr.Valid {
+		err := s.db.QueryRow(`SELECT p.phone_number FROM messages m LEFT JOIN participants p ON p.id = m.sender_id WHERE m.id = ?`, messageID).Scan(&fromAddr)
+		if err != nil {
+			return "", fmt.Errorf("read previous sender: %w", err)
+		}
+	}
+	return fromAddr.String, nil
 }
 
 // BackfillFTS populates the FTS table from existing message data.

@@ -110,6 +110,21 @@ func fetchChats(db *sql.DB) ([]waChat, error) {
 	return chats, rows.Err()
 }
 
+// countUnprocessedMessages accounts for rows excluded by the chat query.
+// Hidden chats are an intentional scope exclusion; missing chat references are
+// an archive integrity error because those messages cannot be routed.
+func countUnprocessedMessages(db *sql.DB) (hidden, orphan int64, err error) {
+	err = db.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN c._id IS NOT NULL AND COALESCE(c.hidden, 0) <> 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN c._id IS NULL OR (COALESCE(c.hidden, 0) = 0 AND j._id IS NULL) THEN 1 ELSE 0 END), 0)
+		FROM message m LEFT JOIN chat c ON c._id = m.chat_row_id
+		LEFT JOIN jid j ON j._id = c.jid_row_id`).Scan(&hidden, &orphan)
+	if err != nil {
+		return 0, 0, fmt.Errorf("account for unprocessed messages: %w", err)
+	}
+	return hidden, orphan, nil
+}
+
 // fetchMessages returns messages for a chat, batched after a given _id.
 // Messages are ordered by _id ascending for deterministic resumability.
 // Joins with jid to resolve sender information.
@@ -332,6 +347,25 @@ func groupRosterSchema(db *sql.DB) string {
 	return "unavailable"
 }
 
+// countOrphanRosterGroups catches references that cannot appear in a
+// per-chat roster query because their group JID row no longer exists.
+func countOrphanRosterGroups(db *sql.DB) (int64, error) {
+	var query string
+	switch groupRosterSchema(db) {
+	case "modern":
+		query = `SELECT COUNT(*) FROM group_participant_user p LEFT JOIN jid g ON g._id = p.group_jid_row_id WHERE g._id IS NULL`
+	case "legacy":
+		query = `SELECT COUNT(*) FROM group_participants p LEFT JOIN jid g ON g.raw_string = p.gjid WHERE g._id IS NULL`
+	default:
+		return 0, nil
+	}
+	var count int64
+	if err := db.QueryRow(query).Scan(&count); err != nil {
+		return 0, fmt.Errorf("check group roster references: %w", err)
+	}
+	return count, nil
+}
+
 // fetchGroupParticipants reads recognized legacy or current WhatsApp rosters.
 // Modern backups refer to JIDs by row id and frequently use LIDs; resolve
 // those only through jid_map, never by interpreting an LID as a phone number.
@@ -347,12 +381,12 @@ func fetchGroupParticipants(db *sql.DB, groupJIDRawString string) ([]waGroupMemb
 			return nil, fmt.Errorf("modern group roster cannot resolve LIDs: jid_map unavailable")
 		}
 		query = `
-			SELECT g.raw_string, u.raw_string,
+			SELECT g.raw_string, COALESCE(u.raw_string, ''),
 			       COALESCE(phone.user, u.user, ''), COALESCE(phone.server, u.server, ''),
 			       COALESCE(p.rank, -1), COALESCE(p.pending, -1)
 			FROM group_participant_user p
 			JOIN jid g ON g._id = p.group_jid_row_id
-			JOIN jid u ON u._id = p.user_jid_row_id
+			LEFT JOIN jid u ON u._id = p.user_jid_row_id
 			LEFT JOIN jid_map jm ON jm.lid_row_id = u._id
 			LEFT JOIN jid phone ON phone._id = jm.jid_row_id
 			WHERE g.raw_string = ?`
