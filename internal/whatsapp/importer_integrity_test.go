@@ -532,3 +532,35 @@ func TestObservedRosterRolesReconcileWithoutRemovingHistoricalMembers(t *testing
 		assert.Equal(t, "admin", roleFor("+15550004444"))
 	}
 }
+
+func TestConflictingRosterRolesPreserveExistingRole(t *testing.T) {
+	for _, existingRole := range []string{"member", "admin"} {
+		t.Run(existingRole, func(t *testing.T) {
+			backup := testBackup(t, modernRoster)
+			st := testutil.NewTestStore(t)
+			opts := DefaultOptions()
+			opts.Phone = "+15550002222"
+			imp := NewImporter(st, nil)
+			_, err := imp.Import(context.Background(), backup, opts)
+			require.NoError(t, err)
+			_, err = st.DB().Exec(`UPDATE conversation_participants SET role=? WHERE participant_id IN (SELECT participant_id FROM participant_identifiers WHERE identifier_value=?)`, existingRole, "+15550001111")
+			require.NoError(t, err)
+			db, err := sql.Open("sqlite3", backup)
+			require.NoError(t, err)
+			// A second LID now maps to the same phone but claims member rank,
+			// conflicting with the existing admin-ranked LID in this group.
+			_, err = db.Exec(`INSERT INTO jid_map VALUES (4, 3); INSERT INTO group_participant_user VALUES (3, 1, 4, 0, 0)`)
+			require.NoError(t, err)
+			require.NoError(t, db.Close())
+			for i := 0; i < 2; i++ {
+				result, err := imp.Import(context.Background(), backup, opts)
+				require.NoError(t, err)
+				assert.Equal(t, "partial", result.GroupRoster)
+				assert.EqualValues(t, 1, result.ErrorCounts["group_roster_conflicting_role"])
+				var role string
+				require.NoError(t, st.DB().QueryRow(`SELECT cp.role FROM conversation_participants cp JOIN participant_identifiers pi ON pi.participant_id=cp.participant_id WHERE pi.identifier_value=?`, "+15550001111").Scan(&role))
+				assert.Equal(t, existingRole, role)
+			}
+		})
+	}
+}

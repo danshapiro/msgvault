@@ -234,6 +234,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 				}
 				reportError("group_roster_query", fmt.Errorf("fetch group participants for %s: %w", sourceConvID, err))
 			} else {
+				// Resolve the complete per-chat roster before applying roles.
+				// Multiple JIDs may resolve to the same participant; conflicting
+				// ranks must never choose a role based on row order.
+				roles := make(map[int64]string)
+				conflicting := make(map[int64]bool)
 				for _, member := range members {
 					if member.Pending != 0 || member.Admin < 0 || member.Admin > 2 {
 						if summary.GroupRoster == "complete" {
@@ -263,6 +268,18 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					}
 					summary.Participants++
 					role := mapGroupRole(member.Admin)
+					if conflicting[participantID] {
+						continue
+					}
+					if previous, found := roles[participantID]; found && previous != role {
+						delete(roles, participantID)
+						conflicting[participantID] = true
+						reportError("group_roster_conflicting_role", errors.New("group roster has conflicting roles for a resolved participant"))
+						continue
+					}
+					roles[participantID] = role
+				}
+				for participantID, role := range roles {
 					if err := imp.store.EnsureConversationParticipant(conversationID, participantID, role); err != nil {
 						reportError("group_roster_write", fmt.Errorf("save group participant: %w", err))
 					} else {

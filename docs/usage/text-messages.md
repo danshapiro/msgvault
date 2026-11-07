@@ -60,8 +60,10 @@ unresolved identity, failed item, interrupted run, or `--limit` produces a
 partial result and a nonzero exit status. Successfully imported records remain
 in the archive and a later import safely upserts them. Group administrators
 are updated on reimport for each resolved, confirmed roster member, including
-promotions and demotions. The importer does not remove members or infer roles
-for people absent from the roster or seen only as senders. Group-roster status
+promotions and demotions. If multiple roster entries resolve to the same person
+but disagree on role, the import is partial and that person's stored role is
+preserved. The importer does not remove members or infer roles for people absent
+from the roster or seen only as senders. Group-roster status
 describes source-read coverage for visible chats only: stored membership also
 includes historical senders and may retain departed members or stale roles for
 people absent from the snapshot. Hidden-chat messages are excluded
