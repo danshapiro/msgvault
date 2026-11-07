@@ -2,6 +2,7 @@ package pst
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -84,42 +85,57 @@ func TestNoAttachments(t *testing.T) {
 	}
 }
 
-func TestWindowsFiletimeToTime(t *testing.T) {
+func TestMessageDate(t *testing.T) {
+	const propertyID = 0x0039
 	tests := []struct {
-		name string
-		ft   int64
-		want time.Time
+		name  string
+		ticks uint64
+		want  time.Time
 	}{
-		{
-			name: "zero",
-			ft:   0,
-			want: time.Time{},
-		},
-		{
-			name: "unix epoch",
-			// 1970-01-01 00:00:00 UTC in Windows FILETIME
-			ft:   116444736000000000,
-			want: time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name: "2024-01-15 10:30:00 UTC",
-			// (2024-01-15T10:30:00 UTC - 1601-01-01) in 100ns intervals
-			ft:   133497882000000000,
-			want: time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
-		},
-		{
-			name: "negative",
-			ft:   -1,
-			want: time.Time{},
-		},
+		{"zero is absent", 0, time.Time{}},
+		{"unix epoch", 116444736000000000, time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"before unix epoch", 116444735990000000, time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC)},
+		{"2024 with fraction", 133497882001234567, time.Date(2024, 1, 15, 10, 30, 0, 123456700, time.UTC)},
+		{"beyond unix nanoseconds", 2650467744000000000, time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := windowsFiletimeToTime(tt.ft)
-			assert.True(t, got.Equal(tt.want), "windowsFiletimeToTime(%d) = %v, want %v", tt.ft, got, tt.want)
+			data := make([]byte, 8)
+			binary.LittleEndian.PutUint64(data, tt.ticks)
+			msg := &pstlib.Message{PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{{ID: propertyID, Type: pstlib.PropertyTypeTime, Data: data}}}}
+			got, err := messageDate(msg, propertyID, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
+
+	t.Run("missing", func(t *testing.T) {
+		got, err := messageDate(&pstlib.Message{PropertyContext: &pstlib.PropertyContext{}}, propertyID, nil)
+		require.NoError(t, err)
+		assert.True(t, got.IsZero())
+	})
+	t.Run("short data reports error", func(t *testing.T) {
+		msg := &pstlib.Message{PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{{ID: propertyID, Type: pstlib.PropertyTypeTime, Data: []byte{1}}}}}
+		_, err := messageDate(msg, propertyID, nil)
+		assert.Error(t, err)
+	})
+	t.Run("synthetic unix epoch", func(t *testing.T) {
+		var value int64
+		got, err := messageDate(&pstlib.Message{}, propertyID, &value)
+		require.NoError(t, err)
+		assert.Equal(t, time.Unix(0, 0).UTC(), got)
+	})
+}
+
+func TestFallbackDate(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	valid := time.Date(1965, 1, 2, 0, 0, 0, 0, time.UTC)
+	entry := &MessageEntry{SentAt: time.Date(1601, 1, 1, 0, 0, 0, 100, time.UTC), ReceivedAt: valid}
+	assert.Equal(t, valid, entry.FallbackDate(now))
+	entry.SentAt = now.AddDate(1, 0, 0)
+	assert.Equal(t, valid, entry.FallbackDate(now))
+	entry.ReceivedAt = time.Time{}
+	assert.True(t, entry.FallbackDate(now).IsZero())
 }
 
 func TestExtractCN(t *testing.T) {

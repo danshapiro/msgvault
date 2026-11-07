@@ -527,6 +527,14 @@ func importPstWithBatchSize(
 				// Not an email (calendar, contact, task, etc.) — skip silently.
 				continue
 			}
+			if entry.DateError != nil {
+				cp.ErrorsCount++
+				summary.Errors++
+				checkpointBlocked = true
+				hardErrors = true
+				log.Warn("read PST message date failed", "entry_id", entry.EntryID, "error", entry.DateError)
+				continue
+			}
 
 			attachments, err := pstreader.ReadAttachments(msg, opts.MaxMessageBytes)
 			if err != nil {
@@ -565,13 +573,7 @@ func importPstWithBatchSize(
 			// different files imported under the same identifier.
 			sourceMsgID := fmt.Sprintf("pst-%s-%s", archiveID, entry.EntryID)
 
-			fallbackDate := entry.SentAt
-			if fallbackDate.IsZero() {
-				fallbackDate = entry.ReceivedAt
-			}
-			if fallbackDate.IsZero() {
-				fallbackDate = entry.CreationTime
-			}
+			fallbackDate := entry.FallbackDate(time.Now())
 
 			pending = append(pending, pendingPstMessage{
 				Raw:          raw,
@@ -596,6 +598,8 @@ func importPstWithBatchSize(
 		if err := msgIter.Err(); err != nil {
 			cp.ErrorsCount++
 			summary.Errors++
+			checkpointBlocked = true
+			hardErrors = true
 			log.Warn("message iterator error", "path", fr.Entry.Path, "error", err)
 		}
 	}

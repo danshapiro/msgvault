@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
+	"github.com/mooijtech/go-pst/v6/pkg/properties"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pstreader "go.kenn.io/msgvault/internal/pst"
@@ -19,6 +22,47 @@ import (
 )
 
 const pstTestdataDir = "../pst/testdata"
+
+func TestImportPst_PassesRealMessageDateToIngestion(t *testing.T) {
+	path := filepath.Join(pstTestdataDir, "support.pst")
+	f, err := pstreader.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, f.Close()) })
+	var expectedID string
+	var expected time.Time
+	require.NoError(t, f.WalkFolders(func(_ pstreader.FolderEntry, folder *pstlib.Folder) error {
+		iter, err := folder.GetMessageIterator()
+		if err != nil {
+			return nil //nolint:nilerr // empty folder
+		}
+		for iter.Next() {
+			msg := iter.Value()
+			props, ok := msg.Properties.(*properties.Message)
+			if !ok || props.ClientSubmitTime == nil || expectedID != "" {
+				continue
+			}
+			date := time.Unix(0, *props.ClientSubmitTime).UTC()
+			if date.Year() >= 1990 && date.Year() < 2026 {
+				expectedID = fmt.Sprintf("-%d", msg.Identifier)
+				expected = date
+			}
+		}
+		return iter.Err()
+	}))
+	require.NotEmpty(t, expectedID)
+	mock := &mockIngestFunc{}
+	st := openIntegrationStore(t)
+	summary, err := ImportPst(t.Context(), st, path, PstImportOptions{Identifier: "owner@example.test", NoResume: true, IngestFunc: mock.fn})
+	require.NoError(t, err)
+	require.Zero(t, summary.Errors)
+	for _, call := range mock.calls {
+		if strings.HasSuffix(call.SourceMsgID, expectedID) {
+			assert.Equal(t, expected, call.FallbackDate)
+			return
+		}
+	}
+	assert.Fail(t, "expected message was not passed to ingestion")
+}
 
 func openIntegrationStore(t *testing.T) *store.Store {
 	t.Helper()

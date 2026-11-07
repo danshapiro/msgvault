@@ -200,13 +200,7 @@ func writeSynthesizedHeaders(buf *bytes.Buffer, msg *MessageEntry) {
 		writeHeader(buf, "Bcc", formatDisplayList(msg.DisplayBcc))
 	}
 
-	t := msg.SentAt
-	if t.IsZero() {
-		t = msg.ReceivedAt
-	}
-	if t.IsZero() {
-		t = msg.CreationTime
-	}
+	t := msg.FallbackDate(time.Now())
 	if !t.IsZero() {
 		writeHeader(buf, "Date", t.Format(time.RFC1123Z))
 	}

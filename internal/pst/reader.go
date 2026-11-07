@@ -2,6 +2,7 @@ package pst
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -24,17 +25,48 @@ func init() {
 	})
 }
 
-// windowsFiletimeToTime converts a Windows FILETIME value (100-nanosecond
-// intervals since 1601-01-01 UTC) to a time.Time. Returns zero time if ft == 0.
-func windowsFiletimeToTime(ft int64) time.Time {
-	if ft <= 0 {
-		return time.Time{}
+// messageDate reads the original FILETIME; go-pst's decoded property is Unix
+// nanoseconds and cannot represent all FILETIME values, including raw zero.
+func messageDate(msg *pstlib.Message, id uint16, decoded *int64) (time.Time, error) {
+	if msg.PropertyContext == nil {
+		if decoded == nil {
+			return time.Time{}, nil
+		}
+		return time.Unix(0, *decoded).UTC(), nil
 	}
-	// 11644473600 seconds between Windows epoch (1601-01-01) and Unix epoch (1970-01-01).
+	prop, err := msg.PropertyContext.GetPropertyByID(id)
+	if errors.Is(err, pstlib.ErrPropertyNotFound) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if prop.Type != pstlib.PropertyTypeTime {
+		return time.Time{}, fmt.Errorf("property %#x has unexpected type %v", id, prop.Type)
+	}
+	data := prop.Data
+	if len(data) == 0 {
+		reader, err := msg.PropertyContext.GetPropertyReader(id, msg.LocalDescriptors)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if reader.HeapOnNodeReader == nil || reader.Size() != 8 {
+			return time.Time{}, fmt.Errorf("property %#x has invalid date data", id)
+		}
+		data = make([]byte, 8)
+		if n, err := reader.ReadAt(data, 0); err != nil || n != len(data) {
+			return time.Time{}, fmt.Errorf("read date property %#x: read %d bytes: %v", id, n, err)
+		}
+	}
+	if len(data) != 8 {
+		return time.Time{}, fmt.Errorf("property %#x has %d date bytes, expected 8", id, len(data))
+	}
+	ft := binary.LittleEndian.Uint64(data)
+	if ft == 0 {
+		return time.Time{}, nil
+	}
 	const epochDiff int64 = 11644473600
-	secs := ft/10_000_000 - epochDiff
-	ns := (ft % 10_000_000) * 100
-	return time.Unix(secs, ns).UTC()
+	return time.Unix(int64(ft/10_000_000)-epochDiff, int64(ft%10_000_000)*100).UTC(), nil
 }
 
 // File wraps a PST file for reading.
@@ -110,6 +142,19 @@ type MessageEntry struct {
 	SentAt       time.Time // ClientSubmitTime
 	ReceivedAt   time.Time // MessageDeliveryTime
 	CreationTime time.Time // PidTagCreationTime
+	DateError    error     // unreadable timestamp properties, if any
+}
+
+// FallbackDate picks a plausible PST date when no reliable message date exists.
+func (entry *MessageEntry) FallbackDate(now time.Time) time.Time {
+	earliest := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+	latest := now.AddDate(0, 0, 30)
+	for _, date := range []time.Time{entry.SentAt, entry.ReceivedAt, entry.CreationTime} {
+		if !date.IsZero() && !date.Before(earliest) && !date.After(latest) {
+			return date
+		}
+	}
+	return time.Time{}
 }
 
 // AttachmentEntry holds metadata and content for a PST attachment.
@@ -202,6 +247,9 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		}
 	}
 
+	sentAt, sentErr := messageDate(msg, 0x0039, props.ClientSubmitTime)
+	receivedAt, receivedErr := messageDate(msg, 0x0e06, props.MessageDeliveryTime)
+	createdAt, createdErr := messageDate(msg, 0x3007, props.CreationTime)
 	return &MessageEntry{
 		EntryID:           fmt.Sprintf("%d", msg.Identifier),
 		FolderPath:        folderPath,
@@ -218,9 +266,10 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		MessageID:         props.GetInternetMessageId(),
 		InReplyTo:         props.GetInReplyToId(),
 		References:        props.GetInternetReferences(),
-		SentAt:            windowsFiletimeToTime(props.GetClientSubmitTime()),
-		ReceivedAt:        windowsFiletimeToTime(props.GetMessageDeliveryTime()),
-		CreationTime:      windowsFiletimeToTime(props.GetCreationTime()),
+		SentAt:            sentAt,
+		ReceivedAt:        receivedAt,
+		CreationTime:      createdAt,
+		DateError:         errors.Join(sentErr, receivedErr, createdErr),
 	}
 }
 

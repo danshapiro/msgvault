@@ -3,8 +3,10 @@ package pst_test
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
+	"github.com/mooijtech/go-pst/v6/pkg/properties"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pstreader "go.kenn.io/msgvault/internal/pst"
@@ -97,6 +99,44 @@ func TestExtractMessages_SupportPST(t *testing.T) {
 	assert.NotEmpty(found.TransportHeaders, "expected TransportHeaders to be non-empty for an internet-delivered message")
 	assert.NotEmpty(found.MessageID, "expected MessageID to be non-empty")
 	assert.False(found.SentAt.IsZero(), "expected SentAt to be non-zero")
+}
+
+func TestExtractMessages_SupportPSTDates(t *testing.T) {
+	f, err := pstreader.Open(supportPST(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, f.Close()) })
+	checked := 0
+	err = f.WalkFolders(func(entry pstreader.FolderEntry, folder *pstlib.Folder) error {
+		iter, err := folder.GetMessageIterator()
+		if err != nil {
+			return nil //nolint:nilerr // empty folder
+		}
+		for iter.Next() {
+			msg := iter.Value()
+			got := pstreader.ExtractMessage(msg, entry.Path)
+			if got == nil {
+				continue
+			}
+			require.NoError(t, got.DateError)
+			props := msg.Properties.(*properties.Message)
+			for _, date := range []struct {
+				decoded *int64
+				got     time.Time
+			}{{props.ClientSubmitTime, got.SentAt}, {props.MessageDeliveryTime, got.ReceivedAt}, {props.CreationTime, got.CreationTime}} {
+				if date.decoded == nil {
+					continue
+				}
+				want := time.Unix(0, *date.decoded).UTC()
+				if want.Year() >= 1990 && want.Year() <= 2030 {
+					assert.Equal(t, want, date.got)
+					checked++
+				}
+			}
+		}
+		return iter.Err()
+	})
+	require.NoError(t, err)
+	assert.Positive(t, checked)
 }
 
 // TestExtractMessages_NonEmailsSkipped verifies that non-email items (contacts,
