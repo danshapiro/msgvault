@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -77,10 +78,14 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	// Handle Ctrl+C gracefully.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 	go func() {
-		<-sigChan
-		fmt.Println("\nInterrupted. Saving checkpoint...")
-		cancel()
+		select {
+		case <-sigChan:
+			fmt.Println("\nInterrupted. Saving checkpoint...")
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	// Build import options.
@@ -109,7 +114,7 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Println("\nImport interrupted. Run again to continue.")
-			return rebuildCacheAfterWrite(dbPath)
+			return errors.Join(fmt.Errorf("WhatsApp import interrupted: %w", ctx.Err()), rebuildCacheAfterWrite(dbPath))
 		}
 		return fmt.Errorf("import failed: %w", err)
 	}
@@ -138,11 +143,15 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 
 	// Print summary.
 	fmt.Println()
-	fmt.Println("Import complete!")
+	if summary.Errors > 0 {
+		fmt.Println("Import partially completed!")
+	} else {
+		fmt.Println("Import complete!")
+	}
 	fmt.Printf("  Duration:       %s\n", summary.Duration.Round(time.Second))
 	fmt.Printf("  Chats:          %d\n", summary.ChatsProcessed)
-	fmt.Printf("  Messages:       %d processed, %d added, %d skipped\n",
-		summary.MessagesProcessed, summary.MessagesAdded, summary.MessagesSkipped)
+	fmt.Printf("  Messages:       %d processed, %d added, %d updated, %d skipped\n",
+		summary.MessagesProcessed, summary.MessagesAdded, summary.MessagesUpdated, summary.MessagesSkipped)
 	fmt.Printf("  Participants:   %d\n", summary.Participants)
 	fmt.Printf("  Reactions:      %d\n", summary.ReactionsAdded)
 	fmt.Printf("  Attachments:    %d found", summary.AttachmentsFound)
@@ -159,7 +168,36 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		fmt.Printf("  Rate:           %.0f messages/sec\n", rate)
 	}
 
-	return rebuildCacheAfterWrite(dbPath)
+	if err := rebuildCacheAfterWrite(dbPath); err != nil {
+		return err
+	}
+	status := "complete"
+	if summary.Errors > 0 {
+		status = "partial"
+	}
+	result := struct {
+		Version           int              `json:"version"`
+		Status            string           `json:"status"`
+		Errors            int64            `json:"errors"`
+		ErrorCounts       map[string]int64 `json:"error_counts"`
+		SkippedCounts     map[string]int64 `json:"skipped_counts"`
+		GroupRoster       string           `json:"group_roster"`
+		MessagesProcessed int64            `json:"messages_processed"`
+		MessagesUpserted  int64            `json:"messages_upserted"`
+		MessagesAdded     int64            `json:"messages_added"`
+		MessagesUpdated   int64            `json:"messages_updated"`
+		MessagesSkipped   int64            `json:"messages_skipped"`
+	}{1, status, summary.Errors, summary.ErrorCounts, summary.SkippedCounts, summary.GroupRoster, summary.MessagesProcessed,
+		summary.MessagesAdded + summary.MessagesUpdated, summary.MessagesAdded, summary.MessagesUpdated, summary.MessagesSkipped}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("encode import result: %w", err)
+	}
+	fmt.Printf("WHATSAPP_IMPORT_RESULT=%s\n", encoded)
+	if summary.Errors > 0 {
+		return fmt.Errorf("WhatsApp import incomplete: %d errors", summary.Errors)
+	}
+	return nil
 }
 
 // ImportCLIProgress implements whatsapp.ImportProgress for terminal output.

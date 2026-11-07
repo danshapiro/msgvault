@@ -730,7 +730,7 @@ The `--phone` flag is required and must be in E.164 format (e.g., `+447700900000
 | `--display-name` | No | Display name for the phone owner |
 | `--no-default-identity` | No | Do not auto-confirm the phone number as this source's "me" identity |
 
-See [Text Messages](/usage/text-messages/) for usage examples.
+Partial imports, including unresolved group members or an explicit `--limit`, exit nonzero and emit a structured result when available. Successfully imported records are retained; see [Text Messages](/usage/text-messages/) for details and usage examples.
 
 ---
 

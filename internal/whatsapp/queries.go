@@ -314,22 +314,55 @@ func scanReactionChunk(rows *sql.Rows, result map[int64][]waReaction) error {
 	return rows.Err()
 }
 
-// fetchGroupParticipants returns all participants of a group chat.
-// In the WhatsApp schema, group_participants.gjid and .jid are TEXT fields
-// containing raw JID strings (e.g., "447700900000@s.whatsapp.net"),
-// not integer row IDs.
+// groupRosterSchema determines whether the backup has a recognized roster layout.
+// A table with an unexpected layout is unsupported rather than silently treated
+// as a complete empty roster.
+func groupRosterSchema(db *sql.DB) string {
+	if hasColumn(db, "group_participant_user", "group_jid_row_id") &&
+		hasColumn(db, "group_participant_user", "user_jid_row_id") &&
+		hasColumn(db, "group_participant_user", "rank") &&
+		hasColumn(db, "group_participant_user", "pending") {
+		return "modern"
+	}
+	if hasColumn(db, "group_participants", "gjid") &&
+		hasColumn(db, "group_participants", "jid") &&
+		hasColumn(db, "group_participants", "admin") {
+		return "legacy"
+	}
+	return "unavailable"
+}
+
+// fetchGroupParticipants reads recognized legacy or current WhatsApp rosters.
+// Modern backups refer to JIDs by row id and frequently use LIDs; resolve
+// those only through jid_map, never by interpreting an LID as a phone number.
 func fetchGroupParticipants(db *sql.DB, groupJIDRawString string) ([]waGroupMember, error) {
-	rows, err := db.Query(`
-		SELECT
-			gp.gjid,
-			gp.jid,
-			COALESCE(j.user, ''),
-			COALESCE(j.server, ''),
-			COALESCE(gp.admin, 0)
-		FROM group_participants gp
-		LEFT JOIN jid j ON gp.jid = j.raw_string
-		WHERE gp.gjid = ?
-	`, groupJIDRawString)
+	var query string
+	switch groupRosterSchema(db) {
+	case "modern":
+		if !hasColumn(db, "jid_map", "lid_row_id") || !hasColumn(db, "jid_map", "jid_row_id") {
+			return nil, fmt.Errorf("modern group roster cannot resolve LIDs: jid_map unavailable")
+		}
+		query = `
+			SELECT g.raw_string, u.raw_string,
+			       COALESCE(phone.user, u.user, ''), COALESCE(phone.server, u.server, ''),
+			       COALESCE(p.rank, -1), COALESCE(p.pending, -1)
+			FROM group_participant_user p
+			JOIN jid g ON g._id = p.group_jid_row_id
+			JOIN jid u ON u._id = p.user_jid_row_id
+			LEFT JOIN jid_map jm ON jm.lid_row_id = u._id
+			LEFT JOIN jid phone ON phone._id = jm.jid_row_id
+			WHERE g.raw_string = ?`
+	case "legacy":
+		query = `
+			SELECT gp.gjid, gp.jid, COALESCE(j.user, ''), COALESCE(j.server, ''),
+			       COALESCE(gp.admin, -1), 0
+			FROM group_participants gp
+			LEFT JOIN jid j ON gp.jid = j.raw_string
+			WHERE gp.gjid = ?`
+	default:
+		return nil, fmt.Errorf("group roster schema unavailable")
+	}
+	rows, err := db.Query(query, groupJIDRawString)
 	if err != nil {
 		return nil, fmt.Errorf("fetch group participants: %w", err)
 	}
@@ -338,10 +371,7 @@ func fetchGroupParticipants(db *sql.DB, groupJIDRawString string) ([]waGroupMemb
 	var members []waGroupMember
 	for rows.Next() {
 		var m waGroupMember
-		if err := rows.Scan(
-			&m.GroupJID, &m.MemberJID,
-			&m.MemberUser, &m.MemberServer, &m.Admin,
-		); err != nil {
+		if err := rows.Scan(&m.GroupJID, &m.MemberJID, &m.MemberUser, &m.MemberServer, &m.Admin, &m.Pending); err != nil {
 			return nil, fmt.Errorf("scan group participant: %w", err)
 		}
 		members = append(members, m)

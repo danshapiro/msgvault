@@ -69,7 +69,8 @@ type waGroupMember struct {
 	MemberJID    string // group_participants.jid (text, raw JID string)
 	MemberUser   string // jid.user (parsed from MemberJID)
 	MemberServer string // jid.server (parsed from MemberJID)
-	Admin        int    // group_participants.admin (0=member, 1=admin, 2=superadmin)
+	Admin        int    // admin rank (0=member, 1=admin, 2=superadmin)
+	Pending      int    // nonzero means membership is not confirmed
 }
 
 // waQuoted represents a quoted/replied-to message reference.
@@ -129,12 +130,16 @@ type ImportSummary struct {
 	ChatsProcessed    int64
 	MessagesProcessed int64
 	MessagesAdded     int64
+	MessagesUpdated   int64
 	MessagesSkipped   int64
 	ReactionsAdded    int64
 	AttachmentsFound  int64
 	MediaCopied       int64
 	Participants      int64
 	Errors            int64
+	GroupRoster       string // complete, partial, or unavailable
+	ErrorCounts       map[string]int64
+	SkippedCounts     map[string]int64
 }
 
 // ImportProgress provides callbacks for import progress reporting.

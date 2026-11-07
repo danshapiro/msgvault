@@ -53,6 +53,23 @@ You need a decrypted copy of your WhatsApp `msgstore.db` file. This is the SQLit
 
 The importer brings in chats, messages, participants, reactions, and attachments (when `--media-dir` is provided).
 
+The command recognizes legacy and current group-roster layouts. Current backups
+may contain local identifiers that cannot be mapped to phone numbers; those
+members are reported as unresolved rather than guessed. A missing roster,
+unresolved identity, failed item, interrupted run, or `--limit` produces a
+partial result and a nonzero exit status. Successfully imported records remain
+in the archive and a later import safely upserts them. Group administrators
+can be promoted on reimport; the importer does not remove members or demote
+roles based on an incomplete roster.
+
+After a finished import, the command emits a `WHATSAPP_IMPORT_RESULT=` line
+containing versioned JSON with `status` (`complete` or `partial`), categorized
+error and skip counts, group-roster status, and inserted/updated message counts.
+A fatal error may stop the command before this line. System messages, calls,
+locations, contacts, polls, and status posts are skipped; their counts are
+reported separately. Media files are copied only when `--media-dir` is supplied.
+
+
 ## import-imessage
 
 Import messages from the local iMessage database on macOS.
