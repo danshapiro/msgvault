@@ -59,10 +59,12 @@ members are reported as unresolved rather than guessed. A missing roster,
 unresolved identity, failed item, interrupted run, or `--limit` produces a
 partial result and a nonzero exit status. Successfully imported records remain
 in the archive and a later import safely upserts them. Group administrators
-can be promoted on reimport; the importer does not remove members or demote
-roles based on an incomplete roster. Group-roster status describes source-read
-coverage for visible chats only: stored membership also includes historical senders and may retain
-departed members or stale administrator roles. Hidden-chat messages are excluded
+are updated on reimport for each resolved, confirmed roster member, including
+promotions and demotions. The importer does not remove members or infer roles
+for people absent from the roster or seen only as senders. Group-roster status
+describes source-read coverage for visible chats only: stored membership also
+includes historical senders and may retain departed members or stale roles for
+people absent from the snapshot. Hidden-chat messages are excluded
 and counted; messages without a matching chat make the import partial. The
 current roster's rank and pending
 interpretation is corroborated by an [independent importer](https://github.com/akhil-dara/WAInsight/blob/main/backend/app/ingestion/chat_ingester.py),

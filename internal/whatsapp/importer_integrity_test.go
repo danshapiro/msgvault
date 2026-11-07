@@ -477,3 +477,58 @@ func TestRosterGroupWithoutChatIsPartialButHiddenChatIsRecognized(t *testing.T) 
 		})
 	}
 }
+
+func TestObservedRosterRolesReconcileWithoutRemovingHistoricalMembers(t *testing.T) {
+	backup := testBackup(t, modernRoster)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	imp := NewImporter(st, nil)
+	first, err := imp.Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.Zero(t, first.Errors)
+
+	var conversationID int64
+	require.NoError(t, st.DB().QueryRow(`SELECT id FROM conversations WHERE source_id=?`, first.SourceID).Scan(&conversationID))
+	historicalID, err := st.EnsureParticipantByPhone("+15550004444", "", "whatsapp")
+	require.NoError(t, err)
+	require.NoError(t, st.EnsureConversationParticipant(conversationID, historicalID, "admin"))
+	roleFor := func(phone string) string {
+		t.Helper()
+		var role string
+		err := st.DB().QueryRow(`SELECT cp.role FROM conversation_participants cp JOIN participant_identifiers pi ON pi.participant_id=cp.participant_id WHERE cp.conversation_id=? AND pi.identifier_value=?`, conversationID, phone).Scan(&role)
+		require.NoError(t, err)
+		return role
+	}
+	assert.Equal(t, "admin", roleFor("+15550001111"))
+	assert.Equal(t, "admin", roleFor("+15550004444"))
+
+	// A known member's current role is authoritative even if a different
+	// roster entry cannot be resolved. Historical members remain untouched.
+	db, err := sql.Open("sqlite3", backup)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE group_participant_user SET rank=0 WHERE user_jid_row_id=2;
+		INSERT INTO group_participant_user VALUES (3, 1, 4, 0, 0);`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	partial, err := imp.Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.Equal(t, "partial", partial.GroupRoster)
+	assert.EqualValues(t, 1, partial.ErrorCounts["group_roster_unresolved"])
+	assert.Equal(t, "member", roleFor("+15550001111"))
+	assert.Equal(t, "admin", roleFor("+15550004444"))
+
+	// Promotion and a repeated import are equally safe and idempotent.
+	db, err = sql.Open("sqlite3", backup)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE group_participant_user SET rank=1 WHERE user_jid_row_id=2`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	for i := 0; i < 2; i++ {
+		result, err := imp.Import(context.Background(), backup, opts)
+		require.NoError(t, err)
+		assert.Equal(t, "partial", result.GroupRoster)
+		assert.Equal(t, "admin", roleFor("+15550001111"))
+		assert.Equal(t, "admin", roleFor("+15550004444"))
+	}
+}

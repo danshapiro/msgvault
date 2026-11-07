@@ -265,12 +265,13 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					role := mapGroupRole(member.Admin)
 					if err := imp.store.EnsureConversationParticipant(conversationID, participantID, role); err != nil {
 						reportError("group_roster_write", fmt.Errorf("save group participant: %w", err))
-					} else if role == "admin" {
-						// A previous sender-only import may have inserted this admin as
-						// a member. Promote explicitly; never demote based on fallback.
-						_, err := imp.store.DB().Exec(imp.store.Rebind("UPDATE conversation_participants SET role = ? WHERE conversation_id = ? AND participant_id = ? AND role = ?"), role, conversationID, participantID, "member")
+					} else {
+						// The resolved roster entry is authoritative for this observed
+						// member, even when another entry is unresolved. Do not infer
+						// changes for members absent from this snapshot or from senders.
+						_, err := imp.store.DB().Exec(imp.store.Rebind("UPDATE conversation_participants SET role = ? WHERE conversation_id = ? AND participant_id = ?"), role, conversationID, participantID)
 						if err != nil {
-							reportError("group_roster_write", fmt.Errorf("promote group administrator: %w", err))
+							reportError("group_roster_write", fmt.Errorf("update group member role: %w", err))
 						}
 					}
 				}
