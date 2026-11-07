@@ -264,3 +264,24 @@ func TestModernRosterSuperAdminIsRecordedAsAdmin(t *testing.T) {
 	require.NoError(t, st.DB().QueryRow(`SELECT cp.role FROM conversation_participants cp JOIN participant_identifiers pi ON pi.participant_id=cp.participant_id WHERE pi.identifier_value=?`, "+15550001111").Scan(&role))
 	assert.Equal(t, "admin", role)
 }
+
+type cancelAfterChat struct {
+	NullProgress
+	cancel context.CancelFunc
+}
+
+func (p cancelAfterChat) OnChatComplete(string, int64) { p.cancel() }
+
+func TestImportCancellationAfterFinalChatMarksSyncFailed(t *testing.T) {
+	backup := testBackup(t, modernRoster)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err := NewImporter(st, cancelAfterChat{cancel: cancel}).Import(ctx, backup, opts)
+	require.ErrorIs(t, err, context.Canceled)
+	var status string
+	require.NoError(t, st.DB().QueryRow(`SELECT status FROM sync_runs`).Scan(&status))
+	assert.Equal(t, "failed", status)
+}

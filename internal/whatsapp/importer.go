@@ -610,11 +610,20 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 		imp.progress.OnChatComplete(chat.RawString, chatAdded)
 	}
 
+	if err := ctx.Err(); err != nil {
+		syncErr = err
+		return nil, err
+	}
+
 	// Update denormalised conversation counts for the WhatsApp source.
 	if err := imp.store.RecomputeConversationStats(source.ID); err != nil {
 		reportError("conversation_stats", fmt.Errorf("recompute conversation stats: %w", err))
 	}
 
+	if err := ctx.Err(); err != nil {
+		syncErr = err
+		return nil, err
+	}
 	summary.Duration = time.Since(startTime)
 	imp.progress.OnComplete(summary)
 

@@ -119,6 +119,10 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		return fmt.Errorf("import failed: %w", err)
 	}
 
+	if ctx.Err() != nil {
+		return errors.Join(fmt.Errorf("WhatsApp import interrupted: %w", ctx.Err()), rebuildCacheAfterWrite(dbPath))
+	}
+
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment in account_identity.go.
 	if !noDefaultIdentityImportWhatsApp && summary.Errors == 0 && summary.SourceID != 0 {
@@ -170,6 +174,9 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 
 	if err := rebuildCacheAfterWrite(dbPath); err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WhatsApp import interrupted: %w", err)
 	}
 	status := "complete"
 	if summary.Errors > 0 {
