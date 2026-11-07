@@ -150,7 +150,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 		summary.GroupRoster = "partial"
 		summary.Errors += count
 		summary.ErrorCounts["group_roster_orphan_group"] += count
-		imp.progress.OnError(fmt.Errorf("group roster has %d entries with a missing group identity", count))
+		imp.progress.OnError(fmt.Errorf("group roster has %d entries without a corresponding group chat", count))
 	}
 
 	// Load lid → phone mapping for resolving "lid" senders.
@@ -409,6 +409,8 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					} else {
 						reportError("sender_unresolved", errors.New("direct message sender cannot be resolved"))
 					}
+				} else {
+					reportError("sender_unresolved", errors.New("group message sender identity is missing"))
 				}
 
 				// Track sender for participant fallback.

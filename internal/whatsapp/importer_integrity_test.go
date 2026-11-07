@@ -436,3 +436,44 @@ func TestDirectLIDChatResolvesSenderThroughJIDMap(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "+15550001111", phone)
 }
+
+func TestMissingGroupSenderAndPrivacyEventAreAccountedFor(t *testing.T) {
+	backup := testBackup(t, modernRoster+`
+	INSERT INTO message VALUES (3, 10, 0, 'missing-sender', NULL, 1700000002000, 0, 'content', 0, 0);
+	INSERT INTO message VALUES (4, 10, 0, 'dangling-sender', 999, 1700000003000, 0, 'content', 0, 0);
+	INSERT INTO message VALUES (5, 10, 0, 'privacy-event', NULL, 1700000004000, 112, NULL, 0, 0);`)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, result.ErrorCounts["sender_unresolved"])
+	assert.EqualValues(t, 1, result.SkippedCounts["type_112"])
+	assert.EqualValues(t, 5, result.MessagesProcessed)
+	assert.EqualValues(t, 4, result.MessagesAdded)
+	assert.EqualValues(t, 1, result.MessagesSkipped)
+}
+
+func TestRosterGroupWithoutChatIsPartialButHiddenChatIsRecognized(t *testing.T) {
+	cases := []struct{ name, roster string }{
+		{"modern", modernRoster + `INSERT INTO group_participant_user VALUES (3, 7, 2, 0, 0); INSERT INTO group_participant_user VALUES (4, 8, 2, 0, 0);`},
+		{"legacy", `CREATE TABLE group_participants(gjid TEXT, jid TEXT, admin INTEGER);
+		INSERT INTO group_participants VALUES ('12347@g.us', '15550001111@s.whatsapp.net', 0);
+		INSERT INTO group_participants VALUES ('12348@g.us', '15550001111@s.whatsapp.net', 0);`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backup := testBackup(t, tc.roster+`
+			INSERT INTO jid VALUES (7, '12347', 'g.us', '12347@g.us');
+			INSERT INTO jid VALUES (8, '12348', 'g.us', '12348@g.us');
+			INSERT INTO chat VALUES (20, 8, 1, 'Hidden', 1700000002000, 1);`)
+			st := testutil.NewTestStore(t)
+			opts := DefaultOptions()
+			opts.Phone = "+15550002222"
+			result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+			require.NoError(t, err)
+			assert.Equal(t, "partial", result.GroupRoster)
+			assert.EqualValues(t, 1, result.ErrorCounts["group_roster_orphan_group"])
+		})
+	}
+}

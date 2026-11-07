@@ -60,7 +60,7 @@ func TestIsMediaType(t *testing.T) {
 }
 
 func TestIsSkippedType(t *testing.T) {
-	skipped := []int{7, 9, 10, 15, 64, 66, 99, 11}
+	skipped := []int{7, 9, 10, 15, 64, 66, 99, 11, 112}
 	for _, typ := range skipped {
 		assert.True(t, isSkippedType(typ), "isSkippedType(%d) should be true", typ)
 	}

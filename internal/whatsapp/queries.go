@@ -348,14 +348,16 @@ func groupRosterSchema(db *sql.DB) string {
 }
 
 // countOrphanRosterGroups catches references that cannot appear in a
-// per-chat roster query because their group JID row no longer exists.
+// per-chat roster query because their group JID or chat no longer exists.
+// A hidden chat still counts as present; its exclusion is an intentional scope
+// limit and does not make the visible-chat roster unreadable.
 func countOrphanRosterGroups(db *sql.DB) (int64, error) {
 	var query string
 	switch groupRosterSchema(db) {
 	case "modern":
-		query = `SELECT COUNT(*) FROM group_participant_user p LEFT JOIN jid g ON g._id = p.group_jid_row_id WHERE g._id IS NULL`
+		query = `SELECT COUNT(*) FROM group_participant_user p LEFT JOIN jid g ON g._id = p.group_jid_row_id WHERE g._id IS NULL OR NOT EXISTS (SELECT 1 FROM chat c WHERE c.jid_row_id = g._id)`
 	case "legacy":
-		query = `SELECT COUNT(*) FROM group_participants p LEFT JOIN jid g ON g.raw_string = p.gjid WHERE g._id IS NULL`
+		query = `SELECT COUNT(*) FROM group_participants p LEFT JOIN jid g ON g.raw_string = p.gjid WHERE g._id IS NULL OR NOT EXISTS (SELECT 1 FROM chat c WHERE c.jid_row_id = g._id)`
 	default:
 		return 0, nil
 	}

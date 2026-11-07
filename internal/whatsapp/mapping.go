@@ -126,6 +126,10 @@ func isSkippedType(waMessageType int) bool {
 		return true
 	case 11: // status/story
 		return true
+	case 112: // Advanced chat privacy setting (system event).
+		// Corroborated by WAInsight's independent WhatsApp taxonomy;
+		// WhatsApp does not publish an official msgstore schema.
+		return true
 	default:
 		return false
 	}
