@@ -193,6 +193,9 @@ func TestReadAttachments_SupportPST(t *testing.T) {
 			for i, att := range atts {
 				assert.NotEmpty(t, att.Content, "attachment %d (%q) has empty content", i, att.Filename)
 			}
+			limited, err := pstreader.ReadAttachments(msg, 1)
+			assert.Error(t, err, "attachment limit must not silently drop content")
+			assert.Empty(t, limited)
 		}
 		return nil
 	})

@@ -23,6 +23,28 @@ import (
 
 const pstTestdataDir = "../pst/testdata"
 
+func TestImportPst_SizeLimitFailsInsteadOfImportingPartialMessages(t *testing.T) {
+	st := openIntegrationStore(t)
+	mock := &mockIngestFunc{}
+	summary, err := ImportPst(t.Context(), st, filepath.Join(pstTestdataDir, "support.pst"), PstImportOptions{
+		Identifier: "owner@example.test", NoResume: true, MaxMessageBytes: 1, IngestFunc: mock.fn,
+	})
+	require.NoError(t, err)
+	assert.True(t, summary.HardErrors)
+	assert.Positive(t, summary.Errors)
+	assert.Empty(t, mock.calls)
+	var status string
+	require.NoError(t, st.DB().QueryRow(`SELECT status FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&status))
+	assert.Equal(t, store.SyncStatusFailed, status)
+
+	retry, err := ImportPst(t.Context(), st, filepath.Join(pstTestdataDir, "support.pst"), PstImportOptions{
+		Identifier: "owner@example.test", IngestFunc: mock.fn,
+	})
+	require.NoError(t, err)
+	assert.False(t, retry.HardErrors)
+	assert.Len(t, mock.calls, 17, "retry should process every previously omitted message")
+}
+
 func TestImportPst_PassesRealMessageDateToIngestion(t *testing.T) {
 	path := filepath.Join(pstTestdataDir, "support.pst")
 	f, err := pstreader.Open(path)

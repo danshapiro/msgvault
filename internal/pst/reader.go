@@ -332,8 +332,8 @@ func ReadAttachments(msg *pstlib.Message, maxBytes int64) ([]AttachmentEntry, er
 		// enforces the limit unconditionally, covering the size==0 case.
 		if maxBytes > 0 {
 			estimatedSize := int64(att.GetAttachSize())
-			if estimatedSize > 0 && totalBytes+estimatedSize > maxBytes {
-				break
+			if estimatedSize > maxBytes-totalBytes {
+				return nil, fmt.Errorf("read attachment %q: %w", filename, errAttachmentTooLarge)
 			}
 		}
 
@@ -346,10 +346,6 @@ func ReadAttachments(msg *pstlib.Message, maxBytes int64) ([]AttachmentEntry, er
 		}
 		written, err := att.WriteTo(w)
 		if err != nil {
-			// ErrAttachmentTooLarge means we hit the cap; stop reading further attachments.
-			if errors.Is(err, errAttachmentTooLarge) {
-				break
-			}
 			return nil, fmt.Errorf("read attachment %q: %w", filename, err)
 		}
 		totalBytes += written

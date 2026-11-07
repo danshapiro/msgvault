@@ -499,9 +499,11 @@ func importPstWithBatchSize(
 
 		msgIter, err := folder.GetMessageIterator()
 		if err != nil {
-			// ErrMessagesNotFound is expected for empty folders.
+			// Collected folders report messages, so failure can hide content.
 			cp.ErrorsCount++
 			summary.Errors++
+			checkpointBlocked = true
+			hardErrors = true
 			log.Warn("get message iterator failed", "path", entry.Path, "error", err)
 			continue
 		}
@@ -540,15 +542,18 @@ func importPstWithBatchSize(
 			if err != nil {
 				cp.ErrorsCount++
 				summary.Errors++
+				checkpointBlocked = true
+				hardErrors = true
 				log.Warn("read attachments failed", "entry_id", entry.EntryID, "error", err)
-				// Continue without attachments rather than skipping the message.
-				attachments = nil
+				continue
 			}
 
 			raw, err := pstreader.BuildRFC5322(entry, attachments)
 			if err != nil {
 				cp.ErrorsCount++
 				summary.Errors++
+				checkpointBlocked = true
+				hardErrors = true
 				log.Warn("build RFC5322 failed", "entry_id", entry.EntryID, "error", err)
 				continue
 			}
@@ -556,6 +561,8 @@ func importPstWithBatchSize(
 			if opts.MaxMessageBytes > 0 && int64(len(raw)) > opts.MaxMessageBytes {
 				cp.ErrorsCount++
 				summary.Errors++
+				checkpointBlocked = true
+				hardErrors = true
 				log.Warn("message exceeds size limit; skipping",
 					"entry_id", entry.EntryID,
 					"size", len(raw),
