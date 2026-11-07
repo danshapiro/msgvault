@@ -489,13 +489,12 @@ func ImportMbox(
 				break
 			}
 			nextOffset := r.NextFromOffset()
-			if !checkpointBlocked {
-				lastCheckpointOffset = nextOffset
-			}
 			cp.ErrorsCount++
 			summary.Errors++
+			checkpointBlocked = true
+			hardErrors = true
 			log.Warn("mbox read error", "error", err, "next_offset", nextOffset)
-			continue
+			break
 		}
 
 		// Compute stable IDs:

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -531,7 +530,7 @@ func TestImportMbox_ErrorsCauseSyncFailed(t *testing.T) {
 	assert.NotZero(errorsCount, "errorsCount")
 }
 
-func TestImportMbox_SoftErrorsDoNotFailSync(t *testing.T) {
+func TestImportMbox_OversizedMessageFailsAndCanRetry(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
@@ -566,15 +565,22 @@ func TestImportMbox_SoftErrorsDoNotFailSync(t *testing.T) {
 	})
 	require.NoError(err, "ImportMbox")
 	assert.NotZero(summary.Errors, "expected errors > 0")
-	assert.False(summary.HardErrors, "expected no hard errors")
+	assert.True(summary.HardErrors, "expected hard error for omitted message")
 
 	var (
 		status      string
 		errorsCount int
 	)
 	require.NoError(st.DB().QueryRow(`SELECT status, errors_count FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &errorsCount), "select sync")
-	require.Equal(store.SyncStatusCompleted, status)
+	require.Equal(store.SyncStatusFailed, status)
 	assert.NotZero(errorsCount, "errorsCount")
+
+	retry, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+		SourceType: "mbox", Identifier: "me@example.com", MaxMessageBytes: 1024,
+	})
+	require.NoError(err)
+	assert.False(retry.HardErrors)
+	assert.Equal(int64(2), retry.MessagesAdded)
 }
 
 func TestImportMbox_CheckpointDoesNotAdvancePastFailedIngest(t *testing.T) {
@@ -853,104 +859,20 @@ func TestImportMbox_HardErrorsStopsMultiFileLoop(t *testing.T) {
 	_ = path2 // would be processed if loop didn't break
 }
 
-type cancelOnLogMessageHandler struct {
-	msg    string
-	cancel func()
-	next   slog.Handler
-}
-
-func (h *cancelOnLogMessageHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.next.Enabled(ctx, level)
-}
-
-func (h *cancelOnLogMessageHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Message == h.msg {
-		h.cancel()
-	}
-	if err := h.next.Handle(ctx, r); err != nil {
-		return fmt.Errorf("delegate slog handler: %w", err)
-	}
-	return nil
-}
-
-func (h *cancelOnLogMessageHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &cancelOnLogMessageHandler{
-		msg:    h.msg,
-		cancel: h.cancel,
-		next:   h.next.WithAttrs(attrs),
-	}
-}
-
-func (h *cancelOnLogMessageHandler) WithGroup(name string) slog.Handler {
-	return &cancelOnLogMessageHandler{
-		msg:    h.msg,
-		cancel: h.cancel,
-		next:   h.next.WithGroup(name),
-	}
-}
-
-func TestImportMbox_CheckpointAdvancesPastReaderErrors(t *testing.T) {
-	require := require.New(t)
-	tmp := t.TempDir()
-
-	dbPath := filepath.Join(tmp, "msgvault.db")
-	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
-
-	maxBytes := int64(64)
-
-	mboxData := strings.Join([]string{
-		"From sender@example.com Mon Jan 1 00:00:00 2024",
-		"Subject: " + strings.Repeat("a", 200),
-		"",
-		"Body1",
-		"",
-		"From sender@example.com Mon Jan 1 00:00:01 2024",
-		"Subject: Two",
-		"",
-		"Body2",
-		"",
-	}, "\n")
-	mboxPath := filepath.Join(tmp, "export.mbox")
-	require.NoError(os.WriteFile(mboxPath, []byte(mboxData), 0600), "write mbox")
-
-	// Expected resume point is the next message separator after the read error.
-	f, err := os.Open(mboxPath)
-	require.NoError(err, "open mbox")
-	r := mbox.NewReaderWithMaxMessageBytes(f, maxBytes)
-	_, _ = r.Next() // first message is expected to exceed max size
-	wantOffset := r.NextFromOffset()
-	_ = f.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	log := slog.New(&cancelOnLogMessageHandler{
-		msg:    "mbox read error",
-		cancel: cancel,
-		// slog.DiscardHandler.Enabled() always returns false, which would
-		// stop the wrapping handler's Handle (and thus cancel) from ever
-		// firing. A real handler keeps Enabled() true so the cancel triggers.
-		next: slog.NewTextHandler(io.Discard, nil), //nolint:sloglint // need an Enabled() handler so the cancel fires
+func TestImportMbox_CheckpointDoesNotAdvancePastReaderErrors(t *testing.T) {
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(t.TempDir(), "msgvault.db"))
+	mboxData := "From sender@example.com Mon Jan 1 00:00:00 2024\nSubject: " + strings.Repeat("a", 200) + "\n\nBody\n"
+	mboxPath := filepath.Join(t.TempDir(), "export.mbox")
+	require.NoError(t, os.WriteFile(mboxPath, []byte(mboxData), 0600))
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
+		SourceType: "mbox", Identifier: "me@example.com", NoResume: true, CheckpointInterval: 1, MaxMessageBytes: 64,
 	})
-
-	_, err = ImportMbox(ctx, st, mboxPath, MboxImportOptions{
-		SourceType:         "mbox",
-		Identifier:         "me@example.com",
-		NoResume:           true,
-		CheckpointInterval: 1,
-		MaxMessageBytes:    maxBytes,
-		Logger:             log,
-	})
-	require.NoError(err, "ImportMbox")
-
-	var (
-		status string
-		cursor string
-	)
-	require.NoError(st.DB().QueryRow(`SELECT status, cursor_before FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &cursor), "select sync")
-	require.Equal(store.SyncStatusRunning, status)
-
+	require.NoError(t, err)
+	require.True(t, summary.HardErrors)
+	var status, cursor string
+	require.NoError(t, st.DB().QueryRow(`SELECT status, cursor_before FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&status, &cursor))
+	assert.Equal(t, store.SyncStatusFailed, status)
 	var cp mboxCheckpoint
-	require.NoError(json.Unmarshal([]byte(cursor), &cp), "unmarshal checkpoint")
-	require.Equal(wantOffset, cp.Offset, "checkpoint offset")
+	require.NoError(t, json.Unmarshal([]byte(cursor), &cp))
+	assert.Zero(t, cp.Offset)
 }
