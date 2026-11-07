@@ -201,7 +201,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 		// For direct chats: add the remote participant. Skip non-phone JIDs
 		// (e.g. lid:..., broadcast) — normalizePhone returns "" for those.
 		if !isGroupChat(chat) && chat.User != "" {
-			if phone := normalizePhone(chat.User, chat.Server); phone != "" {
+			phone := normalizePhone(chat.User, chat.Server)
+			if chat.Server == "lid" {
+				phone = resolveLidSender(sql.NullInt64{Int64: chat.JIDRowID, Valid: true}, chat.Server, lidMap)
+			}
+			if phone != "" {
 				if participantID, err := imp.store.EnsureParticipantByPhone(phone, "", "whatsapp"); err != nil {
 					reportError("participant", fmt.Errorf("ensure participant %s: %w", phone, err))
 				} else {
@@ -386,10 +390,15 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						} else {
 							senderID = sql.NullInt64{Int64: pid, Valid: true}
 						}
+					} else {
+						reportError("sender_unresolved", errors.New("message sender identity is not a recognized phone JID"))
 					}
 				} else if !isGroupChat(chat) && waMsg.FromMe == 0 {
 					// In a direct chat, the other person is the sender.
 					phone := normalizePhone(chat.User, chat.Server)
+					if chat.Server == "lid" {
+						phone = resolveLidSender(sql.NullInt64{Int64: chat.JIDRowID, Valid: true}, chat.Server, lidMap)
+					}
 					if phone != "" {
 						pid, err := imp.store.EnsureParticipantByPhone(phone, "", "whatsapp")
 						if err == nil {
@@ -397,6 +406,8 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						} else {
 							reportError("participant", fmt.Errorf("ensure direct sender: %w", err))
 						}
+					} else {
+						reportError("sender_unresolved", errors.New("direct message sender cannot be resolved"))
 					}
 				}
 
@@ -572,6 +583,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 							// Lid JID — resolve via jid_map first.
 							phone := resolveLidSender(r.SenderJIDRowID, r.SenderServer.String, lidMap)
 							if phone == "" {
+								reportError("reaction_unresolved", errors.New("reaction sender LID cannot be resolved"))
 								continue
 							}
 							pid, err := imp.store.EnsureParticipantByPhone(phone, "", "whatsapp")
@@ -583,7 +595,8 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						} else if r.SenderUser.Valid && r.SenderUser.String != "" {
 							phone := normalizePhone(r.SenderUser.String, r.SenderServer.String)
 							if phone == "" {
-								continue // Non-phone JID — skip reaction.
+								reportError("reaction_unresolved", errors.New("reaction sender is not a recognized phone JID"))
+								continue
 							}
 							pid, err := imp.store.EnsureParticipantByPhone(phone, "", "whatsapp")
 							if err != nil {

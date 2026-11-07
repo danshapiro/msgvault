@@ -400,3 +400,39 @@ func TestRosterCoverageDoesNotClaimHistoricalMembershipIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "admin", role, "historical role is retained pending source-aware reconciliation")
 }
+
+func TestUnknownSenderJIDIsNotInventedAsPhone(t *testing.T) {
+	backup := testBackup(t, modernRoster+`
+	INSERT INTO jid VALUES (6, '123456789', 'unknown', '123456789@unknown');
+	INSERT INTO message VALUES (3, 10, 0, 'unknown-sender', 6, 1700000002000, 0, 'text', 0, 0);`)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, result.ErrorCounts["sender_unresolved"])
+	var sender sql.NullInt64
+	require.NoError(t, st.DB().QueryRow(`SELECT sender_id FROM messages WHERE source_message_id='unknown-sender'`).Scan(&sender))
+	assert.False(t, sender.Valid)
+	if st.FTS5Available() && !st.IsPostgreSQL() {
+		var indexedFrom string
+		require.NoError(t, st.DB().QueryRow(`SELECT f.from_addr FROM messages_fts f JOIN messages m ON m.id=f.message_id WHERE m.source_message_id='unknown-sender'`).Scan(&indexedFrom))
+		assert.Empty(t, indexedFrom)
+	}
+}
+
+func TestDirectLIDChatResolvesSenderThroughJIDMap(t *testing.T) {
+	backup := testBackup(t, modernRoster+`
+	INSERT INTO chat VALUES (20, 2, 0, NULL, 1700000002000, 0);
+	INSERT INTO message VALUES (3, 20, 0, 'direct-lid-message', NULL, 1700000002000, 0, 'direct', 0, 0);`)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.Zero(t, result.Errors)
+	var phone string
+	err = st.DB().QueryRow(`SELECT p.phone_number FROM messages m JOIN participants p ON p.id=m.sender_id WHERE m.source_message_id='direct-lid-message'`).Scan(&phone)
+	require.NoError(t, err)
+	assert.Equal(t, "+15550001111", phone)
+}

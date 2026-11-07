@@ -136,7 +136,7 @@ func isSkippedType(waMessageType int) bool {
 // Output: "+447700900000"
 // Returns empty string for non-phone JIDs (e.g., lid:..., status@broadcast).
 func normalizePhone(user, server string) string {
-	if user == "" {
+	if user == "" || (server != "s.whatsapp.net" && server != "c.us") {
 		return ""
 	}
 
