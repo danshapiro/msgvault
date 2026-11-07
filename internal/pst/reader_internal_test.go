@@ -1,6 +1,11 @@
 package pst
 
 import (
+	"bytes"
+	"encoding/binary"
+	"io"
+	"mime/quotedprintable"
+	"net/mail"
 	"path/filepath"
 	"testing"
 
@@ -89,4 +94,160 @@ func TestExtractMessage_ThreadingProperties(t *testing.T) {
 	assert.Equal(id, entry.MessageID)
 	assert.Equal(parent, entry.InReplyTo)
 	assert.Equal(refs, entry.References)
+}
+
+func TestExtractMessage_BinaryHTML(t *testing.T) {
+	codepage := make([]byte, 4)
+	binary.LittleEndian.PutUint32(codepage, 1252)
+	msg := &pstlib.Message{
+		Identifier: 123,
+		Properties: &properties.Message{},
+		PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+			{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("<p>caf\xe9</p>\x00")},
+			{ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: codepage},
+		}},
+	}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "<p>café</p>", entry.BodyHTML)
+
+	raw, err := BuildRFC5322(entry, nil)
+	require.NoError(t, err)
+	email, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Contains(t, email.Header.Get("Content-Type"), "text/html")
+	body, err := io.ReadAll(quotedprintable.NewReader(email.Body))
+	require.NoError(t, err)
+	assert.Equal(t, "<p>café</p>\r\n", string(body))
+}
+
+func TestExtractMessage_RTFOnlyIsReported(t *testing.T) {
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x1009, Type: pstlib.PropertyTypeBinary, Data: []byte("rtf")},
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	assert.ErrorContains(t, entry.BodyError, "RTF-only")
+	text := "normal body"
+	msg.Properties = &properties.Message{Body: &text}
+	assert.NoError(t, ExtractMessage(msg, "Inbox").BodyError)
+}
+
+func TestExtractMessage_BinaryHTMLErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		props []pstlib.Property
+	}{
+		{"wrong property type", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeInteger32, Data: []byte{1, 2, 3, 4}}}},
+		{"missing property data", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary}}},
+		{"invalid codepage property", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("hello")}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{1}}}},
+		{"unknown codepage", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("hello")}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{0x39, 0x30, 0, 0}}}},
+		{"invalid utf8", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte{0xff}}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xe9, 0xfd, 0, 0}}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: tc.props}}
+			entry := ExtractMessage(msg, "Inbox")
+			require.NotNil(t, entry)
+			assert.Error(t, entry.BodyError)
+		})
+	}
+}
+
+func TestExtractMessage_BinaryHTMLMetaCharset(t *testing.T) {
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("<meta charset=utf-8><p>日本語</p>")},
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "<meta charset=utf-8><p>日本語</p>", entry.BodyHTML)
+}
+
+func TestExtractMessage_DeclaredHTMLCharsetOverridesCodepage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		html []byte
+		want string
+	}{
+		{"meta", []byte("<meta charset=utf-8><p>café</p>"), "<meta charset=utf-8><p>café</p>"},
+		{"http-equiv", []byte(`<meta http-equiv="content-type" content="text/html; charset=utf-8"><p>café</p>`), `<meta http-equiv="content-type" content="text/html; charset=utf-8"><p>café</p>`},
+		{"bom", append([]byte{0xef, 0xbb, 0xbf}, []byte("<p>café</p>")...), "<p>café</p>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+				{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: tc.html},
+				{ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xe4, 0x04, 0, 0}}, // 1252
+			}}}
+			entry := ExtractMessage(msg, "Inbox")
+			require.NoError(t, entry.BodyError)
+			assert.Equal(t, tc.want, entry.BodyHTML)
+		})
+	}
+}
+
+func TestExtractMessage_String8Body(t *testing.T) {
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x1000, Type: pstlib.PropertyTypeString8, Data: []byte("caf\xe9\x00")},
+		{ID: 0x3ffd, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xe4, 0x04, 0, 0}}, // 1252
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "café", entry.BodyText)
+
+	// A missing codepage uses the documented Windows-1252 fallback.
+	msg.PropertyContext.Properties = msg.PropertyContext.Properties[:1]
+	entry = ExtractMessage(msg, "Inbox")
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "café", entry.BodyText)
+
+	// An explicitly unsupported codepage must not silently yield an empty body.
+	msg.PropertyContext.Properties = append(msg.PropertyContext.Properties, pstlib.Property{
+		ID: 0x3ffd, Type: pstlib.PropertyTypeInteger32, Data: []byte{0x39, 0x30, 0, 0},
+	})
+	entry = ExtractMessage(msg, "Inbox")
+	assert.ErrorContains(t, entry.BodyError, "unsupported body codepage")
+}
+
+func TestExtractMessage_BinaryHTMLUTF16(t *testing.T) {
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte{'<', 0, 'p', 0, '>', 0, 0xe9, 0, '<', 0, '/', 0, 'p', 0, '>', 0, 0, 0}},
+		{ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xb0, 0x04, 0, 0}},
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "<p>é</p>", entry.BodyHTML)
+}
+
+func TestExtractMessage_RealBinaryHTML(t *testing.T) {
+	f, err := Open(filepath.Join("testdata", "support.pst"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, f.Close()) })
+	found := 0
+	require.NoError(t, f.WalkFolders(func(folder FolderEntry, rawFolder *pstlib.Folder) error {
+		iter, err := rawFolder.GetMessageIterator()
+		if err != nil {
+			return nil //nolint:nilerr // empty folder
+		}
+		for iter.Next() {
+			msg := iter.Value()
+			prop, err := msg.PropertyContext.GetPropertyByID(0x1013)
+			if err != nil || prop.Type != pstlib.PropertyTypeBinary {
+				continue
+			}
+			entry := ExtractMessage(msg, folder.Path)
+			if entry == nil {
+				continue
+			}
+			require.NoError(t, entry.BodyError)
+			assert.NotEmpty(t, entry.BodyHTML)
+			found++
+		}
+		return iter.Err()
+	}))
+	if found == 0 {
+		t.Skip("fixture does not contain a binary HTML body")
+	}
 }

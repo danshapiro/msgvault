@@ -529,12 +529,12 @@ func importPstWithBatchSize(
 				// Not an email (calendar, contact, task, etc.) — skip silently.
 				continue
 			}
-			if entry.DateError != nil {
+			if propertyErr := errors.Join(entry.DateError, entry.BodyError); propertyErr != nil {
 				cp.ErrorsCount++
 				summary.Errors++
 				checkpointBlocked = true
 				hardErrors = true
-				log.Warn("read PST message date failed", "entry_id", entry.EntryID, "error", entry.DateError)
+				log.Warn("read PST message properties failed", "entry_id", entry.EntryID, "error", propertyErr)
 				continue
 			}
 

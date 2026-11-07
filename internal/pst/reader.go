@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	charsets "github.com/emersion/go-message/charset"
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
 	"github.com/mooijtech/go-pst/v6/pkg/properties"
 	"github.com/rotisserie/eris"
+	"golang.org/x/net/html"
+	htmlcharset "golang.org/x/net/html/charset"
 	"golang.org/x/text/encoding"
 )
 
@@ -69,6 +73,215 @@ func messageDate(msg *pstlib.Message, id uint16, decoded *int64) (time.Time, err
 	return time.Unix(int64(ft/10_000_000)-epochDiff, int64(ft%10_000_000)*100).UTC(), nil
 }
 
+const maxPSTBodyBytes = 128 << 20
+
+// bodyPropertyBytes reads a variable-length property with a bounded allocation.
+func bodyPropertyBytes(msg *pstlib.Message, prop pstlib.Property) ([]byte, error) {
+	data := prop.Data
+	if len(data) != 0 {
+		if len(data) > maxPSTBodyBytes {
+			return nil, fmt.Errorf("body property %#x exceeds %d bytes", prop.ID, maxPSTBodyBytes)
+		}
+		return data, nil
+	}
+	r, err := msg.PropertyContext.GetPropertyReader(prop.ID, msg.LocalDescriptors)
+	if err != nil {
+		return nil, fmt.Errorf("open body property %#x: %w", prop.ID, err)
+	}
+	if r.HeapOnNodeReader == nil || r.Size() < 0 || r.Size() > maxPSTBodyBytes {
+		return nil, fmt.Errorf("body property %#x has invalid or oversized data", prop.ID)
+	}
+	data = make([]byte, int(r.Size()))
+	if len(data) > 0 {
+		if n, err := r.ReadAt(data, 0); err != nil || n != len(data) {
+			return nil, fmt.Errorf("read body property %#x: read %d bytes: %v", prop.ID, n, err)
+		}
+	}
+	return data, nil
+}
+
+// messageCodepage returns the first present supported MAPI codepage.
+func messageCodepage(msg *pstlib.Message, ids ...uint16) (string, error) {
+	for _, id := range ids {
+		cp, err := msg.PropertyContext.GetPropertyByID(id)
+		if errors.Is(err, pstlib.ErrPropertyNotFound) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("find body codepage: %w", err)
+		}
+		if cp.Type != pstlib.PropertyTypeInteger32 || len(cp.Data) != 4 {
+			return "", fmt.Errorf("body codepage property %#x is invalid", id)
+		}
+		value := binary.LittleEndian.Uint32(cp.Data)
+		if value == 0 {
+			continue
+		}
+		name := pstlib.CodePageIdentifierToEncoding[int(value)]
+		switch value {
+		case 1200:
+			name = "utf-16le"
+		case 1201:
+			name = "utf-16be"
+		case 932:
+			name = "shift_jis"
+		}
+		if enc, _ := htmlcharset.Lookup(name); enc == nil {
+			return "", fmt.Errorf("unsupported body codepage %d", value)
+		}
+		return name, nil
+	}
+	return "", nil
+}
+
+// hasHTMLDeclaredCharset recognizes a BOM or a meta charset in the part of
+// the document inspected by the HTML charset sniffer.
+func hasHTMLDeclaredCharset(data []byte) bool {
+	for _, bom := range [][]byte{{0xef, 0xbb, 0xbf}, {0xff, 0xfe}, {0xfe, 0xff}} {
+		if bytes.HasPrefix(data, bom) {
+			return true
+		}
+	}
+	tokenizer := html.NewTokenizer(bytes.NewReader(data[:min(len(data), 1024)]))
+	for {
+		typeOfToken := tokenizer.Next()
+		if typeOfToken == html.ErrorToken {
+			return false
+		}
+		if typeOfToken != html.StartTagToken && typeOfToken != html.SelfClosingTagToken {
+			continue
+		}
+		tag := tokenizer.Token()
+		if tag.Data != "meta" {
+			continue
+		}
+		var content, httpEquiv string
+		for _, attr := range tag.Attr {
+			switch attr.Key {
+			case "charset":
+				if enc, _ := htmlcharset.Lookup(attr.Val); enc != nil {
+					return true
+				}
+			case "http-equiv":
+				httpEquiv = attr.Val
+			case "content":
+				content = attr.Val
+			}
+		}
+		if strings.EqualFold(httpEquiv, "content-type") {
+			_, params, err := mime.ParseMediaType(content)
+			if err == nil {
+				if enc, _ := htmlcharset.Lookup(params["charset"]); enc != nil {
+					return true
+				}
+			}
+		}
+	}
+}
+
+// messageHTML retrieves PidTagHtml, which is normally a binary property and is
+// therefore not populated by go-pst's generated Message properties. HTML can
+// declare a charset itself or use the message's Internet code page.
+func messageHTML(msg *pstlib.Message, decoded string) (string, error) {
+	if decoded != "" || msg.PropertyContext == nil {
+		return decoded, nil
+	}
+	prop, err := msg.PropertyContext.GetPropertyByID(0x1013)
+	if errors.Is(err, pstlib.ErrPropertyNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("find HTML body: %w", err)
+	}
+	if prop.Type == pstlib.PropertyTypeString {
+		// The generated Unicode property is already populated, including an
+		// intentionally empty string.
+		return decoded, nil
+	}
+	if prop.Type != pstlib.PropertyTypeBinary && prop.Type != pstlib.PropertyTypeString8 {
+		return "", fmt.Errorf("HTML body has unexpected property type %v", prop.Type)
+	}
+
+	data, err := bodyPropertyBytes(msg, prop)
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", nil
+	}
+
+	contentType := "text/html"
+	if !hasHTMLDeclaredCharset(data) {
+		name, err := messageCodepage(msg, 0x3fde, 0x3ffd) // Internet, then message codepage
+		if err != nil {
+			return "", err
+		}
+		if name != "" {
+			contentType += "; charset=" + name
+		}
+	}
+	r, err := htmlcharset.NewReader(bytes.NewReader(data), contentType)
+	if err != nil {
+		return "", fmt.Errorf("decode HTML body: %w", err)
+	}
+	out, err := io.ReadAll(io.LimitReader(r, maxPSTBodyBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("decode HTML body: %w", err)
+	}
+	if len(out) > maxPSTBodyBytes {
+		return "", fmt.Errorf("decoded HTML body exceeds %d bytes", maxPSTBodyBytes)
+	}
+	if !utf8.Valid(out) || bytes.Contains(out, []byte("\ufffd")) && !bytes.Contains(data, []byte("\ufffd")) {
+		return "", errors.New("HTML body contains undecodable characters")
+	}
+	return strings.TrimPrefix(strings.TrimRight(string(out), "\x00"), "\ufeff"), nil
+}
+
+// messageText recovers String8 PidTagBody, which go-pst does not populate in
+// its Unicode-only generated Body field. If the archive lacks a codepage,
+// Windows-1252 is the fallback used for older Western Outlook data.
+func messageText(msg *pstlib.Message, decoded string) (string, error) {
+	if msg.PropertyContext == nil {
+		return decoded, nil
+	}
+	prop, err := msg.PropertyContext.GetPropertyByID(0x1000)
+	if errors.Is(err, pstlib.ErrPropertyNotFound) {
+		return decoded, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("find text body: %w", err)
+	}
+	if prop.Type == pstlib.PropertyTypeString {
+		return decoded, nil
+	}
+	if prop.Type != pstlib.PropertyTypeString8 {
+		return "", fmt.Errorf("text body has unexpected property type %v", prop.Type)
+	}
+	data, err := bodyPropertyBytes(msg, prop)
+	if err != nil {
+		return "", err
+	}
+	name, err := messageCodepage(msg, 0x3ffd, 0x3fde) // message, then Internet codepage
+	if err != nil {
+		return "", err
+	}
+	if name == "" {
+		name = "windows-1252"
+	}
+	enc, _ := htmlcharset.Lookup(name)
+	out, err := io.ReadAll(io.LimitReader(enc.NewDecoder().Reader(bytes.NewReader(data)), maxPSTBodyBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("decode text body: %w", err)
+	}
+	if len(out) > maxPSTBodyBytes {
+		return "", fmt.Errorf("decoded text body exceeds %d bytes", maxPSTBodyBytes)
+	}
+	if !utf8.Valid(out) || bytes.Contains(out, []byte("\ufffd")) && !bytes.Contains(data, []byte("\ufffd")) {
+		return "", errors.New("text body contains undecodable characters")
+	}
+	return strings.TrimRight(string(out), "\x00"), nil
+}
+
 // File wraps a PST file for reading.
 type File struct {
 	pstFile *pstlib.File
@@ -119,8 +332,9 @@ type MessageEntry struct {
 	TransportHeaders string
 
 	// Body content.
-	BodyText string
-	BodyHTML string
+	BodyText  string
+	BodyHTML  string
+	BodyError error // unreadable or unsupported body, if any
 
 	// Sender fields.
 	SenderName        string
@@ -248,13 +462,24 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 	sentAt, sentErr := messageDate(msg, 0x0039, props.ClientSubmitTime)
 	receivedAt, receivedErr := messageDate(msg, 0x0e06, props.MessageDeliveryTime)
 	createdAt, createdErr := messageDate(msg, 0x3007, props.CreationTime)
+	bodyHTML, htmlErr := messageHTML(msg, props.GetBodyHtml())
+	bodyText, textErr := messageText(msg, props.GetBody())
+	bodyErr := errors.Join(htmlErr, textErr)
+	if bodyErr == nil && bodyText == "" && bodyHTML == "" && msg.PropertyContext != nil {
+		if _, err := msg.PropertyContext.GetPropertyByID(0x1009); err == nil {
+			bodyErr = errors.New("RTF-only body requires conversion")
+		} else if !errors.Is(err, pstlib.ErrPropertyNotFound) {
+			bodyErr = fmt.Errorf("find RTF body: %w", err)
+		}
+	}
 	return &MessageEntry{
 		EntryID:           fmt.Sprintf("%d", msg.Identifier),
 		FolderPath:        folderPath,
 		Subject:           subject,
 		TransportHeaders:  props.GetTransportMessageHeaders(),
-		BodyText:          props.GetBody(),
-		BodyHTML:          props.GetBodyHtml(),
+		BodyText:          bodyText,
+		BodyHTML:          bodyHTML,
+		BodyError:         bodyErr,
 		SenderName:        props.GetSenderName(),
 		SenderEmail:       senderEmail,
 		SenderAddressType: props.GetSenderAddressType(),
