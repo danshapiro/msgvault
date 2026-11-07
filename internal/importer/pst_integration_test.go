@@ -454,19 +454,14 @@ func TestImportPst_ContextCancellationResumesWithoutSkippingMessages(t *testing.
 	}
 }
 
-// TestImportPst_32BitPST verifies that a 32-bit format PST is handled
-// gracefully. go-pst may fail to read sub-folder metadata in 32-bit files;
-// the importer skips those branches and completes without error.
+// A folder traversal failure must not be reported as a successful import.
 func TestImportPst_32BitPST(t *testing.T) {
 	st := openIntegrationStore(t)
 	pstPath := filepath.Join(pstTestdataDir, "32-bit.pst")
 
-	summary, err := ImportPst(context.Background(), st, pstPath, PstImportOptions{
+	_, err := ImportPst(context.Background(), st, pstPath, PstImportOptions{
 		Identifier: "user@example.com",
 		NoResume:   true,
 	})
-	require.NoError(t, err, "ImportPst")
-	// 32-bit.pst has no readable email messages.
-	assert.Equal(t, int64(0), summary.MessagesProcessed, "MessagesProcessed")
-	assert.False(t, summary.HardErrors, "HardErrors")
+	require.ErrorContains(t, err, "read subfolders")
 }

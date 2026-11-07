@@ -172,7 +172,7 @@ type WalkFolderFunc func(entry FolderEntry, folder *pstlib.Folder) error
 
 // WalkFolders walks all folders in the PST file recursively, building
 // slash-separated folder paths. Search folders are skipped automatically.
-// Returns the first non-nil error returned by fn.
+// Returns an error if a folder cannot be read or fn returns an error.
 func (f *File) WalkFolders(fn WalkFolderFunc) error {
 	rootFolder, err := f.pstFile.GetRootFolder()
 	if err != nil {
@@ -209,9 +209,7 @@ func walkFoldersRecursive(folder *pstlib.Folder, parentPath string, fn WalkFolde
 
 	subFolders, err := folder.GetSubFolders()
 	if err != nil {
-		// Some PST variants (e.g. 32-bit) can fail to read sub-folder
-		// metadata; log and continue rather than aborting the walk.
-		return nil //nolint:nilerr // intentional: keep walking sibling folders
+		return fmt.Errorf("read subfolders of %q: %w", path, err)
 	}
 	for i := range subFolders {
 		if err := walkFoldersRecursive(&subFolders[i], path, fn); err != nil {
