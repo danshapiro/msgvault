@@ -335,6 +335,10 @@ func groupRosterSchema(db *sql.DB) string {
 // fetchGroupParticipants reads recognized legacy or current WhatsApp rosters.
 // Modern backups refer to JIDs by row id and frequently use LIDs; resolve
 // those only through jid_map, never by interpreting an LID as a phone number.
+// The modern rank mapping (1=admin, 2=superadmin) and pending=1 as an
+// unaccepted membership are corroborated by the independent WAInsight importer:
+// https://github.com/akhil-dara/WAInsight/blob/main/backend/app/ingestion/chat_ingester.py
+// They are not based on an official WhatsApp schema specification.
 func fetchGroupParticipants(db *sql.DB, groupJIDRawString string) ([]waGroupMember, error) {
 	var query string
 	switch groupRosterSchema(db) {
