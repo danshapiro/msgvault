@@ -22,6 +22,7 @@ var (
 	importMboxNoResume           bool
 	importMboxCheckpointInterval int
 	importMboxNoAttachments      bool
+	importMboxMaxMessageBytes    int64
 	noDefaultIdentityImportMbox  bool
 )
 
@@ -60,6 +61,9 @@ Examples:
 `,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if importMboxMaxMessageBytes < 0 {
+			return errors.New("--max-message-bytes cannot be negative")
+		}
 		state := invocationFromCommand(cmd)
 		if state == nil || state.cfg == nil {
 			return errors.New("configuration is unavailable")
@@ -273,6 +277,7 @@ Examples:
 				Labels:             importMboxLabels,
 				NoResume:           importMboxNoResume,
 				CheckpointInterval: importMboxCheckpointInterval,
+				MaxMessageBytes:    importMboxMaxMessageBytes,
 				AttachmentsDir:     attachmentsDir,
 				RemoteImages:       configuredRemoteImageFetcher(cfg),
 				Logger:             logger,
@@ -388,5 +393,6 @@ func init() {
 	importMboxCmd.Flags().BoolVar(&importMboxNoResume, "no-resume", false, "Do not resume from an interrupted import")
 	importMboxCmd.Flags().IntVar(&importMboxCheckpointInterval, "checkpoint-interval", 200, "Save progress every N messages")
 	importMboxCmd.Flags().BoolVar(&importMboxNoAttachments, "no-attachments", false, "Do not store attachments (disk or database). Messages will still be marked as having attachments. Note: rerunning later without --no-attachments will not backfill attachments for already-imported messages.")
+	importMboxCmd.Flags().Int64Var(&importMboxMaxMessageBytes, "max-message-bytes", 0, "Maximum message size in bytes (0 uses 128 MiB default; individual lines are limited to 32 MiB)")
 	importMboxCmd.Flags().BoolVar(&noDefaultIdentityImportMbox, "no-default-identity", false, noDefaultIdentityHelp)
 }

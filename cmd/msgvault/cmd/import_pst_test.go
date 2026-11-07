@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -21,12 +22,73 @@ func saveImportPstState(t *testing.T) func() {
 	prevNoResume := importPstNoResume
 	prevCheckpointInterval := importPstCheckpointInterval
 	prevNoAttachments := importPstNoAttachments
+	prevMaxMessageBytes := importPstMaxMessageBytes
 	return func() {
 		importPstSourceType = prevSourceType
 		importPstSkipFolders = prevSkipFolders
 		importPstNoResume = prevNoResume
 		importPstCheckpointInterval = prevCheckpointInterval
 		importPstNoAttachments = prevNoAttachments
+		importPstMaxMessageBytes = prevMaxMessageBytes
+	}
+}
+
+func TestImportPstCmdHonorsMessageLimit(t *testing.T) {
+	markDaemonCLISubprocessForTest(t)
+	t.Cleanup(saveImportPstState(t))
+	cfg := lifecycleTestConfig(t.TempDir())
+	ctx := withStoreResolverConfig(t, cfg)
+	path, err := filepath.Abs("../../../internal/pst/testdata/support.pst")
+	require.NoError(t, err)
+	importPstSourceType = "pst"
+	importPstNoResume = true
+	importPstMaxMessageBytes = 1
+	cmd := &cobra.Command{Use: "import-pst"}
+	cmd.SetContext(ctx)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	assert.ErrorContains(t, importPstCmd.RunE(cmd, []string{"owner@example.test", path}), "import completed with")
+}
+
+func TestImportMboxCmdHonorsMessageLimit(t *testing.T) {
+	markDaemonCLISubprocessForTest(t)
+	previousLimit := importMboxMaxMessageBytes
+	previousType := importMboxSourceType
+	previousResume := importMboxNoResume
+	t.Cleanup(func() {
+		importMboxMaxMessageBytes = previousLimit
+		importMboxSourceType = previousType
+		importMboxNoResume = previousResume
+	})
+	dir := t.TempDir()
+	ctx := withStoreResolverConfig(t, lifecycleTestConfig(dir))
+	path := filepath.Join(dir, "messages.mbox")
+	require.NoError(t, os.WriteFile(path, []byte("From alice@example.com Mon Jan 1 00:00:00 2024\nSubject: hello\n\nbody\n"), 0600))
+	importMboxSourceType = "mbox"
+	importMboxNoResume = true
+	importMboxMaxMessageBytes = 1
+	cmd := &cobra.Command{Use: "import-mbox"}
+	cmd.SetContext(ctx)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	assert.ErrorContains(t, importMboxCmd.RunE(cmd, []string{"owner@example.test", path}), "import completed with")
+}
+
+func TestImportMessageLimitIsForwardedToDaemon(t *testing.T) {
+	for _, cmd := range []*cobra.Command{importPstCmd, importMboxCmd} {
+		t.Run(cmd.Name(), func(t *testing.T) {
+			flag := cmd.Flags().Lookup("max-message-bytes")
+			require.NotNil(t, flag)
+			oldValue, oldChanged := flag.Value.String(), flag.Changed
+			t.Cleanup(func() {
+				assert.NoError(t, flag.Value.Set(oldValue))
+				flag.Changed = oldChanged
+			})
+			require.NoError(t, cmd.Flags().Set("max-message-bytes", "4096"))
+			args, err := daemonCLIArgsFromCobra(cmd, []string{"owner@example.test", "archive"})
+			require.NoError(t, err)
+			assert.Contains(t, args, "--max-message-bytes=4096")
+		})
 	}
 }
 

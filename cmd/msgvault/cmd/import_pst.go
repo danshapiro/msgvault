@@ -20,6 +20,7 @@ var (
 	importPstNoResume           bool
 	importPstCheckpointInterval int
 	importPstNoAttachments      bool
+	importPstMaxMessageBytes    int64
 )
 
 var importPstCmd = &cobra.Command{
@@ -42,6 +43,9 @@ Examples:
 `,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if importPstMaxMessageBytes < 0 {
+			return errors.New("--max-message-bytes cannot be negative")
+		}
 		state := invocationFromCommand(cmd)
 		if state == nil || state.cfg == nil {
 			return errors.New("configuration is unavailable")
@@ -120,6 +124,7 @@ Examples:
 			SkipFolders:        importPstSkipFolders,
 			NoResume:           importPstNoResume,
 			CheckpointInterval: importPstCheckpointInterval,
+			MaxMessageBytes:    importPstMaxMessageBytes,
 			AttachmentsDir:     attachmentsDir,
 			RemoteImages:       configuredRemoteImageFetcher(cfg),
 			Logger:             logger,
@@ -171,6 +176,7 @@ func init() {
 	importPstCmd.Flags().BoolVar(&importPstNoResume, "no-resume", false, "Do not resume from an interrupted import")
 	importPstCmd.Flags().IntVar(&importPstCheckpointInterval, "checkpoint-interval", 200, "Save progress every N messages")
 	importPstCmd.Flags().BoolVar(&importPstNoAttachments, "no-attachments", false, "Do not store attachments to disk (messages are still imported)")
+	importPstCmd.Flags().Int64Var(&importPstMaxMessageBytes, "max-message-bytes", 0, "Maximum attachment total and serialized message size in bytes (0 uses 128 MiB default)")
 }
 
 func runPstPostImportMigrations(
