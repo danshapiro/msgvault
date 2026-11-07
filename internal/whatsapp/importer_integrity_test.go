@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -248,4 +249,18 @@ func TestImportRejectsMissingCriticalColumnBeforeWriting(t *testing.T) {
 	var sources int
 	require.NoError(t, st.DB().QueryRow(`SELECT COUNT(*) FROM sources`).Scan(&sources))
 	assert.Zero(t, sources)
+}
+
+func TestModernRosterSuperAdminIsRecordedAsAdmin(t *testing.T) {
+	roster := strings.Replace(modernRoster, "(1, 1, 2, 1, 0)", "(1, 1, 2, 2, 0)", 1)
+	backup := testBackup(t, roster)
+	st := testutil.NewTestStore(t)
+	opts := DefaultOptions()
+	opts.Phone = "+15550002222"
+	result, err := NewImporter(st, nil).Import(context.Background(), backup, opts)
+	require.NoError(t, err)
+	assert.Zero(t, result.Errors)
+	var role string
+	require.NoError(t, st.DB().QueryRow(`SELECT cp.role FROM conversation_participants cp JOIN participant_identifiers pi ON pi.participant_id=cp.participant_id WHERE pi.identifier_value=?`, "+15550001111").Scan(&role))
+	assert.Equal(t, "admin", role)
 }
