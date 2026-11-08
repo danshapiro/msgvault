@@ -140,7 +140,9 @@ func TestExtractMessage_UTF7Body(t *testing.T) {
 
 	msg.PropertyContext.Properties[0].Data = []byte("<p>bad +?</p>")
 	entry = ExtractMessage(msg, "Inbox")
-	assert.Error(t, entry.BodyError)
+	require.NoError(t, entry.BodyError)
+	require.NotNil(t, entry.RawHTMLAttachment)
+	assert.Equal(t, []byte("<p>bad +?</p>"), entry.RawHTMLAttachment.Content)
 }
 
 func TestExtractMessage_RTFOnlyIsReported(t *testing.T) {
@@ -163,8 +165,7 @@ func TestExtractMessage_BinaryHTMLErrors(t *testing.T) {
 		{"wrong property type", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeInteger32, Data: []byte{1, 2, 3, 4}}}},
 		{"missing property data", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary}}},
 		{"invalid codepage property", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("hello")}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{1}}}},
-		{"unknown codepage", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("hello")}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{0x39, 0x30, 0, 0}}}},
-		{"invalid utf8", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte{0xff}}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xe9, 0xfd, 0, 0}}}},
+		{"invalid codepage with declared charset", []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("<meta charset=utf-8>hello")}, {ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: []byte{1}}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -172,6 +173,42 @@ func TestExtractMessage_BinaryHTMLErrors(t *testing.T) {
 			entry := ExtractMessage(msg, "Inbox")
 			require.NotNil(t, entry)
 			assert.Error(t, entry.BodyError)
+			assert.Nil(t, entry.RawHTMLAttachment)
+		})
+	}
+}
+
+func TestExtractMessage_BinaryHTMLDecodeRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		data     []byte
+		codepage []byte
+		want     string
+	}{
+		{"invalid UTF-8", []byte("<meta charset=utf-8><p>before \xff after</p>"), nil, "<meta charset=utf-8><p>before � after</p>"},
+		{"valid replacement and invalid UTF-8", []byte("<meta charset=utf-8><p>� before \xff after</p>\x00"), nil, "<meta charset=utf-8><p>� before � after</p>"},
+		{"unsupported codepage", []byte("<p>unknown \xff bytes</p>"), []byte{0x39, 0x30, 0, 0}, ""},
+		{"unknown declared charset", []byte("<meta charset=not-a-real-encoding><p>unknown \xff bytes</p>"), nil, ""},
+		{"unknown http equiv charset", []byte(`<meta http-equiv="content-type" content="text/html; charset=not-a-real-encoding"><p>test</p>`), nil, `<meta http-equiv="content-type" content="text/html; charset=not-a-real-encoding"><p>test</p>`},
+		{"empty http equiv charset", []byte(`<meta http-equiv="content-type" content='text/html; charset=""'><p>test</p>`), nil, `<meta http-equiv="content-type" content='text/html; charset=""'><p>test</p>`},
+		{"UTF8 MAPI overrides legacy meta", []byte("<meta charset=windows-1252><p>café</p>"), []byte{0xe9, 0xfd, 0, 0}, "<meta charset=windows-1252><p>café</p>"},
+		{"conflicting charset invalid UTF8", []byte("<meta charset=utf-8><p>before \xff after</p>"), []byte{0xaf, 0x6f, 0, 0}, ""},
+		{"UTF8 codepage invalid UTF8", []byte("<p>before \xff after</p>"), []byte{0xe9, 0xfd, 0, 0}, "<p>before � after</p>"},
+		{"undeclared legacy bytes", []byte("<p>caf\xe9</p>"), nil, "<p>café</p>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			props := []pstlib.Property{{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: tc.data}}
+			if tc.codepage != nil {
+				props = append(props, pstlib.Property{ID: 0x3fde, Type: pstlib.PropertyTypeInteger32, Data: tc.codepage})
+			}
+			entry := ExtractMessage(&pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: props}}, "Inbox")
+			require.NotNil(t, entry)
+			require.NoError(t, entry.BodyError)
+			assert.Equal(t, tc.want, entry.BodyHTML)
+			require.NotNil(t, entry.RawHTMLAttachment)
+			assert.Equal(t, tc.data, entry.RawHTMLAttachment.Content)
+			assert.Equal(t, "original-pst-html.bin", entry.RawHTMLAttachment.Filename)
+			assert.Equal(t, "application/octet-stream", entry.RawHTMLAttachment.MIMEType)
 		})
 	}
 }

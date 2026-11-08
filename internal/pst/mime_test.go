@@ -392,6 +392,75 @@ func TestBuildRFC5322_WithAttachments(t *testing.T) {
 	assert.Contains(s, "application/pdf", "attachment content type not found")
 }
 
+func TestBuildRFC5322_PreservesOriginalHTMLBytes(t *testing.T) {
+	original := []byte{'<', 'p', '>', 'c', 'a', 'f', 0xff, 0, '<', '/', 'p', '>'}
+	entry := &MessageEntry{
+		SenderEmail: "sender@example.test",
+		BodyHTML:    "<p>caf�</p>",
+		RawHTMLAttachment: &AttachmentEntry{
+			Filename: "original-pst-html.bin",
+			MIMEType: "application/octet-stream",
+			Content:  original,
+		},
+	}
+	backing := make([]AttachmentEntry, 2)
+	attachments := backing[:1]
+	attachments[0] = AttachmentEntry{Filename: "file.txt", MIMEType: "text/plain", Content: []byte("ordinary file")}
+	raw, err := BuildRFC5322(entry, attachments)
+	require.NoError(t, err)
+	parsed, err := msgmime.Parse(raw)
+	require.NoError(t, err)
+	assert.Contains(t, parsed.BodyHTML, "caf�")
+	require.Len(t, parsed.Attachments, 2)
+	assert.Equal(t, "file.txt", parsed.Attachments[0].Filename)
+	assert.Equal(t, []byte("ordinary file"), parsed.Attachments[0].Content)
+	assert.Equal(t, "original-pst-html.bin", parsed.Attachments[1].Filename)
+	assert.Equal(t, "application/octet-stream", parsed.Attachments[1].ContentType)
+	assert.Equal(t, original, parsed.Attachments[1].Content)
+	assert.Empty(t, backing[1], "building MIME must not modify the caller's backing array")
+}
+
+func TestBuildRFC5322_NormalizesHTMLCharsetWithoutChangingContent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		meta        string
+		preserveRaw bool
+	}{
+		{"charset", `<MeTa id='keep' CHARSET='windows-1252'>`, true},
+		{"http equiv", `<meta http-equiv="Content-Type" content="text/html; charset=windows-1252" data-test="keep">`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := []byte(tc.meta + `<P data-Custom="Caps">日本語 café</P><script>const sample = '<meta charset="old">';</script>`)
+			entry := &MessageEntry{
+				SenderEmail: "sender@example.test", BodyHTML: string(original),
+			}
+			if tc.preserveRaw {
+				entry.RawHTMLAttachment = &AttachmentEntry{Filename: "original-pst-html.bin", MIMEType: "application/octet-stream", Content: original}
+			}
+			raw, err := BuildRFC5322(entry, nil)
+			require.NoError(t, err)
+			parsed, err := msgmime.Parse(raw)
+			require.NoError(t, err)
+			assert.Contains(t, parsed.BodyHTML, "日本語 café")
+			assert.Contains(t, parsed.BodyHTML, "utf-8")
+			assert.NotContains(t, parsed.BodyHTML, "windows-1252")
+			assert.Contains(t, parsed.BodyHTML, "keep")
+			assert.Contains(t, parsed.BodyHTML, `<P data-Custom="Caps">`)
+			assert.Contains(t, parsed.BodyHTML, `const sample = '<meta charset="old">';`)
+			if tc.preserveRaw {
+				require.Len(t, parsed.Attachments, 1)
+				assert.Equal(t, original, parsed.Attachments[0].Content)
+			} else {
+				assert.Empty(t, parsed.Attachments)
+			}
+		})
+	}
+	t.Run("no charset declaration", func(t *testing.T) {
+		body := "<HTML Data-Case='Value'>日本語 &amp; café\r\n<script>const s = '<meta charset=old>';</script></HTML>"
+		assert.Equal(t, body, normalizeHTMLCharset(body))
+	})
+}
+
 func TestBuildRFC5322_EmptyBody(t *testing.T) {
 	msg := &MessageEntry{
 		EntryID:     "1",

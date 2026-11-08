@@ -537,6 +537,9 @@ func importPstWithBatchSize(
 				log.Warn("read PST message properties failed", "entry_id", entry.EntryID, "error", propertyErr)
 				continue
 			}
+			if entry.RawHTMLAttachment != nil {
+				log.Warn("PST HTML decoding was uncertain; preserving original bytes in an attachment", "entry_id", entry.EntryID)
+			}
 			logUnresolvedPSTRecipients(log, entry)
 
 			attachments, err := pstreader.ReadAttachments(msg, opts.MaxMessageBytes)

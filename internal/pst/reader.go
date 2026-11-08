@@ -78,6 +78,8 @@ func messageDate(msg *pstlib.Message, id uint16, decoded *int64) (time.Time, err
 
 const maxPSTBodyBytes = 128 << 20
 
+var errUnsupportedBodyCodepage = errors.New("unsupported body codepage")
+
 // bodyPropertyBytes reads a variable-length property with a bounded allocation.
 func bodyPropertyBytes(msg *pstlib.Message, prop pstlib.Property) ([]byte, error) {
 	data := prop.Data
@@ -130,26 +132,31 @@ func messageCodepage(msg *pstlib.Message, ids ...uint16) (string, error) {
 			name = "shift_jis"
 		}
 		if enc, _ := htmlcharset.Lookup(name); enc == nil && value != 65000 {
-			return "", fmt.Errorf("unsupported body codepage %d", value)
+			return "", fmt.Errorf("%w %d", errUnsupportedBodyCodepage, value)
 		}
 		return name, nil
 	}
 	return "", nil
 }
 
-// hasHTMLDeclaredCharset recognizes a BOM or a meta charset in the part of
-// the document inspected by the HTML charset sniffer.
-func hasHTMLDeclaredCharset(data []byte) bool {
-	for _, bom := range [][]byte{{0xef, 0xbb, 0xbf}, {0xff, 0xfe}, {0xfe, 0xff}} {
-		if bytes.HasPrefix(data, bom) {
-			return true
+// htmlDeclaredCharset recognizes a BOM or a meta charset in the part of
+// the document inspected by the HTML charset sniffer. Unknown declarations
+// are distinct from absence: interpreting them as a guessed charset can alter
+// the original text without any indication that decoding was uncertain.
+func htmlDeclaredCharset(data []byte) (name string, declared bool) {
+	for _, bom := range []struct {
+		bytes []byte
+		name  string
+	}{{[]byte{0xef, 0xbb, 0xbf}, "utf-8"}, {[]byte{0xff, 0xfe}, "utf-16le"}, {[]byte{0xfe, 0xff}, "utf-16be"}} {
+		if bytes.HasPrefix(data, bom.bytes) {
+			return bom.name, true
 		}
 	}
 	tokenizer := html.NewTokenizer(bytes.NewReader(data[:min(len(data), 1024)]))
 	for {
 		typeOfToken := tokenizer.Next()
 		if typeOfToken == html.ErrorToken {
-			return false
+			return "", false
 		}
 		if typeOfToken != html.StartTagToken && typeOfToken != html.SelfClosingTagToken {
 			continue
@@ -162,9 +169,8 @@ func hasHTMLDeclaredCharset(data []byte) bool {
 		for _, attr := range tag.Attr {
 			switch attr.Key {
 			case "charset":
-				if enc, _ := htmlcharset.Lookup(attr.Val); enc != nil {
-					return true
-				}
+				_, name := htmlcharset.Lookup(attr.Val)
+				return name, true
 			case "http-equiv":
 				httpEquiv = attr.Val
 			case "content":
@@ -173,10 +179,12 @@ func hasHTMLDeclaredCharset(data []byte) bool {
 		}
 		if strings.EqualFold(httpEquiv, "content-type") {
 			_, params, err := mime.ParseMediaType(content)
-			if err == nil {
-				if enc, _ := htmlcharset.Lookup(params["charset"]); enc != nil {
-					return true
-				}
+			if charset, ok := params["charset"]; err == nil && ok {
+				_, name := htmlcharset.Lookup(charset)
+				return name, true
+			}
+			if err != nil && strings.Contains(strings.ToLower(content), "charset") {
+				return "", true
 			}
 		}
 	}
@@ -185,66 +193,104 @@ func hasHTMLDeclaredCharset(data []byte) bool {
 // messageHTML retrieves PidTagHtml, which is normally a binary property and is
 // therefore not populated by go-pst's generated Message properties. HTML can
 // declare a charset itself or use the message's Internet code page.
-func messageHTML(msg *pstlib.Message, decoded string) (string, error) {
+func messageHTML(msg *pstlib.Message, decoded string) (string, *AttachmentEntry, error) {
 	if decoded != "" || msg.PropertyContext == nil {
-		return decoded, nil
+		return decoded, nil, nil
 	}
 	prop, err := msg.PropertyContext.GetPropertyByID(0x1013)
 	if errors.Is(err, pstlib.ErrPropertyNotFound) {
-		return "", nil
+		return "", nil, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("find HTML body: %w", err)
+		return "", nil, fmt.Errorf("find HTML body: %w", err)
 	}
 	if prop.Type == pstlib.PropertyTypeString {
 		// The generated Unicode property is already populated, including an
 		// intentionally empty string.
-		return decoded, nil
+		return decoded, nil, nil
 	}
 	if prop.Type != pstlib.PropertyTypeBinary && prop.Type != pstlib.PropertyTypeString8 {
-		return "", fmt.Errorf("HTML body has unexpected property type %v", prop.Type)
+		return "", nil, fmt.Errorf("HTML body has unexpected property type %v", prop.Type)
 	}
 
 	data, err := bodyPropertyBytes(msg, prop)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if len(data) == 0 {
-		return "", nil
+		return "", nil, nil
+	}
+	preserve := func() *AttachmentEntry {
+		return &AttachmentEntry{Filename: "original-pst-html.bin", MIMEType: "application/octet-stream", Content: data}
+	}
+
+	declaredName, declared := htmlDeclaredCharset(data)
+	name, codepageErr := messageCodepage(msg, 0x3fde, 0x3ffd) // Internet, then message codepage
+	if codepageErr != nil && !errors.Is(codepageErr, errUnsupportedBodyCodepage) {
+		return "", nil, codepageErr
+	}
+	canonicalName := name
+	if name != "" && !strings.EqualFold(name, "utf-7") {
+		_, canonicalName = htmlcharset.Lookup(name)
+	}
+	conflict := declared && (codepageErr != nil || canonicalName != "" && canonicalName != declaredName)
+	// An explicit UTF-8 codepage backed by valid UTF-8 bytes gives an
+	// unambiguous decoding even when the HTML declaration says otherwise.
+	if declared && declaredName != "utf-8" && canonicalName == "utf-8" && utf8.Valid(data) {
+		return normalizeHTML(string(data)), preserve(), nil
+	}
+	if (declared && declaredName == "") || (!declared && codepageErr != nil) {
+		return asciiHTML(data), preserve(), nil //nolint:nilerr // Unsupported encodings are preserved as attachments.
+	}
+	if conflict && (declaredName != "utf-8" || !utf8.Valid(data)) {
+		// Conflicting declarations do not identify a trustworthy encoding.
+		return asciiHTML(data), preserve(), nil
 	}
 
 	contentType := "text/html"
 	var r io.Reader
-	if !hasHTMLDeclaredCharset(data) {
-		name, err := messageCodepage(msg, 0x3fde, 0x3ffd) // Internet, then message codepage
-		if err != nil {
-			return "", err
-		}
-		if name != "" {
-			if strings.EqualFold(name, "utf-7") {
-				r = utf7.UTF7.NewDecoder().Reader(bytes.NewReader(bytes.TrimRight(data, "\x00")))
-			} else {
-				contentType += "; charset=" + name
-			}
+	if !declared && name != "" {
+		if strings.EqualFold(name, "utf-7") {
+			r = utf7.UTF7.NewDecoder().Reader(bytes.NewReader(bytes.TrimRight(data, "\x00")))
+		} else {
+			contentType += "; charset=" + name
 		}
 	}
 	if r == nil {
 		r, err = htmlcharset.NewReader(bytes.NewReader(data), contentType)
 		if err != nil {
-			return "", fmt.Errorf("decode HTML body: %w", err)
+			return "", preserve(), nil //nolint:nilerr // Preserve bytes when a decoder cannot be selected.
 		}
 	}
 	out, err := io.ReadAll(io.LimitReader(r, maxPSTBodyBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("decode HTML body: %w", err)
-	}
 	if len(out) > maxPSTBodyBytes {
-		return "", fmt.Errorf("decoded HTML body exceeds %d bytes", maxPSTBodyBytes)
+		return "", nil, fmt.Errorf("decoded HTML body exceeds %d bytes", maxPSTBodyBytes)
 	}
-	if !utf8.Valid(out) || bytes.Contains(out, []byte("\ufffd")) && !bytes.Contains(data, []byte("\ufffd")) {
-		return "", errors.New("HTML body contains undecodable characters")
+	if err != nil || !utf8.Valid(out) || bytes.Count(out, []byte("\ufffd")) > bytes.Count(data, []byte("\ufffd")) {
+		// Decoders can return a readable prefix with an error or replacement
+		// characters. Keep that best-effort text and the exact original bytes.
+		return normalizeHTML(strings.ToValidUTF8(string(out), "\ufffd")), preserve(), nil //nolint:nilerr // Decoder errors retain original bytes.
 	}
-	return strings.TrimPrefix(strings.TrimRight(string(out), "\x00"), "\ufeff"), nil
+	if conflict || (!declared && name == "" && !utf8.Valid(data)) {
+		return normalizeHTML(string(out)), preserve(), nil
+	}
+	return normalizeHTML(string(out)), nil, nil
+}
+
+// When a charset is unknown, literal ASCII is readable without assigning a
+// meaning to any non-ASCII bytes. Never strip controls from an unknown byte
+// stream and claim that the remainder is the original text.
+func asciiHTML(data []byte) string {
+	for _, b := range data {
+		if b != '\t' && b != '\n' && b != '\r' && (b < 0x20 || b > 0x7e) {
+			return ""
+		}
+	}
+	return string(data)
+}
+
+func normalizeHTML(value string) string {
+	return strings.TrimPrefix(strings.TrimRight(value, "\x00"), "\ufeff")
 }
 
 // messageText recovers String8 PidTagBody, which go-pst does not populate in
@@ -532,9 +578,10 @@ type MessageEntry struct {
 	TransportHeaders string
 
 	// Body content.
-	BodyText  string
-	BodyHTML  string
-	BodyError error // unreadable or unsupported body, if any
+	BodyText          string
+	BodyHTML          string
+	BodyError         error            // unreadable or unsupported body, if any
+	RawHTMLAttachment *AttachmentEntry // original bytes when HTML cannot be decoded losslessly
 
 	// Sender fields.
 	SenderName        string
@@ -688,7 +735,7 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 	sentAt, sentErr := messageDate(msg, 0x0039, props.ClientSubmitTime)
 	receivedAt, receivedErr := messageDate(msg, 0x0e06, props.MessageDeliveryTime)
 	createdAt, createdErr := messageDate(msg, 0x3007, props.CreationTime)
-	bodyHTML, htmlErr := messageHTML(msg, props.GetBodyHtml())
+	bodyHTML, rawHTML, htmlErr := messageHTML(msg, props.GetBodyHtml())
 	bodyText, textErr := messageText(msg, props.GetBody())
 	bodyErr := errors.Join(htmlErr, textErr)
 	if bodyErr == nil && bodyText == "" && bodyHTML == "" && msg.PropertyContext != nil {
@@ -705,6 +752,7 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		TransportHeaders:  transportHeaders,
 		BodyText:          bodyText,
 		BodyHTML:          bodyHTML,
+		RawHTMLAttachment: rawHTML,
 		BodyError:         bodyErr,
 		SenderName:        senderName,
 		SenderEmail:       senderEmail,

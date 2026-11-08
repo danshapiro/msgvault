@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"mime/multipart"
 	"net/mail"
@@ -12,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // BuildRFC5322 constructs raw RFC 5322/MIME bytes from a MessageEntry and its
@@ -45,8 +49,15 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 		return nil, err
 	}
 
+	if msg.RawHTMLAttachment != nil {
+		// Keep the caller's attachment slice unchanged, including any spare
+		// capacity in its backing array.
+		attachments = append(append([]AttachmentEntry(nil), attachments...), *msg.RawHTMLAttachment)
+	}
+
+	bodyHTML := normalizeHTMLCharset(msg.BodyHTML)
 	hasText := msg.BodyText != ""
-	hasHTML := msg.BodyHTML != ""
+	hasHTML := bodyHTML != ""
 	hasAtts := len(attachments) > 0
 
 	switch {
@@ -63,7 +74,7 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 			var innerBuf bytes.Buffer
 			altW := multipart.NewWriter(&innerBuf)
 			writeTextPart(altW, msg.BodyText)
-			writeHTMLPart(altW, msg.BodyHTML)
+			writeHTMLPart(altW, bodyHTML)
 			_ = altW.Close()
 
 			bh.Set("Content-Type", fmt.Sprintf(`multipart/alternative; boundary="%s"`, altW.Boundary()))
@@ -73,7 +84,7 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 			bh.Set("Content-Type", "text/html; charset=utf-8")
 			bh.Set("Content-Transfer-Encoding", "quoted-printable")
 			pw, _ := mw.CreatePart(bh)
-			writeQP(pw, msg.BodyHTML)
+			writeQP(pw, bodyHTML)
 		} else {
 			bh.Set("Content-Type", "text/plain; charset=utf-8")
 			bh.Set("Content-Transfer-Encoding", "quoted-printable")
@@ -117,12 +128,12 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 		mw := multipart.NewWriter(&bodyBuf)
 		fmt.Fprintf(&headerBuf, "MIME-Version: 1.0\r\nContent-Type: multipart/alternative;\r\n\tboundary=%q\r\n\r\n", mw.Boundary())
 		writeTextPart(mw, msg.BodyText)
-		writeHTMLPart(mw, msg.BodyHTML)
+		writeHTMLPart(mw, bodyHTML)
 		_ = mw.Close()
 
 	case hasHTML:
 		headerBuf.WriteString("MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n")
-		writeQP(&bodyBuf, msg.BodyHTML)
+		writeQP(&bodyBuf, bodyHTML)
 
 	default:
 		// text/plain only, or empty body.
@@ -131,6 +142,73 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 	}
 
 	return append(headerBuf.Bytes(), bodyBuf.Bytes()...), nil
+}
+
+// normalizeHTMLCharset keeps the UTF-8 MIME body and HTML charset declarations
+// consistent. Only charset declarations in meta tags are rewritten.
+func normalizeHTMLCharset(body string) string {
+	if body == "" {
+		return ""
+	}
+	var out bytes.Buffer
+	z := html.NewTokenizer(strings.NewReader(body))
+	for {
+		typ := z.Next()
+		if typ == html.ErrorToken {
+			if !errors.Is(z.Err(), io.EOF) {
+				return body
+			}
+			return out.String()
+		}
+		raw := z.Raw()
+		if typ != html.StartTagToken && typ != html.SelfClosingTagToken {
+			out.Write(raw)
+			continue
+		}
+		// Token lowercases tag and attribute names in its input buffer.
+		raw = bytes.Clone(raw)
+		token := z.Token()
+		if token.Data != "meta" {
+			out.Write(raw)
+			continue
+		}
+		isContentType := false
+		for _, attr := range token.Attr {
+			if attr.Key == "http-equiv" && strings.EqualFold(strings.TrimSpace(attr.Val), "content-type") {
+				isContentType = true
+			}
+		}
+		changed, discard := false, false
+		for i := range token.Attr {
+			attr := &token.Attr[i]
+			if attr.Key == "charset" {
+				if !strings.EqualFold(strings.TrimSpace(attr.Val), "utf-8") {
+					attr.Val = "utf-8"
+					changed = true
+				}
+			} else if isContentType && attr.Key == "content" && strings.Contains(strings.ToLower(attr.Val), "charset") {
+				mediaType, params, err := mime.ParseMediaType(attr.Val)
+				if err != nil {
+					// A malformed declaration cannot be safely corrected in place.
+					discard = true
+					break
+				}
+				if charset, ok := params["charset"]; ok && !strings.EqualFold(strings.TrimSpace(charset), "utf-8") {
+					params["charset"] = "utf-8"
+					attr.Val = mime.FormatMediaType(mediaType, params)
+					changed = true
+				}
+			}
+		}
+		if discard {
+			continue
+		}
+		if changed {
+			out.WriteString(token.String())
+		} else {
+			out.Write(raw)
+		}
+	}
 }
 
 // writeTextPart writes a text/plain MIME part to mw.
