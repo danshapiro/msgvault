@@ -56,13 +56,57 @@ func TestMeetingICSRespectsSourceCalendarAndMissingInputs(t *testing.T) {
 	start := time.Date(2024, 3, 1, 10, 0, 0, 0, time.UTC)
 	entry := &MessageEntry{EntryID: "3", PSTArchiveID: "source", SentAt: start,
 		meetingICS: &meetingICSData{start: start, end: start.Add(time.Hour)}}
-	original := []AttachmentEntry{{Filename: "source.ics", MIMEType: "text/calendar; method=REQUEST", Content: []byte("source")}}
+	original := []AttachmentEntry{{Filename: "source.ics", MIMEType: "text/calendar; method=REQUEST", Content: []byte("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//example//EN\r\nBEGIN:VEVENT\r\nUID:example\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20240301T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")}}
 	assert.Nil(t, entry.meetingICSAttachment(original))
 	assert.Empty(t, entry.MeetingICSOmission(original))
 	entry.SentAt = time.Time{}
 	assert.Nil(t, entry.meetingICSAttachment(nil))
 	assert.Equal(t, "meeting message timestamp missing", entry.MeetingICSOmission(nil))
 	assert.Empty(t, entry.MeetingICSOmission(original))
+}
+
+func TestMeetingICSSourceCalendarMustContainUsableEvent(t *testing.T) {
+	start := time.Date(2024, 3, 1, 10, 0, 0, 0, time.UTC)
+	entry := &MessageEntry{EntryID: "3", PSTArchiveID: "source", SentAt: start,
+		meetingICS: &meetingICSData{start: start, end: start.Add(time.Hour)}}
+	for _, tc := range []struct {
+		name, contents string
+		usable         bool
+	}{
+		{"empty", "", false},
+		{"arbitrary text", "source", false},
+		{"truncated calendar", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20240301T100000Z\r\nEND:VEVENT\r\n", false},
+		{"mismatched component", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20240301T100000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n", false},
+		{"calendar without events", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", false},
+		{"event without UID", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20240301T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"event without timestamp", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTART:20240301T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"invalid timestamp", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T250000Z\r\nDTSTART:20240301T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"event without start", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"invalid date", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20241301T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"all day", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART;VALUE=DATE:20240301\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", true},
+		{"multiple calendars", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\nBEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20240301T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", true},
+		{"custom timezone and folding", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART;TZID=Custom-\r\n Zone:20240301T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", true},
+		{"long content value", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20240301T090000Z\r\nDTSTART:20240301T100000Z\r\nDESCRIPTION:" + strings.Repeat("a", maxExistingCalendarPrefixBytes+10) + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", true},
+		{"malformed parameter", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID;X=\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"oversized parameter", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID;X=" + strings.Repeat("a", maxExistingCalendarPrefixBytes) + ":one\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"oversized quoted parameter containing colon", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID;X=\"http://" + strings.Repeat("a", maxExistingCalendarPrefixBytes) + "\":one\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", false},
+		{"excessive nested components", "BEGIN:VCALENDAR\r\n" + strings.Repeat("BEGIN:X\r\n", 65) + strings.Repeat("END:X\r\n", 65) + "END:VCALENDAR\r\n", false},
+		{"extra end before nested components", strings.Repeat("END:X\r\n", 65) + "BEGIN:VCALENDAR\r\n" + strings.Repeat("BEGIN:X\r\n", 65), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			attachments := []AttachmentEntry{{Filename: "source.ics", MIMEType: "text/calendar", Content: []byte(tc.contents)}}
+			generated := entry.meetingICSAttachment(attachments)
+			if tc.usable {
+				assert.Nil(t, generated)
+			} else {
+				require.NotNil(t, generated)
+				assert.Equal(t, "meeting.ics", generated.Filename)
+			}
+			assert.Equal(t, []byte(tc.contents), attachments[0].Content)
+		})
+	}
+	entry.SentAt = time.Time{}
+	assert.Equal(t, "meeting message timestamp missing", entry.MeetingICSOmission([]AttachmentEntry{{MIMEType: "text/calendar", Content: []byte("broken")}}))
 }
 
 func TestMeetingICSUsesValidSourceGlobalIdentity(t *testing.T) {

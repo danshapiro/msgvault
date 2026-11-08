@@ -143,13 +143,20 @@ func (msg *MessageEntry) MeetingICSWarning() string {
 // MeetingICSOmission reports why no generated calendar will be available,
 // except when an original calendar attachment already supplies one.
 func (msg *MessageEntry) MeetingICSOmission(attachments []AttachmentEntry) string {
-	for _, att := range attachments {
-		mediaType, _, err := mime.ParseMediaType(att.MIMEType)
-		if err == nil && strings.EqualFold(mediaType, "text/calendar") {
-			return ""
-		}
+	if hasUsableExistingCalendar(attachments) {
+		return ""
 	}
 	return msg.MeetingICSWarning()
+}
+
+func hasUsableExistingCalendar(attachments []AttachmentEntry) bool {
+	for _, att := range attachments {
+		mediaType, _, err := mime.ParseMediaType(att.MIMEType)
+		if err == nil && strings.EqualFold(mediaType, "text/calendar") && usableExistingCalendar(att.Content) {
+			return true
+		}
+	}
+	return false
 }
 
 func (msg *MessageEntry) calendarTimestamp() time.Time {
@@ -171,14 +178,8 @@ func (msg *MessageEntry) calendarTimestamp() time.Time {
 }
 
 func (msg *MessageEntry) meetingICSAttachment(attachments []AttachmentEntry) *AttachmentEntry {
-	if msg.meetingICS == nil || msg.MeetingICSOmission(attachments) != "" {
+	if msg.meetingICS == nil || msg.MeetingICSWarning() != "" || hasUsableExistingCalendar(attachments) {
 		return nil
-	}
-	for _, att := range attachments {
-		mediaType, _, err := mime.ParseMediaType(att.MIMEType)
-		if err == nil && strings.EqualFold(mediaType, "text/calendar") {
-			return nil
-		}
 	}
 	var uidInput []byte
 	switch {
@@ -209,7 +210,21 @@ func (msg *MessageEntry) meetingICSAttachment(attachments []AttachmentEntry) *At
 	}
 	writeICSLine(&out, "END:VEVENT")
 	writeICSLine(&out, "END:VCALENDAR")
-	return &AttachmentEntry{Filename: "meeting.ics", MIMEType: "text/calendar", Content: out.Bytes()}
+	return &AttachmentEntry{Filename: generatedCalendarFilename(attachments), MIMEType: "text/calendar", Content: out.Bytes()}
+}
+
+// Keep the generated calendar distinct from a malformed original with the
+// same name. Both are preserved as separate attachments.
+func generatedCalendarFilename(attachments []AttachmentEntry) string {
+	used := make(map[string]bool, len(attachments))
+	for _, att := range attachments {
+		used[strings.ToLower(sanitizeFilename(att.Filename))] = true
+	}
+	name := "meeting.ics"
+	for n := 2; used[strings.ToLower(name)]; n++ {
+		name = fmt.Sprintf("meeting-%d.ics", n)
+	}
+	return name
 }
 
 func escapeICSText(s string) string {
