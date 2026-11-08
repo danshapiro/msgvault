@@ -216,16 +216,22 @@ func TestExtractMessage_UTF7Body(t *testing.T) {
 	assert.Equal(t, []byte("<p>bad +?</p>"), entry.RawHTMLAttachment.Content)
 }
 
-func TestExtractMessage_RTFOnlyIsReported(t *testing.T) {
+func TestExtractMessage_RTFOnlyInvalidIsPreserved(t *testing.T) {
 	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
 		{ID: 0x1009, Type: pstlib.PropertyTypeBinary, Data: []byte("rtf")},
 	}}}
 	entry := ExtractMessage(msg, "Inbox")
 	require.NotNil(t, entry)
-	assert.ErrorContains(t, entry.BodyError, "RTF-only")
+	require.NoError(t, entry.BodyError)
+	require.Error(t, entry.RTFWarning)
+	require.NotNil(t, entry.RawRTFAttachment)
+	assert.Equal(t, []byte("rtf"), entry.RawRTFAttachment.Content)
+	assert.Empty(t, entry.BodyText)
 	text := "normal body"
 	msg.Properties = &properties.Message{Body: &text}
-	assert.NoError(t, ExtractMessage(msg, "Inbox").BodyError)
+	entry = ExtractMessage(msg, "Inbox")
+	require.NoError(t, entry.BodyError)
+	assert.Nil(t, entry.RawRTFAttachment)
 }
 
 func TestExtractMessage_UndecodableHTMLAndRTFPreservesBoth(t *testing.T) {

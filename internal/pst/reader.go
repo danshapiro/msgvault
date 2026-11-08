@@ -78,6 +78,9 @@ func messageDate(msg *pstlib.Message, id uint16, decoded *int64) (time.Time, err
 
 const maxPSTBodyBytes = 128 << 20
 
+// Limit expanded RTF independently of the source-property and message limits.
+const maxDecodedRTFBytes = 32 << 20
+
 var errUnsupportedBodyCodepage = errors.New("unsupported body codepage")
 
 // bodyPropertyBytes reads a variable-length property with a bounded allocation.
@@ -599,6 +602,7 @@ type MessageEntry struct {
 	BodyText           string
 	BodyHTML           string
 	BodyError          error            // unreadable or unsupported body, if any
+	RTFWarning         error            // original RTF was retained but readable text could not be recovered
 	RawHTMLAttachment  *AttachmentEntry // original bytes when HTML cannot be decoded losslessly
 	RawRTFAttachment   *AttachmentEntry // compressed RTF retained when neither HTML nor text can be decoded
 	CalendarAttachment *AttachmentEntry // structured calendar data retained from meeting requests
@@ -773,11 +777,10 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 	bodyText, textErr := messageText(msg, props.GetBody())
 	bodyErr := errors.Join(htmlErr, textErr)
 	var rawRTF *AttachmentEntry
+	var rtfWarning error
 	if bodyErr == nil && bodyText == "" && bodyHTML == "" && msg.PropertyContext != nil {
 		if prop, err := msg.PropertyContext.GetPropertyByID(0x1009); err == nil {
-			if rawHTML == nil {
-				bodyErr = errors.New("RTF-only body requires conversion")
-			} else if prop.Type != pstlib.PropertyTypeBinary {
+			if prop.Type != pstlib.PropertyTypeBinary {
 				bodyErr = fmt.Errorf("RTF body has unexpected property type %v", prop.Type)
 			} else if data, err := bodyPropertyBytes(msg, prop); err != nil {
 				bodyErr = fmt.Errorf("read compressed RTF body: %w", err)
@@ -785,6 +788,15 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 				bodyErr = errors.New("compressed RTF body is empty")
 			} else {
 				rawRTF = &AttachmentEntry{Filename: "original-pst-rtf-compressed.bin", MIMEType: "application/octet-stream", Content: data}
+				var rtf []byte
+				rtf, rtfWarning = decodeCompressedRTF(data, maxDecodedRTFBytes)
+				if rtfWarning == nil {
+					bodyText, rtfWarning = extractRTFText(rtf, maxDecodedRTFBytes)
+					if rtfWarning == nil && strings.TrimSpace(bodyText) == "" {
+						rtfWarning = errors.New("RTF body contains no recoverable text")
+						bodyText = ""
+					}
+				}
 			}
 		} else if !errors.Is(err, pstlib.ErrPropertyNotFound) {
 			bodyErr = fmt.Errorf("find RTF body: %w", err)
@@ -810,6 +822,7 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		BodyHTML:           bodyHTML,
 		RawHTMLAttachment:  rawHTML,
 		RawRTFAttachment:   rawRTF,
+		RTFWarning:         rtfWarning,
 		CalendarAttachment: calendarAttachment,
 		BodyError:          bodyErr,
 		SenderName:         senderName,

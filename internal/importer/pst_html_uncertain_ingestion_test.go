@@ -96,7 +96,7 @@ func TestPSTUndecodableHTMLAndRTFSurviveIngestion(t *testing.T) {
 	require.NoError(t, err)
 	parsed, err := msgmime.Parse(stored)
 	require.NoError(t, err)
-	assert.Empty(t, parsed.BodyText)
+	assert.Contains(t, parsed.BodyText, "original text")
 	assert.Empty(t, parsed.BodyHTML)
 	want := map[string][]byte{
 		"original-pst-html.bin":           html,
