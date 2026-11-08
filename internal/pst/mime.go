@@ -22,9 +22,9 @@ import (
 // attachments.
 //
 // Strategy:
-//  1. If TransportHeaders is non-empty, use those verbatim as the message
-//     headers, filling missing threading headers from MAPI and stripping
-//     existing MIME content headers we will replace.
+//  1. If TransportHeaders is non-empty, retain structurally valid fields,
+//     preserving malformed transport data in encoded metadata. Fill missing
+//     threading headers from MAPI and replace existing MIME content headers.
 //  2. Otherwise, synthesize headers from MAPI properties.
 //  3. Build the body as multipart/alternative when both text and HTML are
 //     present, or as a simple text/plain or text/html part when only one
@@ -37,7 +37,16 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 
 	// Write message-identifying headers.
 	if msg.TransportHeaders != "" {
-		present := writeTransportHeaders(&headerBuf, msg.TransportHeaders, msg)
+		headers, malformed := validTransportHeaders(msg.TransportHeaders)
+		present := writeTransportHeaders(&headerBuf, headers, msg)
+		if malformed {
+			writeEncodedBytesHeader(&headerBuf, "X-Msgvault-Original-Transport-Headers", []byte(msg.TransportHeaders))
+			if !present["date"] {
+				if date := msg.FallbackDate(time.Now()); !date.IsZero() {
+					writeHeader(&headerBuf, "Date", date.Format(time.RFC1123Z))
+				}
+			}
+		}
 		writeThreadingHeaders(&headerBuf, msg, present)
 	} else {
 		writeSynthesizedHeaders(&headerBuf, msg)
@@ -157,6 +166,78 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 	return append(headerBuf.Bytes(), bodyBuf.Bytes()...), nil
 }
 
+// validTransportHeaders extracts complete, safe fields while retaining their
+// original order and folding. The full original property is separately saved
+// whenever anything cannot be emitted as a valid header, including data after
+// a header/body separator.
+func validTransportHeaders(headers string) (string, bool) {
+	malformed := false
+	for i := range len(headers) {
+		if headers[i] == '\r' && (i+1 == len(headers) || headers[i+1] != '\n') ||
+			headers[i] == '\n' && (i == 0 || headers[i-1] != '\r') {
+			malformed = true
+		}
+	}
+	// A bare CR is invalid within a physical line, not a field separator:
+	// interpreting it as a newline could promote untrusted text to a header.
+	normalized := strings.ReplaceAll(headers, "\r\n", "\n")
+	var result strings.Builder
+	var field []string
+	flush := func() {
+		for _, line := range field {
+			result.WriteString(line)
+			result.WriteByte('\n')
+		}
+		field = nil
+	}
+	afterSeparator := false
+	for line := range strings.SplitSeq(normalized, "\n") {
+		if afterSeparator {
+			if line != "" {
+				malformed = true
+			}
+			continue
+		}
+		if line == "" {
+			flush()
+			afterSeparator = true
+			continue
+		}
+		valid := len(line) <= 998
+		for i := range len(line) {
+			if line[i] == 0x7f || line[i] < 0x20 && line[i] != '\t' {
+				valid = false
+			}
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if len(field) == 0 || !valid {
+				field = nil
+				malformed = true
+			} else {
+				field = append(field, line)
+			}
+			continue
+		}
+		flush()
+		name, _, found := strings.Cut(line, ":")
+		if !found || name == "" {
+			valid = false
+		}
+		for i := range len(name) {
+			if name[i] < 33 || name[i] > 126 || name[i] == ':' {
+				valid = false
+			}
+		}
+		if !valid {
+			malformed = true
+			continue
+		}
+		field = []string{line}
+	}
+	flush()
+	return result.String(), malformed
+}
+
 // normalizeHTMLCharset keeps the UTF-8 MIME body and HTML charset declarations
 // consistent. Only charset declarations in meta tags are rewritten.
 func normalizeHTMLCharset(body string) string {
@@ -267,6 +348,13 @@ func writeTransportHeaders(buf *bytes.Buffer, headers string, msg *MessageEntry)
 				buf.WriteString(line + "\r\n")
 			}
 			return
+		case "x-msgvault-original-transport-headers":
+			// Do not let an input header impersonate our recoverable metadata.
+			writeHeader(buf, "X-Msgvault-Original-Original-Transport-Headers", strings.TrimSpace(value))
+			for _, line := range field[1:] {
+				buf.WriteString(line + "\r\n")
+			}
+			return
 		case "to", "cc", "bcc":
 			value += " " + strings.Join(field[1:], " ")
 			recipientFields[name] = append(recipientFields[name], strings.TrimSpace(value))
@@ -288,7 +376,7 @@ func writeTransportHeaders(buf *bytes.Buffer, headers string, msg *MessageEntry)
 			} else if msg.Subject != "" {
 				return
 			}
-		case "sender":
+		case "sender", "date":
 			if strings.TrimSpace(value+strings.Join(field[1:], "")) != "" {
 				present[name] = true
 			}
@@ -435,6 +523,11 @@ func writeEncodedMetadataHeader(buf *bytes.Buffer, header string, value any) err
 	if err != nil {
 		return err
 	}
+	writeEncodedBytesHeader(buf, header, data)
+	return nil
+}
+
+func writeEncodedBytesHeader(buf *bytes.Buffer, header string, data []byte) {
 	encoded := base64.RawURLEncoding.EncodeToString(data)
 	buf.WriteString(header + ": ")
 	for len(encoded) > 72 {
@@ -443,7 +536,6 @@ func writeEncodedMetadataHeader(buf *bytes.Buffer, header string, value any) err
 		encoded = encoded[72:]
 	}
 	buf.WriteString(encoded + "\r\n")
-	return nil
 }
 
 func writeUnresolvedIdentityHeaders(buf *bytes.Buffer, msg *MessageEntry) error {
