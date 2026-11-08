@@ -157,6 +157,42 @@ func TestExtractMessage_RTFOnlyIsReported(t *testing.T) {
 	assert.NoError(t, ExtractMessage(msg, "Inbox").BodyError)
 }
 
+func TestExtractMessage_UndecodableHTMLAndRTFPreservesBoth(t *testing.T) {
+	htmlBytes := []byte("<meta charset=unknown-example><p>\xff</p>")
+	rtfBytes := []byte{0x10, 0, 0, 0, 0x52, 0x54, 0x46, 0x00, 0xfe}
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: htmlBytes},
+		{ID: 0x1009, Type: pstlib.PropertyTypeBinary, Data: rtfBytes},
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.BodyError)
+	require.NotNil(t, entry.RawHTMLAttachment)
+	assert.Equal(t, htmlBytes, entry.RawHTMLAttachment.Content)
+	require.NotNil(t, entry.RawRTFAttachment)
+	assert.Equal(t, rtfBytes, entry.RawRTFAttachment.Content)
+	assert.Equal(t, "original-pst-rtf-compressed.bin", entry.RawRTFAttachment.Filename)
+	assert.Equal(t, "application/octet-stream", entry.RawRTFAttachment.MIMEType)
+
+	for _, tc := range []struct {
+		name string
+		prop pstlib.Property
+	}{
+		{"unexpected type", pstlib.Property{ID: 0x1009, Type: pstlib.PropertyTypeInteger32, Data: []byte{1, 2, 3, 4}}},
+		{"unreadable property", pstlib.Property{ID: 0x1009, Type: pstlib.PropertyTypeBinary}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+				{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: htmlBytes}, tc.prop,
+			}}}
+			entry := ExtractMessage(bad, "Inbox")
+			require.NotNil(t, entry)
+			require.ErrorContains(t, entry.BodyError, "RTF body")
+			assert.Nil(t, entry.RawRTFAttachment)
+		})
+	}
+}
+
 func TestExtractMessage_BinaryHTMLErrors(t *testing.T) {
 	tests := []struct {
 		name  string

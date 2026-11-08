@@ -246,6 +246,21 @@ func messageHTML(msg *pstlib.Message, decoded string) (string, *AttachmentEntry,
 		// Conflicting declarations do not identify a trustworthy encoding.
 		return asciiHTML(data), preserve(), nil
 	}
+	undeclaredNonASCII := false
+	if !declared && name == "" {
+		for _, b := range data {
+			if b >= utf8.RuneSelf {
+				undeclaredNonASCII = true
+				break
+			}
+		}
+		if undeclaredNonASCII && utf8.Valid(data) {
+			// HTML charset sniffing only looks at an initial prefix. Prefer
+			// valid UTF-8 across the complete body, but keep the original
+			// because the source did not declare an encoding.
+			return normalizeHTML(string(data)), preserve(), nil
+		}
+	}
 
 	contentType := "text/html"
 	var r io.Reader
@@ -271,7 +286,7 @@ func messageHTML(msg *pstlib.Message, decoded string) (string, *AttachmentEntry,
 		// characters. Keep that best-effort text and the exact original bytes.
 		return normalizeHTML(strings.ToValidUTF8(string(out), "\ufffd")), preserve(), nil //nolint:nilerr // Decoder errors retain original bytes.
 	}
-	if conflict || (!declared && name == "" && !utf8.Valid(data)) {
+	if conflict || undeclaredNonASCII {
 		return normalizeHTML(string(out)), preserve(), nil
 	}
 	return normalizeHTML(string(out)), nil, nil
@@ -582,6 +597,7 @@ type MessageEntry struct {
 	BodyHTML          string
 	BodyError         error            // unreadable or unsupported body, if any
 	RawHTMLAttachment *AttachmentEntry // original bytes when HTML cannot be decoded losslessly
+	RawRTFAttachment  *AttachmentEntry // compressed RTF retained when neither HTML nor text can be decoded
 
 	// Sender fields.
 	SenderName        string
@@ -738,9 +754,20 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 	bodyHTML, rawHTML, htmlErr := messageHTML(msg, props.GetBodyHtml())
 	bodyText, textErr := messageText(msg, props.GetBody())
 	bodyErr := errors.Join(htmlErr, textErr)
+	var rawRTF *AttachmentEntry
 	if bodyErr == nil && bodyText == "" && bodyHTML == "" && msg.PropertyContext != nil {
-		if _, err := msg.PropertyContext.GetPropertyByID(0x1009); err == nil {
-			bodyErr = errors.New("RTF-only body requires conversion")
+		if prop, err := msg.PropertyContext.GetPropertyByID(0x1009); err == nil {
+			if rawHTML == nil {
+				bodyErr = errors.New("RTF-only body requires conversion")
+			} else if prop.Type != pstlib.PropertyTypeBinary {
+				bodyErr = fmt.Errorf("RTF body has unexpected property type %v", prop.Type)
+			} else if data, err := bodyPropertyBytes(msg, prop); err != nil {
+				bodyErr = fmt.Errorf("read compressed RTF body: %w", err)
+			} else if len(data) == 0 {
+				bodyErr = errors.New("compressed RTF body is empty")
+			} else {
+				rawRTF = &AttachmentEntry{Filename: "original-pst-rtf-compressed.bin", MIMEType: "application/octet-stream", Content: data}
+			}
 		} else if !errors.Is(err, pstlib.ErrPropertyNotFound) {
 			bodyErr = fmt.Errorf("find RTF body: %w", err)
 		}
@@ -753,6 +780,7 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		BodyText:          bodyText,
 		BodyHTML:          bodyHTML,
 		RawHTMLAttachment: rawHTML,
+		RawRTFAttachment:  rawRTF,
 		BodyError:         bodyErr,
 		SenderName:        senderName,
 		SenderEmail:       senderEmail,

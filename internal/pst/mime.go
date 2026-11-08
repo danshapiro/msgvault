@@ -49,10 +49,16 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 		return nil, err
 	}
 
-	if msg.RawHTMLAttachment != nil {
+	if msg.RawHTMLAttachment != nil || msg.RawRTFAttachment != nil {
 		// Keep the caller's attachment slice unchanged, including any spare
 		// capacity in its backing array.
-		attachments = append(append([]AttachmentEntry(nil), attachments...), *msg.RawHTMLAttachment)
+		attachments = append([]AttachmentEntry(nil), attachments...)
+		if msg.RawHTMLAttachment != nil {
+			attachments = append(attachments, *msg.RawHTMLAttachment)
+		}
+		if msg.RawRTFAttachment != nil {
+			attachments = append(attachments, *msg.RawRTFAttachment)
+		}
 	}
 
 	bodyHTML := normalizeHTMLCharset(msg.BodyHTML)
