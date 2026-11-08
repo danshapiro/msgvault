@@ -247,7 +247,7 @@ func runPSTMessageRepair(cmd *cobra.Command, state *invocation, identifier, pstP
 			}
 		}
 		if result.BodyPreserved {
-			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Existing body preserved; it differs from the original MIME-derived body."); err != nil {
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Existing body preserved."); err != nil {
 				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
 			}
 		}
@@ -260,6 +260,11 @@ func runPSTMessageRepair(cmd *cobra.Command, state *invocation, identifier, pstP
 			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "Message fact not changed: %s\n", fact); err != nil {
 				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
 			}
+		}
+	}
+	for _, warning := range result.Warnings {
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "PST repair warning: %s\n", warning); err != nil {
+			outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair warning: %w", err))
 		}
 	}
 	for _, attachmentErr := range result.AttachmentErrors {

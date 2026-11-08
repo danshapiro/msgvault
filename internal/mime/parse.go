@@ -54,6 +54,16 @@ type Message struct {
 	BodyHTML        string
 	Attachments     []Attachment
 	Errors          []string // Non-fatal parsing errors
+	Issues          []ParseIssue
+}
+
+// ParseIssue retains the parser's structured diagnostics for callers that
+// need to distinguish potentially lossy errors from charset detection warnings.
+type ParseIssue struct {
+	Name, Description string
+	Severe            bool
+	BodyPart          bool
+	UTF8Restored      bool
 }
 
 // Address represents an email address with optional display name.
@@ -104,7 +114,7 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read MIME envelope: Failed to ReadParts: %w", err)
 	}
-	restoreDeclaredUTF8(raw, root)
+	restoredUTF8 := restoreDeclaredUTF8(raw, root)
 	normalizeMalformedContentTypes(root)
 
 	env, err := envelopeParser.EnvelopeFromPart(root)
@@ -160,9 +170,23 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	// Preserve physical occurrences so parsed evidence matches keyed storage.
 	msg.Attachments = DistinctAttachments(msg.Attachments)
 
-	// Collect any parsing errors
+	// Associate diagnostics with their source parts before flattening them.
+	issueParts := make(map[*enmime.Error]*enmime.Part)
+	root.BreadthMatchAll(func(part *enmime.Part) bool {
+		for _, issue := range part.Errors {
+			issueParts[issue] = part
+		}
+		return false
+	})
 	for _, e := range env.Errors {
 		msg.Errors = append(msg.Errors, e.Error())
+		part := issueParts[e]
+		issue := ParseIssue{Name: e.Name, Description: e.Error(), Severe: e.Severe}
+		if part != nil {
+			issue.BodyPart = isBodyPart(part)
+			issue.UTF8Restored = restoredUTF8[part]
+		}
+		msg.Issues = append(msg.Issues, issue)
 	}
 
 	if inspect != nil {

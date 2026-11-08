@@ -16,19 +16,20 @@ var declaredCharsetParser = enmime.NewParser(
 
 // restoreDeclaredUTF8 keeps valid UTF-8 content when charset detection prefers
 // a legacy encoding. Detection still recovers parts with incorrect declarations.
-func restoreDeclaredUTF8(raw []byte, root *enmime.Part) {
+func restoreDeclaredUTF8(raw []byte, root *enmime.Part) map[*enmime.Part]bool {
+	restored := make(map[*enmime.Part]bool)
 	candidates := root.BreadthMatchAll(func(part *enmime.Part) bool {
 		return isUTF8Charset(part.OrigCharset) && !isUTF8Charset(part.Charset)
 	})
 	if len(candidates) == 0 {
-		return
+		return restored
 	}
 
 	// Reparse only actual overrides, retaining enmime's transport decoding. Reverse
 	// transcoding could not recover original bytes lost by a legacy charset decoder.
 	declared, err := declaredCharsetParser.ReadParts(bytes.NewReader(raw))
 	if err != nil {
-		return
+		return restored
 	}
 	byID := make(map[string]*enmime.Part)
 	for _, part := range declared.BreadthMatchAll(func(*enmime.Part) bool { return true }) {
@@ -40,7 +41,9 @@ func restoreDeclaredUTF8(raw []byte, root *enmime.Part) {
 			continue
 		}
 		part.Content = source.Content
+		restored[part] = true
 	}
+	return restored
 }
 
 func isUTF8Charset(charset string) bool {

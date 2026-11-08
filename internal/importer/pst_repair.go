@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jhillyerd/enmime/v2"
 	"go.kenn.io/msgvault/internal/export"
 	msgmime "go.kenn.io/msgvault/internal/mime"
 	pstreader "go.kenn.io/msgvault/internal/pst"
@@ -37,6 +38,7 @@ type PSTRepairResult struct {
 	EnvelopeUpdated   bool
 	EnvelopePreserved []string
 	AttachmentErrors  []error
+	Warnings          []string
 }
 
 // RepairPSTMessage repairs exactly one stored PST message. The source archive
@@ -148,8 +150,27 @@ func repairPSTMessageWithVerify(ctx context.Context, st *store.Store, sourceID i
 	if err != nil {
 		return result, fmt.Errorf("parse repaired PST MIME: %w", err)
 	}
-	if len(parsed.Errors) != 0 {
-		return result, fmt.Errorf("parse repaired PST MIME parts: %s", strings.Join(parsed.Errors, "; "))
+	var blocking []string
+	uncertainBody := false
+	for _, issue := range parsed.Issues {
+		if issue.Name != enmime.ErrorCharsetDeclaration || issue.Severe || !issue.BodyPart {
+			blocking = append(blocking, issue.Description)
+			continue
+		}
+		if !issue.UTF8Restored {
+			uncertainBody = true
+		}
+		warning := issue.Description
+		if !issue.UTF8Restored {
+			warning += "; body encoding is uncertain, so the existing body will be preserved if repair succeeds"
+		}
+		result.Warnings = append(result.Warnings, warning)
+		if log != nil {
+			log.Warn("PST repair MIME charset detection warning", "message", messageID, "warning", issue.Description, "body_preserved", !issue.UTF8Restored)
+		}
+	}
+	if len(blocking) != 0 {
+		return result, fmt.Errorf("parse repaired PST MIME parts: %s", strings.Join(blocking, "; "))
 	}
 	var writes []store.AttachmentWrite
 	for i := range parsed.Attachments {
@@ -177,6 +198,11 @@ func repairPSTMessageWithVerify(ctx context.Context, st *store.Store, sourceID i
 	body := &store.PSTRepairBody{
 		ExpectedText: textutil.EnsureUTF8(oldMessage.GetBodyText()), ExpectedHTML: textutil.EnsureUTF8(oldMessage.BodyHTML),
 		NewText: textutil.EnsureUTF8(parsed.GetBodyText()), NewHTML: textutil.EnsureUTF8(parsed.BodyHTML),
+	}
+	if uncertainBody {
+		// A charset detector's guess is insufficient evidence to replace an
+		// existing body. The repaired raw MIME remains available for recovery.
+		body = nil
 	}
 	now := time.Now().UTC()
 	fallbackDate := entry.FallbackDate(now)
@@ -219,11 +245,12 @@ func repairPSTMessageWithVerify(ctx context.Context, st *store.Store, sourceID i
 		return result, errors.Join(fmt.Errorf("commit PST message repair: %w", err), errors.Join(result.AttachmentErrors...))
 	}
 	result.AttachmentsAdded, result.BodyUpdated, result.BodyPreserved = stored.AttachmentsAdded, stored.BodyUpdated, stored.BodyPreserved
+	result.BodyPreserved = result.BodyPreserved || uncertainBody
 	result.EnvelopeUpdated, result.EnvelopePreserved = stored.EnvelopeUpdated, stored.EnvelopePreserved
 	if len(result.AttachmentErrors) != 0 {
 		return result, fmt.Errorf("PST message repaired with blocked attachments: %w", errors.Join(result.AttachmentErrors...))
 	}
-	if result.BodyPreserved && log != nil {
+	if stored.BodyPreserved && log != nil {
 		log.Warn("PST repair preserved a body that differs from the original MIME-derived body", "message", messageID)
 	}
 	return result, nil
