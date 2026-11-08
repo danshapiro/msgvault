@@ -3,6 +3,7 @@ package pst
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"mime"
 	"mime/multipart"
@@ -36,6 +37,9 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 		writeThreadingHeaders(&headerBuf, msg, present)
 	} else {
 		writeSynthesizedHeaders(&headerBuf, msg)
+	}
+	if err := writeUnresolvedRecipientHeaders(&headerBuf, msg); err != nil {
+		return nil, err
 	}
 
 	hasText := msg.BodyText != ""
@@ -259,6 +263,7 @@ func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[stri
 	}{{"To", 1, msg.DisplayTo}, {"Cc", 2, msg.DisplayCc}, {"Bcc", 3, msg.DisplayBcc}} {
 		original := fields[strings.ToLower(role.name)]
 		var addresses []*mail.Address
+		hasUnresolved := false
 		seen := make(map[string]bool)
 		invalid := false
 		for _, value := range original {
@@ -283,6 +288,10 @@ func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[stri
 			if recipient.Role != role.role {
 				continue
 			}
+			if recipient.Unresolved {
+				hasUnresolved = true
+				continue
+			}
 			key := strings.ToLower(recipient.Email)
 			if !seen[key] {
 				addresses = append(addresses, &mail.Address{Name: sanitizeHeaderValue(recipient.Name), Address: sanitizeHeaderValue(recipient.Email)})
@@ -290,7 +299,7 @@ func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[stri
 			}
 		}
 		if invalid {
-			if len(addresses) == 0 {
+			if len(addresses) == 0 && !hasUnresolved {
 				for _, value := range original {
 					writeHeader(buf, role.name, sanitizeHeaderValue(value))
 				}
@@ -301,7 +310,7 @@ func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[stri
 			}
 		}
 		if len(addresses) == 0 {
-			if len(original) == 0 && role.display != "" {
+			if len(original) == 0 && role.display != "" && !hasUnresolved {
 				writeHeader(buf, role.name, formatDisplayList(role.display))
 			}
 			continue
@@ -315,6 +324,50 @@ func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[stri
 		}
 		buf.WriteString("\r\n")
 	}
+}
+
+// Keep unresolved MAPI facts in raw MIME without placing an unverified value
+// in an email-address field. Base64url makes controls and line breaks safe.
+func writeUnresolvedRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry) error {
+	for _, recipient := range msg.Recipients {
+		if !recipient.Unresolved {
+			continue
+		}
+		name := strings.TrimSpace(strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}, recipient.Name))
+		if name != "" {
+			// The complete name remains in the encoded header below.
+			runes := []rune(name)
+			if len(runes) > 256 {
+				name = string(runes[:256])
+			}
+			role := map[int32]string{1: "To", 2: "Cc", 3: "Bcc"}[recipient.Role]
+			writeHeader(buf, "X-Msgvault-Unresolved-Recipient-Name", mime.QEncoding.Encode("utf-8", role+": "+name))
+		}
+		value, err := json.Marshal(struct {
+			Role        int32  `json:"role"`
+			Name        string `json:"name"`
+			AddressType string `json:"address_type"`
+			Address     string `json:"address"`
+			SMTP        string `json:"smtp"`
+		}{recipient.Role, recipient.Name, recipient.AddressType, recipient.RawAddress, recipient.RawSMTP})
+		if err != nil {
+			return fmt.Errorf("encode unresolved recipient: %w", err)
+		}
+		encoded := base64.RawURLEncoding.EncodeToString(value)
+		buf.WriteString("X-Msgvault-Unresolved-Recipient: ")
+		for len(encoded) > 72 {
+			buf.WriteString(encoded[:72])
+			buf.WriteString("\r\n\t")
+			encoded = encoded[72:]
+		}
+		buf.WriteString(encoded + "\r\n")
+	}
+	return nil
 }
 
 // writeSynthesizedHeaders writes RFC 5322 headers synthesized from MAPI

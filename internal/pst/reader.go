@@ -367,8 +367,10 @@ func decodeMAPIString(msg *pstlib.Message, typ pstlib.PropertyType, data []byte)
 // MessageRecipient retains the MAPI role and address independently of the
 // often-incomplete transport headers.
 type MessageRecipient struct {
-	Name, Email string
-	Role        int32 // 1 = To, 2 = Cc, 3 = Bcc
+	Name, Email                      string
+	Role                             int32 // 1 = To, 2 = Cc, 3 = Bcc
+	Unresolved                       bool
+	AddressType, RawAddress, RawSMTP string
 }
 
 // messageRecipients opens NID_RECIP_TABLE (0x692) from the message's local
@@ -463,12 +465,13 @@ func makeMessageRecipient(role int32, name, addrType, email, smtp string) (*Mess
 	if role < 1 || role > 3 {
 		return nil, nil
 	}
+	rawSMTP := smtp
 	if smtp == "" && (addrType == "" || strings.EqualFold(addrType, "SMTP")) {
 		smtp = email
 	}
 	parsed, err := mail.ParseAddress(strings.TrimSpace(smtp))
 	if err != nil || !strings.Contains(parsed.Address, "@") {
-		return nil, fmt.Errorf("recipient role %d has no usable SMTP address (address type %q)", role, sanitizeHeaderValue(addrType))
+		return &MessageRecipient{Name: name, Role: role, Unresolved: true, AddressType: addrType, RawAddress: email, RawSMTP: rawSMTP}, nil
 	}
 	return &MessageRecipient{Name: name, Email: parsed.Address, Role: role}, nil
 }

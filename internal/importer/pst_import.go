@@ -537,6 +537,7 @@ func importPstWithBatchSize(
 				log.Warn("read PST message properties failed", "entry_id", entry.EntryID, "error", propertyErr)
 				continue
 			}
+			logUnresolvedPSTRecipients(log, entry)
 
 			attachments, err := pstreader.ReadAttachments(msg, opts.MaxMessageBytes)
 			if err != nil {
@@ -648,6 +649,16 @@ func importPstWithBatchSize(
 	}
 
 	return summary, nil
+}
+
+// Keep unresolved recipient data in the message while warning without logging
+// the recipient's private name or address.
+func logUnresolvedPSTRecipients(log *slog.Logger, entry *pstreader.MessageEntry) {
+	for _, recipient := range entry.Recipients {
+		if recipient.Unresolved {
+			log.Warn("PST recipient has no usable SMTP address", "entry_id", entry.EntryID, "role", recipient.Role)
+		}
+	}
 }
 
 // finishPstThreads links replies to archived parents and joins split

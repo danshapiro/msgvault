@@ -2,8 +2,10 @@ package pst
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	msgmime "go.kenn.io/msgvault/internal/mime"
@@ -244,6 +246,81 @@ func TestBuildRFC5322_MergesMAPIHeadersByRole(t *testing.T) {
 	require.Len(t, bcc, 2)
 	assert.Equal(t, "hidden@example.test", bcc[0].Address)
 	assert.Equal(t, "secret@example.test", bcc[1].Address)
+}
+
+func TestBuildRFC5322_PreservesUnresolvedRecipient(t *testing.T) {
+	recipient, err := makeMessageRecipient(1, "José\r\nBcc: injected@example.test", "EX", "/O=EXAMPLE/CN=JOSE", "")
+	require.NoError(t, err)
+	require.NotNil(t, recipient)
+	msg := &MessageEntry{SenderEmail: "sender@example.test", Recipients: []MessageRecipient{*recipient}, BodyText: "body"}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "\r\nBcc:")
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	encoded := message.Header.Get("X-Msgvault-Unresolved-Recipient")
+	require.NotEmpty(t, encoded)
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.Join(strings.Fields(encoded), ""))
+	require.NoError(t, err)
+	var preserved struct {
+		Role        int32  `json:"role"`
+		Name        string `json:"name"`
+		AddressType string `json:"address_type"`
+		Address     string `json:"address"`
+	}
+	require.NoError(t, json.Unmarshal(decoded, &preserved))
+	assert.Equal(t, int32(1), preserved.Role)
+	assert.Equal(t, "José\r\nBcc: injected@example.test", preserved.Name)
+	assert.Equal(t, "EX", preserved.AddressType)
+	assert.Equal(t, "/O=EXAMPLE/CN=JOSE", preserved.Address)
+	assert.Empty(t, message.Header.Get("To"), "an unresolved display name must not become an email address")
+	assert.NotEmpty(t, message.Header.Get("X-Msgvault-Unresolved-Recipient-Name"))
+}
+
+func TestBuildRFC5322_ValidAndUnresolvedRecipientsShareRole(t *testing.T) {
+	unresolved, err := makeMessageRecipient(2, "Unknown person", "SMTP", "malformed address", "also malformed")
+	require.NoError(t, err)
+	msg := &MessageEntry{
+		TransportHeaders: "From: sender@example.test\r\nCc: existing@example.test\r\n",
+		Recipients:       []MessageRecipient{*unresolved, {Name: "New", Email: "new@example.test", Role: 2}},
+		BodyText:         "body",
+	}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	cc, err := message.Header.AddressList("Cc")
+	require.NoError(t, err)
+	require.Len(t, cc, 2)
+	assert.Equal(t, "existing@example.test", cc[0].Address)
+	assert.Equal(t, "new@example.test", cc[1].Address)
+	assert.Contains(t, message.Header.Get("X-Msgvault-Unresolved-Recipient-Name"), "Unknown person")
+	encoded := message.Header.Get("X-Msgvault-Unresolved-Recipient")
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.Join(strings.Fields(encoded), ""))
+	require.NoError(t, err)
+	var preserved struct {
+		Role    int32  `json:"role"`
+		Address string `json:"address"`
+		SMTP    string `json:"smtp"`
+	}
+	require.NoError(t, json.Unmarshal(decoded, &preserved))
+	assert.Equal(t, int32(2), preserved.Role)
+	assert.Equal(t, "malformed address", preserved.Address)
+	assert.Equal(t, "also malformed", preserved.SMTP)
+}
+
+func TestBuildRFC5322_ExistingNameOnlyDoesNotBecomeAddress(t *testing.T) {
+	msg := &MessageEntry{
+		TransportHeaders: "From: sender@example.test\r\nTo: Unresolved Person\r\n",
+		Recipients:       []MessageRecipient{{Name: "Unresolved Person", Role: 1, Unresolved: true, AddressType: "EX", RawAddress: "/O=EXAMPLE/CN=PERSON"}},
+	}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Equal(t, "Unresolved Person", message.Header.Get("X-Msgvault-Original-To"))
+	assert.Empty(t, message.Header.Get("To"), "the display name is not a verified email address")
+	assert.Contains(t, message.Header.Get("X-Msgvault-Unresolved-Recipient-Name"), "Unresolved Person")
 }
 
 func TestBuildRFC5322_MalformedTransportFallback(t *testing.T) {
