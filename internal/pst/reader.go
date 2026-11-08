@@ -580,6 +580,10 @@ type MessageEntry struct {
 	// EntryID is the PST node identifier, used as part of the dedup key.
 	EntryID string
 
+	// PSTArchiveID scopes generated calendar identifiers to the source archive.
+	PSTArchiveID string
+	meetingICS   *meetingICSData
+
 	// FolderPath is the slash-separated folder path this message came from.
 	FolderPath string
 
@@ -787,13 +791,18 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		}
 	}
 	var calendarAttachment *AttachmentEntry
+	var calendarICS *meetingICSData
 	if meetingRequest {
 		var err error
 		calendarAttachment, err = meetingCalendarAttachment(msg)
 		bodyErr = errors.Join(bodyErr, err)
+		if err == nil {
+			calendarICS = readMeetingICSData(msg)
+		}
 	}
 	return &MessageEntry{
 		EntryID:            fmt.Sprintf("%d", msg.Identifier),
+		meetingICS:         calendarICS,
 		FolderPath:         folderPath,
 		Subject:            subject,
 		TransportHeaders:   transportHeaders,

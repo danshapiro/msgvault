@@ -529,6 +529,7 @@ func importPstWithBatchSize(
 				// Not an email (calendar, contact, task, etc.) — skip silently.
 				continue
 			}
+			entry.PSTArchiveID = archiveID
 			if propertyErr := errors.Join(entry.DateError, entry.BodyError, entry.HeaderError); propertyErr != nil {
 				cp.ErrorsCount++
 				summary.Errors++
@@ -553,6 +554,9 @@ func importPstWithBatchSize(
 				hardErrors = true
 				log.Warn("read attachments failed", "entry_id", entry.EntryID, "error", err)
 				continue
+			}
+			if reason := entry.MeetingICSOmission(attachments); reason != "" {
+				log.Warn("PST meeting calendar could not be generated; original properties retained", "entry_id", entry.EntryID, "reason", reason)
 			}
 
 			raw, err := pstreader.BuildRFC5322(entry, attachments)
