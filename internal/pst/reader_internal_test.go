@@ -3,6 +3,7 @@ package pst
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"mime/quotedprintable"
 	"net/mail"
@@ -315,14 +316,44 @@ func TestExtractMessage_String8Headers(t *testing.T) {
 	assert.Equal(t, "To: receiver@example.test\r\n", entry.TransportHeaders)
 }
 
-func TestExtractMessage_ExchangeSenderRequiresSMTP(t *testing.T) {
-	name := "/O=EXAMPLE/OU=EXCHANGE/CN=ALICE"
-	typ := "EX"
-	msg := &pstlib.Message{Properties: &properties.Message{SenderEmailAddress: &name, SenderAddressType: &typ}}
-	entry := ExtractMessage(msg, "Inbox")
-	require.NotNil(t, entry)
-	assert.ErrorContains(t, entry.HeaderError, "unresolved Exchange")
-	assert.Empty(t, entry.SenderEmail)
+func TestExtractMessage_ExchangeIdentities(t *testing.T) {
+	senderName, senderDN, senderType := "Sender Name", "/O=EXAMPLE/CN=SENDER", "EX"
+	authorName, authorDN, authorType := "Author Name", "/O=EXAMPLE/CN=AUTHOR", "EX"
+	tests := []struct {
+		name                     string
+		props                    *properties.Message
+		additional               []pstlib.Property
+		wantSender, wantAuthor   *UnresolvedIdentity
+		senderEmail, authorEmail string
+	}{
+		{name: "sender only", props: &properties.Message{SenderName: &senderName, SenderEmailAddress: &senderDN, SenderAddressType: &senderType}, wantSender: &UnresolvedIdentity{Name: senderName, AddressType: senderType, RawAddress: senderDN}},
+		{name: "represented author only", props: &properties.Message{SentRepresentingName: &authorName, SentRepresentingEmailAddress: &authorDN, SentRepresentingAddressType: &authorType}, wantAuthor: &UnresolvedIdentity{Name: authorName, AddressType: authorType, RawAddress: authorDN}},
+		{name: "both", props: &properties.Message{SenderName: &senderName, SenderEmailAddress: &senderDN, SenderAddressType: &senderType, SentRepresentingName: &authorName, SentRepresentingEmailAddress: &authorDN, SentRepresentingAddressType: &authorType}, wantSender: &UnresolvedIdentity{Name: senderName, AddressType: senderType, RawAddress: senderDN}, wantAuthor: &UnresolvedIdentity{Name: authorName, AddressType: authorType, RawAddress: authorDN}},
+		{name: "SMTP overrides Exchange", props: &properties.Message{SenderName: &senderName, SenderEmailAddress: &senderDN, SenderAddressType: &senderType, SentRepresentingName: &authorName, SentRepresentingEmailAddress: &authorDN, SentRepresentingAddressType: &authorType}, additional: []pstlib.Property{{ID: 0x5d01, Type: pstlib.PropertyTypeString8, Data: []byte("sender@example.test\x00")}, {ID: 0x5d02, Type: pstlib.PropertyTypeString8, Data: []byte("author@example.test\x00")}}, senderEmail: "sender@example.test", authorEmail: "author@example.test"},
+		{name: "invalid SMTP does not hide Exchange", props: &properties.Message{SenderName: &senderName, SenderEmailAddress: &senderDN, SenderAddressType: &senderType}, additional: []pstlib.Property{{ID: 0x5d01, Type: pstlib.PropertyTypeString8, Data: []byte("not an address\x00")}}, wantSender: &UnresolvedIdentity{Name: senderName, AddressType: senderType, RawAddress: senderDN, RawSMTP: "not an address"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := ExtractMessage(&pstlib.Message{Properties: tc.props, PropertyContext: &pstlib.PropertyContext{Properties: tc.additional}}, "Inbox")
+			require.NotNil(t, entry)
+			require.NoError(t, entry.HeaderError)
+			assert.Equal(t, tc.wantSender, entry.UnresolvedSender)
+			assert.Equal(t, tc.wantAuthor, entry.UnresolvedAuthor)
+			assert.Equal(t, tc.senderEmail, entry.SenderEmail)
+			assert.Equal(t, tc.authorEmail, entry.AuthorEmail)
+		})
+	}
+}
+
+func TestExtractMessage_ExchangeIdentityReadErrors(t *testing.T) {
+	for _, id := range []uint16{0x0c1a, 0x0c1e, 0x0c1f, 0x5d01, 0x0042, 0x0064, 0x0065, 0x5d02} {
+		t.Run(fmt.Sprintf("property_%04x", id), func(t *testing.T) {
+			msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{{ID: id, Type: pstlib.PropertyTypeString, Data: []byte{1}}}}}
+			entry := ExtractMessage(msg, "Inbox")
+			require.NotNil(t, entry)
+			assert.ErrorContains(t, entry.HeaderError, "odd-length Unicode MAPI string")
+		})
+	}
 }
 
 func TestMakeMessageRecipient(t *testing.T) {

@@ -509,6 +509,12 @@ type FolderEntry struct {
 	MsgCount int32
 }
 
+// UnresolvedIdentity retains an Exchange identity for which no usable SMTP
+// address was available. Its values are preserved as data, not email headers.
+type UnresolvedIdentity struct {
+	Name, AddressType, RawAddress, RawSMTP string
+}
+
 // MessageEntry holds the extracted email properties from a PST message.
 type MessageEntry struct {
 	// EntryID is the PST node identifier, used as part of the dedup key.
@@ -536,8 +542,10 @@ type MessageEntry struct {
 	SenderAddressType string // "SMTP" or "EX" (Exchange DN)
 	AuthorName        string // Sent-representing identity, when present
 	AuthorEmail       string
+	UnresolvedSender  *UnresolvedIdentity
+	UnresolvedAuthor  *UnresolvedIdentity
 	Recipients        []MessageRecipient
-	HeaderError       error // unreadable or unresolved MAPI header data
+	HeaderError       error // unreadable MAPI header data
 
 	// DisplayTo/Cc/Bcc are semicolon-separated display names from MAPI.
 	// Email addresses must be parsed from TransportHeaders when available.
@@ -663,19 +671,8 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 	authorType := readString(0x0064, props.GetSentRepresentingAddressType())
 	authorEmail := readString(0x0065, props.GetSentRepresentingEmailAddress())
 	authorSMTP := readString(0x5d02, "")
-	if senderSMTP != "" {
-		senderEmail = senderSMTP
-	} else if isExchangeDN(senderEmail) || strings.EqualFold(senderType, "EX") {
-		// Do not fabricate an address from an Exchange distinguished name.
-		headerErrors = append(headerErrors, errors.New("sender has unresolved Exchange address"))
-		senderEmail = ""
-	}
-	if authorSMTP != "" {
-		authorEmail = authorSMTP
-	} else if isExchangeDN(authorEmail) || strings.EqualFold(authorType, "EX") {
-		headerErrors = append(headerErrors, errors.New("represented author has unresolved Exchange address"))
-		authorEmail = ""
-	}
+	senderEmail, unresolvedSender := resolveMessageIdentity(senderName, senderType, senderEmail, senderSMTP)
+	authorEmail, unresolvedAuthor := resolveMessageIdentity(authorName, authorType, authorEmail, authorSMTP)
 	transportHeaders := readString(0x007d, props.GetTransportMessageHeaders())
 	displayTo := readString(0x0e04, props.GetDisplayTo())
 	displayCc := readString(0x0e03, props.GetDisplayCc())
@@ -714,6 +711,8 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		SenderAddressType: senderType,
 		AuthorName:        authorName,
 		AuthorEmail:       authorEmail,
+		UnresolvedSender:  unresolvedSender,
+		UnresolvedAuthor:  unresolvedAuthor,
 		Recipients:        recipients,
 		HeaderError:       errors.Join(headerErrors...),
 		DisplayTo:         displayTo,
@@ -727,6 +726,22 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		CreationTime:      createdAt,
 		DateError:         errors.Join(sentErr, receivedErr, createdErr),
 	}
+}
+
+// resolveMessageIdentity prefers a usable SMTP override to an Exchange value.
+// An unresolved Exchange value is retained separately instead of being used as
+// an email address or being treated as a property read error.
+func resolveMessageIdentity(name, addrType, email, smtp string) (string, *UnresolvedIdentity) {
+	if isExchangeDN(email) || strings.EqualFold(addrType, "EX") {
+		if parsed, err := mail.ParseAddress(strings.TrimSpace(smtp)); err == nil && strings.Contains(parsed.Address, "@") {
+			return parsed.Address, nil
+		}
+		return "", &UnresolvedIdentity{Name: name, AddressType: addrType, RawAddress: email, RawSMTP: smtp}
+	}
+	if smtp != "" {
+		return smtp, nil
+	}
+	return email, nil
 }
 
 var errAttachmentTooLarge = errors.New("attachment exceeds size limit")

@@ -38,6 +38,9 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 	} else {
 		writeSynthesizedHeaders(&headerBuf, msg)
 	}
+	if err := writeUnresolvedIdentityHeaders(&headerBuf, msg); err != nil {
+		return nil, err
+	}
 	if err := writeUnresolvedRecipientHeaders(&headerBuf, msg); err != nil {
 		return nil, err
 	}
@@ -326,6 +329,48 @@ func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[stri
 	}
 }
 
+// writeEncodedMetadataHeader preserves source values without letting their
+// contents create headers. Folding keeps even long values within line limits.
+func writeEncodedMetadataHeader(buf *bytes.Buffer, header string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(data)
+	buf.WriteString(header + ": ")
+	for len(encoded) > 72 {
+		buf.WriteString(encoded[:72])
+		buf.WriteString("\r\n\t")
+		encoded = encoded[72:]
+	}
+	buf.WriteString(encoded + "\r\n")
+	return nil
+}
+
+func writeUnresolvedIdentityHeaders(buf *bytes.Buffer, msg *MessageEntry) error {
+	for _, item := range []struct {
+		header   string
+		identity *UnresolvedIdentity
+	}{
+		{"X-Msgvault-Unresolved-Sender", msg.UnresolvedSender},
+		{"X-Msgvault-Unresolved-Author", msg.UnresolvedAuthor},
+	} {
+		if item.identity == nil {
+			continue
+		}
+		identity := item.identity
+		if err := writeEncodedMetadataHeader(buf, item.header, struct {
+			Name        string `json:"name"`
+			AddressType string `json:"address_type"`
+			Address     string `json:"address"`
+			SMTP        string `json:"smtp"`
+		}{identity.Name, identity.AddressType, identity.RawAddress, identity.RawSMTP}); err != nil {
+			return fmt.Errorf("encode %s: %w", item.header, err)
+		}
+	}
+	return nil
+}
+
 // Keep unresolved MAPI facts in raw MIME without placing an unverified value
 // in an email-address field. Base64url makes controls and line breaks safe.
 func writeUnresolvedRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry) error {
@@ -348,24 +393,15 @@ func writeUnresolvedRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry) error
 			role := map[int32]string{1: "To", 2: "Cc", 3: "Bcc"}[recipient.Role]
 			writeHeader(buf, "X-Msgvault-Unresolved-Recipient-Name", mime.QEncoding.Encode("utf-8", role+": "+name))
 		}
-		value, err := json.Marshal(struct {
+		if err := writeEncodedMetadataHeader(buf, "X-Msgvault-Unresolved-Recipient", struct {
 			Role        int32  `json:"role"`
 			Name        string `json:"name"`
 			AddressType string `json:"address_type"`
 			Address     string `json:"address"`
 			SMTP        string `json:"smtp"`
-		}{recipient.Role, recipient.Name, recipient.AddressType, recipient.RawAddress, recipient.RawSMTP})
-		if err != nil {
+		}{recipient.Role, recipient.Name, recipient.AddressType, recipient.RawAddress, recipient.RawSMTP}); err != nil {
 			return fmt.Errorf("encode unresolved recipient: %w", err)
 		}
-		encoded := base64.RawURLEncoding.EncodeToString(value)
-		buf.WriteString("X-Msgvault-Unresolved-Recipient: ")
-		for len(encoded) > 72 {
-			buf.WriteString(encoded[:72])
-			buf.WriteString("\r\n\t")
-			encoded = encoded[72:]
-		}
-		buf.WriteString(encoded + "\r\n")
 	}
 	return nil
 }
@@ -376,7 +412,7 @@ func writeSynthesizedHeaders(buf *bytes.Buffer, msg *MessageEntry) {
 	if author := fallbackAuthor(msg); author != nil {
 		writeHeader(buf, "From", author.String())
 		writeRepresentingSender(buf, msg)
-	} else {
+	} else if msg.UnresolvedSender == nil && msg.UnresolvedAuthor == nil {
 		writeHeader(buf, "From", formatAddr(msg.SenderName, msg.SenderEmail))
 	}
 	writeRecipientHeaders(buf, msg, nil)

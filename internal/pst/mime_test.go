@@ -573,3 +573,58 @@ func TestBuildRFC5322_ThreadingFallbackRejectsHeaderInjection(t *testing.T) {
 		assert.Empty(t, parsed.Header.Get("Bcc"))
 	}
 }
+
+func TestBuildRFC5322_PreservesUnresolvedIdentities(t *testing.T) {
+	longName := strings.Repeat("郵便", 300) + "\r\nBcc: injected@example.test"
+	sender := &UnresolvedIdentity{Name: longName, AddressType: "EX\r\nX-Injected: type", RawAddress: "/O=EXAMPLE/CN=SENDER\nX-Injected: address", RawSMTP: "bad\r\nX-Injected: smtp"}
+	author := &UnresolvedIdentity{Name: "Author\nX-Injected: name", AddressType: "EX", RawAddress: "/O=EXAMPLE/CN=AUTHOR"}
+	for _, tc := range []struct {
+		name, transport, from string
+		sender, author        *UnresolvedIdentity
+	}{
+		{"sender synthesized", "", "", sender, nil},
+		{"author synthesized", "", "", nil, author},
+		{"both synthesized", "", "", sender, author},
+		{"both transport", "From: valid@example.test\r\n", "valid@example.test", sender, author},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := &MessageEntry{TransportHeaders: tc.transport, SenderName: longName, UnresolvedSender: tc.sender, UnresolvedAuthor: tc.author, BodyText: "body"}
+			raw, err := BuildRFC5322(entry, nil)
+			require.NoError(t, err)
+			parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+			require.NoError(t, err)
+			assert.Equal(t, tc.from, parsed.Header.Get("From"))
+			assert.Empty(t, parsed.Header.Get("Bcc"))
+			assert.Empty(t, parsed.Header.Get("X-Injected"))
+			for _, identity := range []struct {
+				field string
+				want  *UnresolvedIdentity
+			}{
+				{"X-Msgvault-Unresolved-Sender", tc.sender}, {"X-Msgvault-Unresolved-Author", tc.author},
+			} {
+				encoded := parsed.Header.Get(identity.field)
+				if identity.want == nil {
+					assert.Empty(t, encoded)
+					continue
+				}
+				require.NotEmpty(t, encoded)
+				decoded, err := base64.RawURLEncoding.DecodeString(strings.Join(strings.Fields(encoded), ""))
+				require.NoError(t, err)
+				var got struct {
+					Name        string `json:"name"`
+					AddressType string `json:"address_type"`
+					Address     string `json:"address"`
+					SMTP        string `json:"smtp"`
+				}
+				require.NoError(t, json.Unmarshal(decoded, &got))
+				assert.Equal(t, identity.want.Name, got.Name)
+				assert.Equal(t, identity.want.AddressType, got.AddressType)
+				assert.Equal(t, identity.want.RawAddress, got.Address)
+				assert.Equal(t, identity.want.RawSMTP, got.SMTP)
+			}
+			for line := range strings.SplitSeq(string(raw), "\r\n") {
+				assert.LessOrEqual(t, len(line), 998, "header line length")
+			}
+		})
+	}
+}
