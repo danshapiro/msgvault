@@ -49,7 +49,7 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 		return nil, err
 	}
 
-	if msg.RawHTMLAttachment != nil || msg.RawRTFAttachment != nil {
+	if msg.RawHTMLAttachment != nil || msg.RawRTFAttachment != nil || msg.CalendarAttachment != nil {
 		// Keep the caller's attachment slice unchanged, including any spare
 		// capacity in its backing array.
 		attachments = append([]AttachmentEntry(nil), attachments...)
@@ -58,6 +58,9 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 		}
 		if msg.RawRTFAttachment != nil {
 			attachments = append(attachments, *msg.RawRTFAttachment)
+		}
+		if msg.CalendarAttachment != nil {
+			attachments = append(attachments, *msg.CalendarAttachment)
 		}
 	}
 

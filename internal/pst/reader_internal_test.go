@@ -9,6 +9,8 @@ import (
 	"net/mail"
 	"path/filepath"
 	"testing"
+	"time"
+	"unicode/utf16"
 
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
 	"github.com/mooijtech/go-pst/v6/pkg/properties"
@@ -84,6 +86,75 @@ func TestWalkFolders_MatchesLibraryTraversalWithoutSearchFolders(t *testing.T) {
 	require.NoError(err, "go-pst WalkFolders")
 	require.Less(len(want), len(all))
 	assert.Equal(want, got)
+}
+
+func TestExtractMessage_MeetingRequest(t *testing.T) {
+	unicodeProperty := func(id uint16, value string) pstlib.Property {
+		var data []byte
+		for _, unit := range utf16.Encode([]rune(value + "\x00")) {
+			data = binary.LittleEndian.AppendUint16(data, unit)
+		}
+		return pstlib.Property{ID: id, Type: pstlib.PropertyTypeString, Data: data}
+	}
+	filetime := make([]byte, 8)
+	binary.LittleEndian.PutUint64(filetime, uint64((time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC).Unix()+11644473600)*10000000))
+	props := []pstlib.Property{
+		unicodeProperty(0x001a, "IPM.Schedule.Meeting.Request"),
+		unicodeProperty(0x0037, "Réunion"),
+		unicodeProperty(0x0c1a, "Sender"),
+		unicodeProperty(0x0c1e, "EX"),
+		unicodeProperty(0x0c1f, "/O=EXAMPLE/CN=SENDER"),
+		unicodeProperty(0x007d, "From: person@example.test\r\n"),
+		unicodeProperty(0x1035, "<meeting@example.test>"),
+		unicodeProperty(0x1000, "Meeting body 日本語"),
+		unicodeProperty(0x1013, "<p>Meeting body 日本語</p>"),
+		{ID: 0x0039, Type: pstlib.PropertyTypeTime, Data: filetime},
+	}
+	entry := ExtractMessage(&pstlib.Message{Properties: &properties.Appointment{}, PropertyContext: &pstlib.PropertyContext{Properties: props}}, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.HeaderError)
+	require.NoError(t, entry.BodyError)
+	require.NoError(t, entry.DateError)
+	assert.Equal(t, "Réunion", entry.Subject)
+	assert.Equal(t, "From: person@example.test\r\n", entry.TransportHeaders)
+	assert.Equal(t, "<meeting@example.test>", entry.MessageID)
+	assert.Equal(t, "Meeting body 日本語", entry.BodyText)
+	assert.Equal(t, "<p>Meeting body 日本語</p>", entry.BodyHTML)
+	assert.Equal(t, time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC), entry.SentAt)
+	assert.Equal(t, &UnresolvedIdentity{Name: "Sender", AddressType: "EX", RawAddress: "/O=EXAMPLE/CN=SENDER"}, entry.UnresolvedSender)
+}
+
+func TestExtractMessage_AppointmentClasses(t *testing.T) {
+	for _, class := range []string{"", "IPM.Appointment", "IPM.Schedule.Meeting", "IPM.Schedule.Meeting.Request.Custom"} {
+		t.Run(class, func(t *testing.T) {
+			msg := &pstlib.Message{Properties: &properties.Appointment{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{{ID: 0x001a, Type: pstlib.PropertyTypeString8, Data: []byte(class + "\x00")}}}}
+			assert.Nil(t, ExtractMessage(msg, "Inbox"))
+		})
+	}
+	msg := &pstlib.Message{Properties: &properties.Appointment{}, PropertyContext: &pstlib.PropertyContext{}}
+	assert.Nil(t, ExtractMessage(msg, "Inbox"))
+	msg.PropertyContext.Properties = []pstlib.Property{{ID: 0x001a, Type: pstlib.PropertyTypeString, Data: []byte{1}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.ErrorContains(t, entry.HeaderError, "odd-length Unicode MAPI string")
+	msg.PropertyContext.Properties[0] = pstlib.Property{ID: 0x001a, Type: pstlib.PropertyTypeInteger32, Data: []byte{1, 0, 0, 0}}
+	entry = ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.ErrorContains(t, entry.HeaderError, "unexpected type")
+}
+
+func TestExtractMessage_MeetingUnicodeBodyReadErrors(t *testing.T) {
+	for _, id := range []uint16{0x1000, 0x1013} {
+		t.Run(fmt.Sprintf("property_%04x", id), func(t *testing.T) {
+			msg := &pstlib.Message{Properties: &properties.Appointment{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+				{ID: 0x001a, Type: pstlib.PropertyTypeString8, Data: []byte("IPM.Schedule.Meeting.Request\x00")},
+				{ID: id, Type: pstlib.PropertyTypeString, Data: []byte{1}},
+			}}}
+			entry := ExtractMessage(msg, "Inbox")
+			require.NotNil(t, entry)
+			require.ErrorContains(t, entry.BodyError, "odd-length Unicode MAPI string")
+		})
+	}
 }
 
 func TestExtractMessage_ThreadingProperties(t *testing.T) {

@@ -205,9 +205,8 @@ func messageHTML(msg *pstlib.Message, decoded string) (string, *AttachmentEntry,
 		return "", nil, fmt.Errorf("find HTML body: %w", err)
 	}
 	if prop.Type == pstlib.PropertyTypeString {
-		// The generated Unicode property is already populated, including an
-		// intentionally empty string.
-		return decoded, nil, nil
+		value, err := propertyString(msg, 0x1013, decoded)
+		return value, nil, err
 	}
 	if prop.Type != pstlib.PropertyTypeBinary && prop.Type != pstlib.PropertyTypeString8 {
 		return "", nil, fmt.Errorf("HTML body has unexpected property type %v", prop.Type)
@@ -323,7 +322,7 @@ func messageText(msg *pstlib.Message, decoded string) (string, error) {
 		return "", fmt.Errorf("find text body: %w", err)
 	}
 	if prop.Type == pstlib.PropertyTypeString {
-		return decoded, nil
+		return propertyString(msg, 0x1000, decoded)
 	}
 	if prop.Type != pstlib.PropertyTypeString8 {
 		return "", fmt.Errorf("text body has unexpected property type %v", prop.Type)
@@ -593,11 +592,12 @@ type MessageEntry struct {
 	TransportHeaders string
 
 	// Body content.
-	BodyText          string
-	BodyHTML          string
-	BodyError         error            // unreadable or unsupported body, if any
-	RawHTMLAttachment *AttachmentEntry // original bytes when HTML cannot be decoded losslessly
-	RawRTFAttachment  *AttachmentEntry // compressed RTF retained when neither HTML nor text can be decoded
+	BodyText           string
+	BodyHTML           string
+	BodyError          error            // unreadable or unsupported body, if any
+	RawHTMLAttachment  *AttachmentEntry // original bytes when HTML cannot be decoded losslessly
+	RawRTFAttachment   *AttachmentEntry // compressed RTF retained when neither HTML nor text can be decoded
+	CalendarAttachment *AttachmentEntry // structured calendar data retained from meeting requests
 
 	// Sender fields.
 	SenderName        string
@@ -704,13 +704,27 @@ func walkFoldersRecursive(folder *pstlib.Folder, parentPath string, fn WalkFolde
 
 // ExtractMessage extracts email properties from a pstlib.Message.
 // Returns nil if the message is not an email (e.g. calendar, contact, task).
+// Meeting requests are emails even though go-pst classifies them as appointments.
 func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 	props, ok := msg.Properties.(*properties.Message)
-	if !ok {
-		return nil
-	}
-
 	var headerErrors []error
+	var meetingRequest bool
+	if !ok {
+		if _, appointment := msg.Properties.(*properties.Appointment); !appointment {
+			return nil
+		}
+		class, err := propertyString(msg, 0x001a, "")
+		if err != nil {
+			headerErrors = append(headerErrors, fmt.Errorf("read message class: %w", err))
+		} else if class != "IPM.Schedule.Meeting.Request" {
+			return nil
+		} else {
+			meetingRequest = true
+		}
+		// Appointment properties do not include the usual email fields. Read
+		// them from the original property context below.
+		props = &properties.Message{}
+	}
 	readString := func(id uint16, fallback string) string {
 		value, err := propertyString(msg, id, fallback)
 		if err != nil {
@@ -772,35 +786,42 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 			bodyErr = fmt.Errorf("find RTF body: %w", err)
 		}
 	}
+	var calendarAttachment *AttachmentEntry
+	if meetingRequest {
+		var err error
+		calendarAttachment, err = meetingCalendarAttachment(msg)
+		bodyErr = errors.Join(bodyErr, err)
+	}
 	return &MessageEntry{
-		EntryID:           fmt.Sprintf("%d", msg.Identifier),
-		FolderPath:        folderPath,
-		Subject:           subject,
-		TransportHeaders:  transportHeaders,
-		BodyText:          bodyText,
-		BodyHTML:          bodyHTML,
-		RawHTMLAttachment: rawHTML,
-		RawRTFAttachment:  rawRTF,
-		BodyError:         bodyErr,
-		SenderName:        senderName,
-		SenderEmail:       senderEmail,
-		SenderAddressType: senderType,
-		AuthorName:        authorName,
-		AuthorEmail:       authorEmail,
-		UnresolvedSender:  unresolvedSender,
-		UnresolvedAuthor:  unresolvedAuthor,
-		Recipients:        recipients,
-		HeaderError:       errors.Join(headerErrors...),
-		DisplayTo:         displayTo,
-		DisplayCc:         displayCc,
-		DisplayBcc:        displayBcc,
-		MessageID:         messageID,
-		InReplyTo:         inReplyTo,
-		References:        references,
-		SentAt:            sentAt,
-		ReceivedAt:        receivedAt,
-		CreationTime:      createdAt,
-		DateError:         errors.Join(sentErr, receivedErr, createdErr),
+		EntryID:            fmt.Sprintf("%d", msg.Identifier),
+		FolderPath:         folderPath,
+		Subject:            subject,
+		TransportHeaders:   transportHeaders,
+		BodyText:           bodyText,
+		BodyHTML:           bodyHTML,
+		RawHTMLAttachment:  rawHTML,
+		RawRTFAttachment:   rawRTF,
+		CalendarAttachment: calendarAttachment,
+		BodyError:          bodyErr,
+		SenderName:         senderName,
+		SenderEmail:        senderEmail,
+		SenderAddressType:  senderType,
+		AuthorName:         authorName,
+		AuthorEmail:        authorEmail,
+		UnresolvedSender:   unresolvedSender,
+		UnresolvedAuthor:   unresolvedAuthor,
+		Recipients:         recipients,
+		HeaderError:        errors.Join(headerErrors...),
+		DisplayTo:          displayTo,
+		DisplayCc:          displayCc,
+		DisplayBcc:         displayBcc,
+		MessageID:          messageID,
+		InReplyTo:          inReplyTo,
+		References:         references,
+		SentAt:             sentAt,
+		ReceivedAt:         receivedAt,
+		CreationTime:       createdAt,
+		DateError:          errors.Join(sentErr, receivedErr, createdErr),
 	}
 }
 
