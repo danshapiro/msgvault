@@ -247,7 +247,75 @@ func TestExtractMessage_RealBinaryHTML(t *testing.T) {
 		}
 		return iter.Err()
 	}))
-	if found == 0 {
-		t.Skip("fixture does not contain a binary HTML body")
-	}
+	assert.Positive(t, found, "fixture must contain a binary HTML body")
+}
+
+func TestExtractMessage_RealRecipientTable(t *testing.T) {
+	f, err := Open(filepath.Join("testdata", "support.pst"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, f.Close()) })
+	totalMessages, totalRecipients := 0, 0
+	require.NoError(t, f.WalkFolders(func(folder FolderEntry, rawFolder *pstlib.Folder) error {
+		if folder.MsgCount == 0 {
+			return nil
+		}
+		iter, err := rawFolder.GetMessageIterator()
+		if err != nil {
+			return err
+		}
+		for iter.Next() {
+			entry := ExtractMessage(iter.Value(), folder.Path)
+			if entry == nil {
+				continue
+			}
+			require.NoError(t, entry.HeaderError)
+			totalMessages++
+			totalRecipients += len(entry.Recipients)
+		}
+		return iter.Err()
+	}))
+	assert.Equal(t, 17, totalMessages)
+	assert.Equal(t, 1073, totalRecipients)
+}
+
+func TestExtractMessage_String8Headers(t *testing.T) {
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x0037, Type: pstlib.PropertyTypeString8, Data: []byte("caf\xe9 subject\x00")},
+		{ID: 0x0c1a, Type: pstlib.PropertyTypeString8, Data: []byte("Jos\xe9\x00")},
+		{ID: 0x0c1f, Type: pstlib.PropertyTypeString8, Data: []byte("sender@example.test\x00")},
+		{ID: 0x007d, Type: pstlib.PropertyTypeString8, Data: []byte("To: receiver@example.test\r\n\x00")},
+		{ID: 0x3ffd, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xe4, 0x04, 0, 0}},
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.HeaderError)
+	assert.Equal(t, "café subject", entry.Subject)
+	assert.Equal(t, "José", entry.SenderName)
+	assert.Equal(t, "sender@example.test", entry.SenderEmail)
+	assert.Equal(t, "To: receiver@example.test\r\n", entry.TransportHeaders)
+}
+
+func TestExtractMessage_ExchangeSenderRequiresSMTP(t *testing.T) {
+	name := "/O=EXAMPLE/OU=EXCHANGE/CN=ALICE"
+	typ := "EX"
+	msg := &pstlib.Message{Properties: &properties.Message{SenderEmailAddress: &name, SenderAddressType: &typ}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	assert.ErrorContains(t, entry.HeaderError, "unresolved Exchange")
+	assert.Empty(t, entry.SenderEmail)
+}
+
+func TestMakeMessageRecipient(t *testing.T) {
+	r, err := makeMessageRecipient(2, "Alice", "SMTP", "alice@example.test", "")
+	require.NoError(t, err)
+	assert.Equal(t, &MessageRecipient{Name: "Alice", Email: "alice@example.test", Role: 2}, r)
+	r, err = makeMessageRecipient(3, "Bob", "EX", "/O=EXAMPLE/CN=BOB", "bob@example.test")
+	require.NoError(t, err)
+	assert.Equal(t, &MessageRecipient{Name: "Bob", Email: "bob@example.test", Role: 3}, r)
+	_, err = makeMessageRecipient(1, "Bob", "EX", "/O=EXAMPLE/CN=BOB", "")
+	assert.ErrorContains(t, err, `address type "EX"`)
+	assert.NotContains(t, err.Error(), "/O=EXAMPLE")
+	r, err = makeMessageRecipient(0, "", "", "", "")
+	require.NoError(t, err)
+	assert.Nil(t, r)
 }

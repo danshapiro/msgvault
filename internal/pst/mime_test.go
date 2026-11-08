@@ -211,6 +211,85 @@ func TestBuildRFC5322_TransportHeaders(t *testing.T) {
 	assert.Contains(s, "multipart/alternative", "expected multipart/alternative for text+html body")
 }
 
+func TestBuildRFC5322_MergesMAPIHeadersByRole(t *testing.T) {
+	msg := &MessageEntry{
+		TransportHeaders: "From: original@example.test\r\nTo: Bob <bob@example.test>\r\nBcc: hidden@example.test\r\n",
+		Subject:          "Recovered subject",
+		SenderEmail:      "fallback@example.test",
+		Recipients: []MessageRecipient{
+			{Name: "Duplicate", Email: "BOB@example.test", Role: 1},
+			{Name: "Alice", Email: "alice@example.test", Role: 1},
+			{Name: "Alice", Email: "alice@example.test", Role: 2},
+			{Name: "Secret", Email: "secret@example.test", Role: 3},
+		},
+		BodyText: "body",
+	}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Equal(t, "original@example.test", message.Header.Get("From"))
+	assert.Equal(t, "Recovered subject", message.Header.Get("Subject"))
+	to, err := message.Header.AddressList("To")
+	require.NoError(t, err)
+	require.Len(t, to, 2)
+	assert.Equal(t, "bob@example.test", to[0].Address)
+	assert.Equal(t, "alice@example.test", to[1].Address)
+	cc, err := message.Header.AddressList("Cc")
+	require.NoError(t, err)
+	require.Len(t, cc, 1)
+	assert.Equal(t, "alice@example.test", cc[0].Address)
+	bcc, err := message.Header.AddressList("Bcc")
+	require.NoError(t, err)
+	require.Len(t, bcc, 2)
+	assert.Equal(t, "hidden@example.test", bcc[0].Address)
+	assert.Equal(t, "secret@example.test", bcc[1].Address)
+}
+
+func TestBuildRFC5322_MalformedTransportFallback(t *testing.T) {
+	msg := &MessageEntry{
+		TransportHeaders: "From: broken <\r\nTo: invalid <\r\nSubject: \r\n",
+		SenderName:       "Sender", SenderEmail: "sender@example.test", Subject: "Recovered",
+		Recipients: []MessageRecipient{{Name: "Recipient", Email: "recipient@example.test", Role: 1}},
+	}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	from, err := message.Header.AddressList("From")
+	require.NoError(t, err)
+	assert.Equal(t, "sender@example.test", from[0].Address)
+	to, err := message.Header.AddressList("To")
+	require.NoError(t, err)
+	assert.Equal(t, "recipient@example.test", to[0].Address)
+	assert.Equal(t, "Recovered", message.Header.Get("Subject"))
+	assert.Equal(t, "broken <", message.Header.Get("X-Msgvault-Original-From"))
+	assert.Equal(t, "invalid <", message.Header.Get("X-Msgvault-Original-To"))
+}
+
+func TestBuildRFC5322_SentOnBehalf(t *testing.T) {
+	msg := &MessageEntry{SenderName: "Assistant", SenderEmail: "assistant@example.test", AuthorName: "Owner", AuthorEmail: "owner@example.test"}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	from, err := message.Header.AddressList("From")
+	require.NoError(t, err)
+	assert.Equal(t, "owner@example.test", from[0].Address)
+	sender, err := message.Header.AddressList("Sender")
+	require.NoError(t, err)
+	assert.Equal(t, "assistant@example.test", sender[0].Address)
+
+	msg.TransportHeaders = "From: owner@example.test\r\nSubject: Test\r\n"
+	raw, err = BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	message, err = mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	sender, err = message.Header.AddressList("Sender")
+	require.NoError(t, err)
+	assert.Equal(t, "assistant@example.test", sender[0].Address)
+}
+
 func TestBuildRFC5322_WithAttachments(t *testing.T) {
 	assert := assert.New(t)
 	msg := &MessageEntry{
@@ -276,6 +355,16 @@ func TestBuildRFC5322_HeaderInjection(t *testing.T) {
 	// injection vector). A sanitized value may still contain "Bcc:" as a
 	// substring within the From address, but not as a new header line.
 	assert.NotContains(t, string(raw), "\r\nBcc:", "header injection: Bcc header was injected via SenderEmail")
+}
+
+func TestBuildRFC5322_SanitizesMAPIHeaderValues(t *testing.T) {
+	msg := &MessageEntry{
+		SenderName: "Sender\r\nBcc: hidden@example.test", SenderEmail: "sender@example.test",
+		Subject: "Subject\r\nBcc: injected@example.test", DisplayTo: "Alice\r\nBcc: injected@example.test",
+	}
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "\r\nBcc:")
 }
 
 func TestSanitizeFilename(t *testing.T) {

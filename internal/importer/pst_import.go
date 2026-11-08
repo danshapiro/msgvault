@@ -529,7 +529,7 @@ func importPstWithBatchSize(
 				// Not an email (calendar, contact, task, etc.) — skip silently.
 				continue
 			}
-			if propertyErr := errors.Join(entry.DateError, entry.BodyError); propertyErr != nil {
+			if propertyErr := errors.Join(entry.DateError, entry.BodyError, entry.HeaderError); propertyErr != nil {
 				cp.ErrorsCount++
 				summary.Errors++
 				checkpointBlocked = true

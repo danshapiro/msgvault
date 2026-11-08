@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net/mail"
 	"os"
 	"slices"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/net/html"
 	htmlcharset "golang.org/x/net/html/charset"
 	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/unicode"
 )
 
 func init() {
@@ -282,6 +284,175 @@ func messageText(msg *pstlib.Message, decoded string) (string, error) {
 	return strings.TrimRight(string(out), "\x00"), nil
 }
 
+// propertyString reads both Unicode and String8 MAPI strings. The generated
+// go-pst fields only contain Unicode values and its String8 default is UTF-8.
+func propertyString(msg *pstlib.Message, id uint16, fallback string) (string, error) {
+	if msg.PropertyContext == nil {
+		return fallback, nil
+	}
+	prop, err := msg.PropertyContext.GetPropertyByID(id)
+	if errors.Is(err, pstlib.ErrPropertyNotFound) {
+		return fallback, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if prop.Type == pstlib.PropertyTypeString && fallback != "" {
+		return fallback, nil
+	}
+	if prop.Type != pstlib.PropertyTypeString && prop.Type != pstlib.PropertyTypeString8 {
+		return "", fmt.Errorf("string property %#x has unexpected type %v", id, prop.Type)
+	}
+	if prop.HNID == 0 && len(prop.Data) == 0 {
+		return "", nil
+	}
+	data, err := bodyPropertyBytes(msg, prop)
+	if err != nil {
+		return "", err
+	}
+	return decodeMAPIString(msg, prop.Type, data)
+}
+
+func decodeMAPIString(msg *pstlib.Message, typ pstlib.PropertyType, data []byte) (string, error) {
+	var dec *encoding.Decoder
+	switch typ {
+	case pstlib.PropertyTypeString:
+		if len(data)%2 != 0 {
+			return "", errors.New("odd-length Unicode MAPI string")
+		}
+		dec = unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
+	case pstlib.PropertyTypeString8:
+		name, err := messageCodepage(msg, 0x3ffd, 0x3fde)
+		if err != nil {
+			return "", err
+		}
+		if name == "" {
+			name = "windows-1252"
+		}
+		enc, _ := htmlcharset.Lookup(name)
+		dec = enc.NewDecoder()
+	default:
+		return "", fmt.Errorf("unexpected MAPI string type %v", typ)
+	}
+	out, err := io.ReadAll(io.LimitReader(dec.Reader(bytes.NewReader(data)), maxPSTBodyBytes+1))
+	if err != nil || len(out) > maxPSTBodyBytes {
+		return "", fmt.Errorf("decode MAPI string: invalid or oversized data: %v", err)
+	}
+	if !utf8.Valid(out) || bytes.Contains(out, []byte("\ufffd")) && !bytes.Contains(data, []byte("\ufffd")) {
+		return "", errors.New("MAPI string contains undecodable characters")
+	}
+	return strings.TrimRight(string(out), "\x00"), nil
+}
+
+// MessageRecipient retains the MAPI role and address independently of the
+// often-incomplete transport headers.
+type MessageRecipient struct {
+	Name, Email string
+	Role        int32 // 1 = To, 2 = Cc, 3 = Bcc
+}
+
+// messageRecipients opens NID_RECIP_TABLE (0x692) from the message's local
+// descriptors using the same primitives go-pst uses for attachment tables.
+func messageRecipients(msg *pstlib.Message) ([]MessageRecipient, error) {
+	if msg.File == nil || msg.PropertyContext == nil {
+		return nil, nil // synthetic messages or messages without a file
+	}
+	desc, err := pstlib.FindLocalDescriptor(0x692, msg.LocalDescriptors)
+	if errors.Is(err, pstlib.ErrLocalDescriptorNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find recipient table: %w", err)
+	}
+	heap, err := msg.File.GetHeapOnNodeFromLocalDescriptor(desc)
+	if err != nil {
+		return nil, fmt.Errorf("open recipient table: %w", err)
+	}
+	locals, err := msg.File.GetLocalDescriptorsFromIdentifier(desc.LocalDescriptorsIdentifier)
+	if err != nil {
+		return nil, fmt.Errorf("read recipient table descriptors: %w", err)
+	}
+	table, err := msg.File.GetTableContext(heap, locals, 0x0c15, 0x3001, 0x3002, 0x3003, 0x39fe)
+	if errors.Is(err, pstlib.ErrTableContextNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read recipient table: %w", err)
+	}
+	var recipients []MessageRecipient
+	for _, row := range table.Properties {
+		var role int32
+		var name, addrType, email, smtp string
+		for _, prop := range row {
+			if prop.ID != 0x0c15 && prop.HNID == 0 && len(prop.Data) == 0 {
+				continue // an explicitly empty optional string
+			}
+			r, err := table.GetPropertyReader(prop, locals...)
+			if err != nil {
+				return nil, fmt.Errorf("open recipient property %#x: %w", prop.ID, err)
+			}
+			if prop.ID == 0x0c15 {
+				role, err = r.GetInteger32()
+			} else {
+				var data []byte
+				if len(prop.Data) > 0 {
+					data = prop.Data
+				} else if r.HeapOnNodeReader == nil || r.Size() < 0 || r.Size() > maxPSTBodyBytes {
+					err = errors.New("invalid or oversized recipient string")
+				} else {
+					data = make([]byte, int(r.Size()))
+					if len(data) > 0 {
+						var n int
+						n, err = r.ReadAt(data, 0)
+						if err == nil && n != len(data) {
+							err = io.ErrUnexpectedEOF
+						}
+					}
+				}
+				var value string
+				if err == nil {
+					value, err = decodeMAPIString(msg, prop.Type, data)
+				}
+				switch prop.ID {
+				case 0x3001:
+					name = value
+				case 0x3002:
+					addrType = value
+				case 0x3003:
+					email = value
+				case 0x39fe:
+					smtp = value
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("read recipient property %#x: %w", prop.ID, err)
+			}
+		}
+		recipient, err := makeMessageRecipient(role, name, addrType, email, smtp)
+		if err != nil {
+			return nil, err
+		}
+		if recipient != nil {
+			recipients = append(recipients, *recipient)
+		}
+	}
+	return recipients, nil
+}
+
+func makeMessageRecipient(role int32, name, addrType, email, smtp string) (*MessageRecipient, error) {
+	if role < 1 || role > 3 {
+		return nil, nil
+	}
+	if smtp == "" && (addrType == "" || strings.EqualFold(addrType, "SMTP")) {
+		smtp = email
+	}
+	parsed, err := mail.ParseAddress(strings.TrimSpace(smtp))
+	if err != nil || !strings.Contains(parsed.Address, "@") {
+		return nil, fmt.Errorf("recipient role %d has no usable SMTP address (address type %q)", role, sanitizeHeaderValue(addrType))
+	}
+	return &MessageRecipient{Name: name, Email: parsed.Address, Role: role}, nil
+}
+
 // File wraps a PST file for reading.
 type File struct {
 	pstFile *pstlib.File
@@ -340,6 +511,10 @@ type MessageEntry struct {
 	SenderName        string
 	SenderEmail       string
 	SenderAddressType string // "SMTP" or "EX" (Exchange DN)
+	AuthorName        string // Sent-representing identity, when present
+	AuthorEmail       string
+	Recipients        []MessageRecipient
+	HeaderError       error // unreadable or unresolved MAPI header data
 
 	// DisplayTo/Cc/Bcc are semicolon-separated display names from MAPI.
 	// Email addresses must be parsed from TransportHeaders when available.
@@ -441,22 +616,53 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		return nil
 	}
 
-	subject := props.GetSubject()
+	var headerErrors []error
+	readString := func(id uint16, fallback string) string {
+		value, err := propertyString(msg, id, fallback)
+		if err != nil {
+			headerErrors = append(headerErrors, fmt.Errorf("read property %#x: %w", id, err))
+		}
+		return value
+	}
+	subject := readString(0x0037, props.GetSubject())
 	if subject == "" {
-		subject = props.GetNormalizedSubject()
+		subject = readString(0x0e1d, props.GetNormalizedSubject())
 	}
 	if subject == "" {
 		subject = props.GetInternetSubject()
 	}
 
-	senderEmail := props.GetSenderEmailAddress()
-	// Exchange Distinguished Names start with /O= — try to resolve to SMTP.
-	if isExchangeDN(senderEmail) {
-		if smtp := props.GetSmtpAddress(); smtp != "" {
-			senderEmail = smtp
-		} else {
-			senderEmail = extractCN(senderEmail)
-		}
+	senderName := readString(0x0c1a, props.GetSenderName())
+	senderType := readString(0x0c1e, props.GetSenderAddressType())
+	senderEmail := readString(0x0c1f, props.GetSenderEmailAddress())
+	senderSMTP := readString(0x5d01, "")
+	authorName := readString(0x0042, props.GetSentRepresentingName())
+	authorType := readString(0x0064, props.GetSentRepresentingAddressType())
+	authorEmail := readString(0x0065, props.GetSentRepresentingEmailAddress())
+	authorSMTP := readString(0x5d02, "")
+	if senderSMTP != "" {
+		senderEmail = senderSMTP
+	} else if isExchangeDN(senderEmail) || strings.EqualFold(senderType, "EX") {
+		// Do not fabricate an address from an Exchange distinguished name.
+		headerErrors = append(headerErrors, errors.New("sender has unresolved Exchange address"))
+		senderEmail = ""
+	}
+	if authorSMTP != "" {
+		authorEmail = authorSMTP
+	} else if isExchangeDN(authorEmail) || strings.EqualFold(authorType, "EX") {
+		headerErrors = append(headerErrors, errors.New("represented author has unresolved Exchange address"))
+		authorEmail = ""
+	}
+	transportHeaders := readString(0x007d, props.GetTransportMessageHeaders())
+	displayTo := readString(0x0e04, props.GetDisplayTo())
+	displayCc := readString(0x0e03, props.GetDisplayCc())
+	displayBcc := readString(0x0e02, props.GetDisplayBcc())
+	messageID := readString(0x1035, props.GetInternetMessageId())
+	inReplyTo := readString(0x1042, props.GetInReplyToId())
+	references := readString(0x1039, props.GetInternetReferences())
+	recipients, recipientErr := messageRecipients(msg)
+	if recipientErr != nil {
+		headerErrors = append(headerErrors, recipientErr)
 	}
 
 	sentAt, sentErr := messageDate(msg, 0x0039, props.ClientSubmitTime)
@@ -476,19 +682,23 @@ func ExtractMessage(msg *pstlib.Message, folderPath string) *MessageEntry {
 		EntryID:           fmt.Sprintf("%d", msg.Identifier),
 		FolderPath:        folderPath,
 		Subject:           subject,
-		TransportHeaders:  props.GetTransportMessageHeaders(),
+		TransportHeaders:  transportHeaders,
 		BodyText:          bodyText,
 		BodyHTML:          bodyHTML,
 		BodyError:         bodyErr,
-		SenderName:        props.GetSenderName(),
+		SenderName:        senderName,
 		SenderEmail:       senderEmail,
-		SenderAddressType: props.GetSenderAddressType(),
-		DisplayTo:         props.GetDisplayTo(),
-		DisplayCc:         props.GetDisplayCc(),
-		DisplayBcc:        props.GetDisplayBcc(),
-		MessageID:         props.GetInternetMessageId(),
-		InReplyTo:         props.GetInReplyToId(),
-		References:        props.GetInternetReferences(),
+		SenderAddressType: senderType,
+		AuthorName:        authorName,
+		AuthorEmail:       authorEmail,
+		Recipients:        recipients,
+		HeaderError:       errors.Join(headerErrors...),
+		DisplayTo:         displayTo,
+		DisplayCc:         displayCc,
+		DisplayBcc:        displayBcc,
+		MessageID:         messageID,
+		InReplyTo:         inReplyTo,
+		References:        references,
 		SentAt:            sentAt,
 		ReceivedAt:        receivedAt,
 		CreationTime:      createdAt,

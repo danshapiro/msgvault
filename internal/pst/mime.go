@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"mime"
 	"mime/multipart"
+	"net/mail"
 	"net/textproto"
 	"path/filepath"
 	"strings"
@@ -31,7 +32,7 @@ func BuildRFC5322(msg *MessageEntry, attachments []AttachmentEntry) ([]byte, err
 
 	// Write message-identifying headers.
 	if msg.TransportHeaders != "" {
-		present := writeTransportHeaders(&headerBuf, msg.TransportHeaders)
+		present := writeTransportHeaders(&headerBuf, msg.TransportHeaders, msg)
 		writeThreadingHeaders(&headerBuf, msg, present)
 	} else {
 		writeSynthesizedHeaders(&headerBuf, msg)
@@ -145,10 +146,11 @@ func writeHTMLPart(mw *multipart.Writer, html string) {
 
 // writeTransportHeaders writes the original transport headers to buf,
 // stripping any existing MIME content headers that we will replace.
-func writeTransportHeaders(buf *bytes.Buffer, headers string) map[string]bool {
+func writeTransportHeaders(buf *bytes.Buffer, headers string, msg *MessageEntry) map[string]bool {
 	headers = strings.ReplaceAll(headers, "\r\n", "\n")
 	headers = strings.ReplaceAll(headers, "\r", "\n")
 	present := make(map[string]bool)
+	recipientFields := make(map[string][]string)
 	var field []string
 	flush := func() {
 		if len(field) == 0 {
@@ -159,6 +161,31 @@ func writeTransportHeaders(buf *bytes.Buffer, headers string) map[string]bool {
 		switch name {
 		case "mime-version", "content-type", "content-transfer-encoding":
 			return
+		case "to", "cc", "bcc":
+			value += " " + strings.Join(field[1:], " ")
+			recipientFields[name] = append(recipientFields[name], strings.TrimSpace(value))
+			return
+		case "from":
+			fullValue := strings.TrimSpace(value + " " + strings.Join(field[1:], " "))
+			addresses, err := mail.ParseAddressList(fullValue)
+			if err != nil || len(addresses) == 0 || !strings.Contains(addresses[0].Address, "@") {
+				if fallbackAuthor(msg) != nil {
+					writeHeader(buf, "X-Msgvault-Original-From", sanitizeHeaderValue(fullValue))
+					return
+				}
+			} else {
+				present[name] = true
+			}
+		case "subject":
+			if strings.TrimSpace(value+strings.Join(field[1:], "")) != "" {
+				present[name] = true
+			} else if msg.Subject != "" {
+				return
+			}
+		case "sender":
+			if strings.TrimSpace(value+strings.Join(field[1:], "")) != "" {
+				present[name] = true
+			}
 		case "message-id", "in-reply-to", "references":
 			if strings.TrimSpace(value+strings.Join(field[1:], "")) == "" {
 				return
@@ -182,23 +209,124 @@ func writeTransportHeaders(buf *bytes.Buffer, headers string) map[string]bool {
 		field = []string{line}
 	}
 	flush()
+	if !present["from"] {
+		if author := fallbackAuthor(msg); author != nil {
+			writeHeader(buf, "From", author.String())
+		}
+	}
+	if !present["subject"] && strings.TrimSpace(msg.Subject) != "" {
+		writeHeader(buf, "Subject", mime.QEncoding.Encode("utf-8", sanitizeHeaderValue(msg.Subject)))
+	}
+	if !present["sender"] {
+		writeRepresentingSender(buf, msg)
+	}
+	writeRecipientHeaders(buf, msg, recipientFields)
 	return present
+}
+
+func fallbackAuthor(msg *MessageEntry) *mail.Address {
+	name, email := msg.AuthorName, msg.AuthorEmail
+	if email == "" {
+		name, email = msg.SenderName, msg.SenderEmail
+	}
+	email = sanitizeHeaderValue(strings.TrimSpace(email))
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || !strings.Contains(parsed.Address, "@") {
+		return nil
+	}
+	return &mail.Address{Name: sanitizeHeaderValue(name), Address: parsed.Address}
+}
+
+func writeRepresentingSender(buf *bytes.Buffer, msg *MessageEntry) {
+	if msg.AuthorEmail == "" || msg.SenderEmail == "" || strings.EqualFold(msg.AuthorEmail, msg.SenderEmail) {
+		return
+	}
+	email := sanitizeHeaderValue(strings.TrimSpace(msg.SenderEmail))
+	parsed, err := mail.ParseAddress(email)
+	if err == nil && strings.Contains(parsed.Address, "@") {
+		writeHeader(buf, "Sender", (&mail.Address{Name: sanitizeHeaderValue(msg.SenderName), Address: parsed.Address}).String())
+	}
+}
+
+// writeRecipientHeaders merges transport and recipient-table addresses by
+// role. Existing Bcc/CC values are retained and addresses are deduplicated
+// only within the same role.
+func writeRecipientHeaders(buf *bytes.Buffer, msg *MessageEntry, fields map[string][]string) {
+	for _, role := range []struct {
+		name    string
+		role    int32
+		display string
+	}{{"To", 1, msg.DisplayTo}, {"Cc", 2, msg.DisplayCc}, {"Bcc", 3, msg.DisplayBcc}} {
+		original := fields[strings.ToLower(role.name)]
+		var addresses []*mail.Address
+		seen := make(map[string]bool)
+		invalid := false
+		for _, value := range original {
+			parsed, err := mail.ParseAddressList(value)
+			if err != nil {
+				invalid = true
+				continue
+			}
+			for _, address := range parsed {
+				if !strings.Contains(address.Address, "@") {
+					invalid = true
+					continue
+				}
+				key := strings.ToLower(address.Address)
+				if !seen[key] {
+					addresses = append(addresses, address)
+					seen[key] = true
+				}
+			}
+		}
+		for _, recipient := range msg.Recipients {
+			if recipient.Role != role.role {
+				continue
+			}
+			key := strings.ToLower(recipient.Email)
+			if !seen[key] {
+				addresses = append(addresses, &mail.Address{Name: sanitizeHeaderValue(recipient.Name), Address: sanitizeHeaderValue(recipient.Email)})
+				seen[key] = true
+			}
+		}
+		if invalid {
+			if len(addresses) == 0 {
+				for _, value := range original {
+					writeHeader(buf, role.name, sanitizeHeaderValue(value))
+				}
+				continue
+			}
+			for _, value := range original {
+				writeHeader(buf, "X-Msgvault-Original-"+role.name, sanitizeHeaderValue(value))
+			}
+		}
+		if len(addresses) == 0 {
+			if len(original) == 0 && role.display != "" {
+				writeHeader(buf, role.name, formatDisplayList(role.display))
+			}
+			continue
+		}
+		buf.WriteString(role.name + ": ")
+		for i, address := range addresses {
+			if i > 0 {
+				buf.WriteString(",\r\n\t")
+			}
+			buf.WriteString(address.String())
+		}
+		buf.WriteString("\r\n")
+	}
 }
 
 // writeSynthesizedHeaders writes RFC 5322 headers synthesized from MAPI
 // properties when TransportMessageHeaders is absent.
 func writeSynthesizedHeaders(buf *bytes.Buffer, msg *MessageEntry) {
-	writeHeader(buf, "From", formatAddr(msg.SenderName, msg.SenderEmail))
-
-	if msg.DisplayTo != "" {
-		writeHeader(buf, "To", formatDisplayList(msg.DisplayTo))
+	if author := fallbackAuthor(msg); author != nil {
+		writeHeader(buf, "From", author.String())
+		writeRepresentingSender(buf, msg)
+	} else {
+		writeHeader(buf, "From", formatAddr(msg.SenderName, msg.SenderEmail))
 	}
-	if msg.DisplayCc != "" {
-		writeHeader(buf, "Cc", formatDisplayList(msg.DisplayCc))
-	}
-	if msg.DisplayBcc != "" {
-		writeHeader(buf, "Bcc", formatDisplayList(msg.DisplayBcc))
-	}
+	writeRecipientHeaders(buf, msg, nil)
 
 	t := msg.FallbackDate(time.Now())
 	if !t.IsZero() {
@@ -206,7 +334,7 @@ func writeSynthesizedHeaders(buf *bytes.Buffer, msg *MessageEntry) {
 	}
 
 	if msg.Subject != "" {
-		writeHeader(buf, "Subject", mime.QEncoding.Encode("utf-8", msg.Subject))
+		writeHeader(buf, "Subject", mime.QEncoding.Encode("utf-8", sanitizeHeaderValue(msg.Subject)))
 	}
 
 	writeThreadingHeaders(buf, msg, nil)
@@ -280,6 +408,7 @@ func sanitizeContentID(s string) string {
 
 // formatAddr formats a display name + email as "Name <email>" or just email.
 func formatAddr(name, email string) string {
+	name = sanitizeHeaderValue(name)
 	email = sanitizeHeaderValue(email)
 	if name == "" && email == "" {
 		return ""
@@ -300,7 +429,7 @@ func formatDisplayList(display string) string {
 	parts := strings.Split(display, ";")
 	cleaned := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
+		p = strings.TrimSpace(sanitizeHeaderValue(p))
 		if p != "" {
 			cleaned = append(cleaned, mime.QEncoding.Encode("utf-8", p))
 		}
