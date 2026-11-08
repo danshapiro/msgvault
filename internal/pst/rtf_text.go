@@ -15,9 +15,14 @@ import (
 
 const maxRTFGroups = 512
 
+// errRTFIncompleteText indicates that readable text was recovered, but an
+// unsupported destination may contain additional visible text.
+var errRTFIncompleteText = errors.New("RTF searchable text may be incomplete: visible content was not extracted")
+
 // extractRTFText extracts a conservative plain-text view of an RTF body. It
 // returns no text when the syntax or character encoding cannot be interpreted
-// reliably; callers retain the original RTF in either case.
+// reliably. When visible destinations are omitted, it returns the recovered
+// text and errRTFIncompleteText; callers retain the original RTF in either case.
 func extractRTFText(data []byte, maxBytes int) (string, error) {
 	// Some Outlook RTF properties include terminal NUL padding after the root
 	// group. It is not part of the RTF text and must not hide a valid body.
@@ -29,6 +34,9 @@ func extractRTFText(data []byte, maxBytes int) (string, error) {
 	if err := p.parse(); err != nil {
 		return "", err
 	}
+	if p.incompleteText {
+		return p.output.String(), errRTFIncompleteText
+	}
 	return p.output.String(), nil
 }
 
@@ -39,17 +47,18 @@ type rtfTextState struct {
 }
 
 type rtfTextParser struct {
-	data         []byte
-	limit        int
-	state        rtfTextState
-	stack        []rtfTextState
-	output       strings.Builder
-	pending      []byte
-	fallback     int
-	high         uint16
-	rootClosed   bool
-	defaultFont  int
-	fontCharsets map[int]int
+	data           []byte
+	limit          int
+	state          rtfTextState
+	stack          []rtfTextState
+	output         strings.Builder
+	pending        []byte
+	fallback       int
+	high           uint16
+	rootClosed     bool
+	incompleteText bool
+	defaultFont    int
+	fontCharsets   map[int]int
 }
 
 func (p *rtfTextParser) visible() bool { return !p.state.skip && !p.state.hidden && !p.state.deleted }
@@ -172,6 +181,17 @@ func (p *rtfTextParser) emitUnicode(value int) error {
 func rtfDestination(word string) bool {
 	switch word {
 	case "fonttbl", "colortbl", "stylesheet", "info", "generator", "filetbl", "listtable", "listoverridetable", "revtbl", "rsidtbl", "xmlnstbl", "themedata", "datastore", "colorschememapping", "pict", "object", "objdata", "objclass", "objname", "nonshppict", "shppict", "shp", "shpinst", "shptxt", "fldinst", "header", "headerl", "headerr", "headerf", "footer", "footerl", "footerr", "footerf", "footnote", "annotation", "atnauthor", "atnid", "pntext", "listtext", "latentstyles", "xmlopen", "xmlclose", "htmltag", "mhtmltag":
+		return true
+	default:
+		return false
+	}
+}
+
+// These destinations can contain user-visible document content. We do not
+// parse them as ordinary body text, so their presence must be reported.
+func rtfPotentiallyVisibleDestination(word string) bool {
+	switch word {
+	case "shp", "shpinst", "shptxt", "object", "header", "headerl", "headerr", "headerf", "footer", "footerl", "footerr", "footerf", "footnote", "annotation", "pntext", "listtext":
 		return true
 	default:
 		return false
@@ -317,6 +337,9 @@ func (p *rtfTextParser) control(i int) (int, error) {
 				p.fontCharsets[p.state.fontDefinition] = rtfFontCodepage(value)
 			}
 		}
+	}
+	if rtfPotentiallyVisibleDestination(word) {
+		p.incompleteText = true
 	}
 	if rtfDestination(word) {
 		if err := p.flushBytes(); err != nil {

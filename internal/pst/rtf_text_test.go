@@ -1,6 +1,7 @@
 package pst
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -31,6 +32,31 @@ func TestExtractRTFText(t *testing.T) {
 	}
 }
 
+func TestExtractRTFTextReportsSkippedVisibleDestinations(t *testing.T) {
+	for _, destination := range []string{
+		"shp", "shpinst", "shptxt", "object", "header", "headerl", "headerr", "headerf",
+		"footer", "footerl", "footerr", "footerf", "footnote", "annotation", "pntext", "listtext",
+	} {
+		t.Run(destination, func(t *testing.T) {
+			source := `{\rtf1\ansi searchable {\` + destination + ` omittedword} body}`
+			got, err := extractRTFText([]byte(source), 4096)
+			require.ErrorIs(t, err, errRTFIncompleteText)
+			assert.Equal(t, "searchable  body", got)
+			assert.NotContains(t, got, "omittedword")
+		})
+	}
+	t.Run("nested ignorable shape text", func(t *testing.T) {
+		got, err := extractRTFText([]byte(`{\rtf1\ansi body {\*\shptxt omittedword}}`), 4096)
+		require.ErrorIs(t, err, errRTFIncompleteText)
+		assert.Equal(t, "body ", got)
+	})
+	t.Run("metadata is not a visible destination", func(t *testing.T) {
+		got, err := extractRTFText([]byte(`{\rtf1\ansi {\fonttbl{\f0 Arial;}}{\info{\title ignored}}body}`), 4096)
+		require.NoError(t, err)
+		assert.Equal(t, "body", got)
+	})
+}
+
 func TestExtractRTFTextRejectsUnsafeInput(t *testing.T) {
 	for _, tc := range []struct{ name, input string }{
 		{"not RTF", `plain text`},
@@ -59,7 +85,7 @@ func FuzzExtractRTFText(f *testing.F) {
 	f.Add([]byte{0, 0xff, '{', '\\'})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		got, err := extractRTFText(data, 4096)
-		if err != nil {
+		if err != nil && !errors.Is(err, errRTFIncompleteText) {
 			assert.Empty(t, got)
 			return
 		}

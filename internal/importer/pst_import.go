@@ -542,7 +542,7 @@ func importPstWithBatchSize(
 				log.Warn("PST HTML decoding was uncertain; preserving original bytes in an attachment", "entry_id", entry.EntryID)
 			}
 			if entry.RTFWarning != nil {
-				log.Warn("PST RTF text could not be recovered; preserving original RTF in an attachment", "entry_id", entry.EntryID, "error", entry.RTFWarning)
+				log.Warn("PST RTF text recovery incomplete; preserving original RTF in an attachment", "entry_id", entry.EntryID, "error", entry.RTFWarning)
 			}
 			logUnresolvedPSTRecipients(log, entry)
 

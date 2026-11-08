@@ -602,7 +602,7 @@ type MessageEntry struct {
 	BodyText           string
 	BodyHTML           string
 	BodyError          error            // unreadable or unsupported body, if any
-	RTFWarning         error            // original RTF was retained but readable text could not be recovered
+	RTFWarning         error            // original RTF retained; text recovery was incomplete or failed
 	RawHTMLAttachment  *AttachmentEntry // original bytes when HTML cannot be decoded losslessly
 	RawRTFAttachment   *AttachmentEntry // compressed RTF retained when neither HTML nor text can be decoded
 	CalendarAttachment *AttachmentEntry // structured calendar data retained from meeting requests
