@@ -251,6 +251,16 @@ func runPSTMessageRepair(cmd *cobra.Command, state *invocation, identifier, pstP
 				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
 			}
 		}
+		if result.EnvelopeUpdated {
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Missing or importer-derived message facts recovered."); err != nil {
+				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
+			}
+		}
+		for _, fact := range result.EnvelopePreserved {
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "Message fact not changed: %s\n", fact); err != nil {
+				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
+			}
+		}
 	}
 	for _, attachmentErr := range result.AttachmentErrors {
 		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "Attachment not stored: %v\n", attachmentErr); err != nil {

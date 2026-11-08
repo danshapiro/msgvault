@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.kenn.io/msgvault/internal/export"
 	msgmime "go.kenn.io/msgvault/internal/mime"
@@ -27,13 +28,15 @@ type PSTRepairOptions struct {
 
 // PSTRepairResult reports successful changes even if an attachment was blocked.
 type PSTRepairResult struct {
-	MessageID        int64
-	SourceMessageID  string
-	ArchiveID        string
-	AttachmentsAdded int
-	BodyUpdated      bool
-	BodyPreserved    bool
-	AttachmentErrors []error
+	MessageID         int64
+	SourceMessageID   string
+	ArchiveID         string
+	AttachmentsAdded  int
+	BodyUpdated       bool
+	BodyPreserved     bool
+	EnvelopeUpdated   bool
+	EnvelopePreserved []string
+	AttachmentErrors  []error
 }
 
 // RepairPSTMessage repairs exactly one stored PST message. The source archive
@@ -175,16 +178,48 @@ func repairPSTMessageWithVerify(ctx context.Context, st *store.Store, sourceID i
 		ExpectedText: textutil.EnsureUTF8(oldMessage.GetBodyText()), ExpectedHTML: textutil.EnsureUTF8(oldMessage.BodyHTML),
 		NewText: textutil.EnsureUTF8(parsed.GetBodyText()), NewHTML: textutil.EnsureUTF8(parsed.BodyHTML),
 	}
+	now := time.Now().UTC()
+	fallbackDate := entry.FallbackDate(now)
+	oldDate, _ := msgmime.ResolveMessageDate(oldMessage.Date, oldMessage.ReceivedDates, fallbackDate, now)
+	newDate, _ := msgmime.ResolveMessageDate(parsed.Date, parsed.ReceivedDates, fallbackDate, now)
+	rfcID, parent, refs := msgmime.ParseThreadingHeaders(newRaw)
+	threadKey := rfcID
+	if parent != "" {
+		threadKey = parent
+	}
+	if len(refs) != 0 {
+		if root := msgmime.NormalizeMessageID(refs[0]); root != "" {
+			threadKey = root
+		}
+	}
+	envelope := &store.PSTRepairEnvelope{
+		ExpectedSubject: textutil.EnsureUTF8(oldMessage.Subject), Subject: textutil.EnsureUTF8(parsed.Subject),
+		ExpectedSentAt: oldDate, SentAt: newDate,
+		From: parsed.From, To: parsed.To, Cc: parsed.Cc, Bcc: parsed.Bcc,
+		MessageID: rfcID, InReplyTo: parent, ThreadKey: threadKey, UnresolvedRecipients: unresolvedPSTRecipientRoles(newRaw),
+	}
+	if unresolved := unresolvedPSTSender(newRaw); unresolved != nil {
+		envelope.UnresolvedSenderName = unresolved.Name
+		envelope.UnresolvedSenderKey = unresolved.participantKey(sourceID, sourceMessageID)
+		envelope.UnresolvedSender = true
+		for _, from := range parsed.From {
+			if strings.Contains(from.Email, "@") {
+				envelope.UnresolvedSender = false
+				break
+			}
+		}
+	}
 	if verifySource != nil {
 		if err := verifySource(); err != nil {
 			return result, errors.Join(fmt.Errorf("verify PST source: %w", err), errors.Join(result.AttachmentErrors...))
 		}
 	}
-	stored, err := st.RepairPSTRawAndAttachments(ctx, sourceID, messageID, sourceMessageID, oldRaw, newRaw, writes, body)
+	stored, err := st.RepairPSTRawAndAttachments(ctx, sourceID, messageID, sourceMessageID, oldRaw, newRaw, writes, body, envelope)
 	if err != nil {
 		return result, errors.Join(fmt.Errorf("commit PST message repair: %w", err), errors.Join(result.AttachmentErrors...))
 	}
 	result.AttachmentsAdded, result.BodyUpdated, result.BodyPreserved = stored.AttachmentsAdded, stored.BodyUpdated, stored.BodyPreserved
+	result.EnvelopeUpdated, result.EnvelopePreserved = stored.EnvelopeUpdated, stored.EnvelopePreserved
 	if len(result.AttachmentErrors) != 0 {
 		return result, fmt.Errorf("PST message repaired with blocked attachments: %w", errors.Join(result.AttachmentErrors...))
 	}

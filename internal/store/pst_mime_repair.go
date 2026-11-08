@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/textutil"
 )
 
@@ -18,10 +20,24 @@ type PSTRepairBody struct {
 	NewText, NewHTML           string
 }
 
+// PSTRepairEnvelope holds facts parsed from the original and repaired MIME.
+// Expected values must use the same decoding and date selection as import.
+type PSTRepairEnvelope struct {
+	ExpectedSubject, Subject                  string
+	ExpectedSentAt, SentAt                    time.Time
+	From, To, Cc, Bcc                         []mime.Address
+	MessageID, InReplyTo, ThreadKey           string
+	UnresolvedSender                          bool
+	UnresolvedSenderName, UnresolvedSenderKey string
+	UnresolvedRecipients                      []string
+}
+
 type PSTRepairStoreResult struct {
-	AttachmentsAdded int
-	BodyUpdated      bool
-	BodyPreserved    bool
+	AttachmentsAdded  int
+	BodyUpdated       bool
+	BodyPreserved     bool
+	EnvelopeUpdated   bool
+	EnvelopePreserved []string
 }
 
 // RepairPSTRawAndAttachments changes one identified raw MIME snapshot using
@@ -30,9 +46,9 @@ type PSTRepairStoreResult struct {
 // replaced. An empty attachment location may be filled when its hash matches.
 // Files must already have been stored using the normal attachment
 // storage path; a failed file can be retried on a subsequent invocation.
-func (s *Store) RepairPSTRawAndAttachments(ctx context.Context, sourceID, messageID int64, sourceMessageID string, expectedRaw, replacementRaw []byte, writes []AttachmentWrite, body *PSTRepairBody) (PSTRepairStoreResult, error) {
+func (s *Store) RepairPSTRawAndAttachments(ctx context.Context, sourceID, messageID int64, sourceMessageID string, expectedRaw, replacementRaw []byte, writes []AttachmentWrite, body *PSTRepairBody, envelope ...*PSTRepairEnvelope) (PSTRepairStoreResult, error) {
 	var result PSTRepairStoreResult
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+	err := s.withAttributionTxContext(ctx, attributionLock{Sources: []int64{sourceID}}, func(tx *loggedTx) error {
 		if err := s.lockMeetingEvidenceWith(ctx, tx, messageID); err != nil {
 			return fmt.Errorf("lock PST message: %w", err)
 		}
@@ -86,15 +102,54 @@ func (s *Store) RepairPSTRawAndAttachments(ctx context.Context, sourceID, messag
 					if err != nil {
 						return fmt.Errorf("update PST message snippet: %w", err)
 					}
-					if s.fts5Available {
-						if _, err := q.Exec(s.dialect.FTSBackfillBatchSQL(), messageID, messageID+1); err != nil {
-							return fmt.Errorf("update PST message search: %w", err)
-						}
-					}
 					result.BodyUpdated = true
 				}
 			} else if oldText.String != body.NewText || oldHTML.String != body.NewHTML {
 				result.BodyPreserved = true
+			}
+		}
+		if len(envelope) > 1 {
+			return errors.New("multiple PST repair envelopes")
+		}
+		if len(envelope) == 1 && envelope[0] != nil {
+			changed, preserved, err := s.applyPSTRepairEnvelope(ctx, tx, sourceID, messageID, envelope[0])
+			if err != nil {
+				return err
+			}
+			result.EnvelopeUpdated, result.EnvelopePreserved = changed, preserved
+		}
+		if s.fts5Available && (result.BodyUpdated || result.EnvelopeUpdated) {
+			stored, err := s.loadDerivedEmailText(q, messageID)
+			if err != nil {
+				return fmt.Errorf("read PST message search fields: %w", err)
+			}
+			stored.fts.Body = stored.body
+			if stored.fts.FromAddr == "" {
+				// The original PST importer indexes unresolved Exchange senders
+				// by participant name even when no From row can be made.
+				var name sql.NullString
+				err := q.QueryRow(`SELECT p.display_name FROM messages m JOIN participants p ON p.id = m.sender_id
+					JOIN participant_identifiers pi ON pi.participant_id = p.id AND pi.identifier_type = 'pst-unresolved-sender'
+					WHERE m.id = ? ORDER BY pi.id LIMIT 1`, messageID).Scan(&name)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("read PST unresolved sender: %w", err)
+				}
+				stored.fts.FromAddr = name.String
+				if len(envelope) == 1 && envelope[0] != nil && envelope[0].UnresolvedSenderName != "" {
+					var matching int
+					if err := q.QueryRow(`SELECT COUNT(*) FROM messages m JOIN participant_identifiers pi ON pi.participant_id = m.sender_id
+						WHERE m.id = ? AND pi.identifier_type = 'pst-unresolved-sender' AND pi.identifier_value = ?`, messageID, envelope[0].UnresolvedSenderKey).Scan(&matching); err != nil {
+						return fmt.Errorf("verify PST unresolved sender: %w", err)
+					}
+					if matching > 0 {
+						stored.fts.FromAddr = envelope[0].UnresolvedSenderName
+					} else {
+						result.EnvelopePreserved = append(result.EnvelopePreserved, "unresolved sender identity")
+					}
+				}
+			}
+			if err := s.dialect.FTSUpsert(q, stored.fts); err != nil {
+				return fmt.Errorf("update PST message search: %w", err)
 			}
 		}
 		if added > 0 {
@@ -102,7 +157,7 @@ func (s *Store) RepairPSTRawAndAttachments(ctx context.Context, sourceID, messag
 				return fmt.Errorf("update PST attachment counts: %w", err)
 			}
 		}
-		if changedRaw || added > 0 || result.BodyUpdated {
+		if changedRaw || added > 0 || result.BodyUpdated || result.EnvelopeUpdated {
 			if err := s.bumpDerivedDataRevision(tx); err != nil {
 				return fmt.Errorf("update PST repair revision: %w", err)
 			}

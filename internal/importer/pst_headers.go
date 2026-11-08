@@ -77,6 +77,38 @@ func unresolvedPSTSender(raw []byte) *unresolvedPSTIdentity {
 	return nil
 }
 
+// unresolvedPSTRecipientRoles reports source recipient facts that could not
+// be represented as SMTP addresses. Values remain in the encoded MIME header;
+// the repair uses these roles only to inform the operator.
+func unresolvedPSTRecipientRoles(raw []byte) []string {
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return nil
+	}
+	var roles []string
+	for _, value := range msg.Header["X-Msgvault-Unresolved-Recipient"] {
+		data, err := base64.RawURLEncoding.DecodeString(strings.Join(strings.Fields(value), ""))
+		var identity struct {
+			Role int32 `json:"role"`
+		}
+		if err != nil || json.Unmarshal(data, &identity) != nil {
+			roles = append(roles, "recipient metadata unreadable")
+			continue
+		}
+		switch identity.Role {
+		case 1:
+			roles = append(roles, "to-unresolved")
+		case 2:
+			roles = append(roles, "cc-unresolved")
+		case 3:
+			roles = append(roles, "bcc-unresolved")
+		default:
+			roles = append(roles, "recipient-unresolved")
+		}
+	}
+	return roles
+}
+
 // participantKey shares a confidently identified Exchange identity within a
 // source. Ambiguous identities remain scoped to one message to avoid merging
 // unrelated people. The hash keeps the original DN out of the identifier.
