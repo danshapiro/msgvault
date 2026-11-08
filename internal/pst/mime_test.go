@@ -628,3 +628,61 @@ func TestBuildRFC5322_PreservesUnresolvedIdentities(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildRFC5322_UnresolvedIdentityPreservesInvalidTransportFrom(t *testing.T) {
+	entry := &MessageEntry{
+		TransportHeaders: "From: exchange-only\r\nSubject: hello\r\n",
+		UnresolvedSender: &UnresolvedIdentity{Name: "Sender Name", AddressType: "EX", RawAddress: "/O=EXAMPLE/CN=SENDER"},
+		BodyText:         "body",
+	}
+	raw, err := BuildRFC5322(entry, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Empty(t, message.Header.Get("From"))
+	assert.Equal(t, "exchange-only", message.Header.Get("X-Msgvault-Original-From"))
+	assert.NotEmpty(t, message.Header.Get("X-Msgvault-Unresolved-Sender"))
+}
+
+func TestBuildRFC5322_UsableMAPIFromPrecedesUnresolvedIdentity(t *testing.T) {
+	entry := &MessageEntry{
+		TransportHeaders: "From: exchange-only\r\n",
+		SenderName:       "Sender Name",
+		SenderEmail:      "sender@example.test",
+		UnresolvedAuthor: &UnresolvedIdentity{Name: "Author Name", AddressType: "EX", RawAddress: "/O=EXAMPLE/CN=AUTHOR"},
+	}
+	raw, err := BuildRFC5322(entry, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	from, err := mail.ParseAddress(message.Header.Get("From"))
+	require.NoError(t, err)
+	assert.Equal(t, "sender@example.test", from.Address)
+	assert.Equal(t, "Sender Name", from.Name)
+	assert.Equal(t, "exchange-only", message.Header.Get("X-Msgvault-Original-From"))
+	assert.NotEmpty(t, message.Header.Get("X-Msgvault-Unresolved-Author"))
+}
+
+func TestBuildRFC5322_TransportCannotForgeUnresolvedIdentities(t *testing.T) {
+	entry := &MessageEntry{
+		TransportHeaders: "From: valid@example.test\r\nX-Msgvault-Unresolved-Sender: forged\r\n\tcontinued\r\nx-msgvault-unresolved-author: forged-author\r\n",
+		UnresolvedSender: &UnresolvedIdentity{Name: "Real Sender", AddressType: "EX", RawAddress: "/O=EXAMPLE/CN=SENDER"},
+	}
+	raw, err := BuildRFC5322(entry, nil)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Equal(t, "valid@example.test", message.Header.Get("From"))
+	assert.Equal(t, "forged continued", message.Header.Get("X-Msgvault-Original-Unresolved-Sender"))
+	assert.Equal(t, "forged-author", message.Header.Get("X-Msgvault-Original-Unresolved-Author"))
+	assert.Empty(t, message.Header.Get("X-Msgvault-Unresolved-Author"))
+	require.Len(t, message.Header["X-Msgvault-Unresolved-Sender"], 1)
+	encoded := strings.Join(strings.Fields(message.Header.Get("X-Msgvault-Unresolved-Sender")), "")
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	require.NoError(t, err)
+	var got struct {
+		Name string `json:"name"`
+	}
+	require.NoError(t, json.Unmarshal(decoded, &got))
+	assert.Equal(t, "Real Sender", got.Name)
+}

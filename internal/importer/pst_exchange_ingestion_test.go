@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/require"
 	msgmime "go.kenn.io/msgvault/internal/mime"
 	pstreader "go.kenn.io/msgvault/internal/pst"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 )
 
 // Exercise extraction, MIME construction, archive ingestion, and reply linking
@@ -104,4 +106,102 @@ func TestPSTUnresolvedExchangeIdentitiesSurviveIngestionAndThreading(t *testing.
 	assert.True(t, parent.Valid)
 	assert.Equal(t, ids["parent"], parent.Int64)
 	assert.Equal(t, parentConversation, replyConversation)
+}
+
+// A readable sender must survive the full ingest and search paths even when
+// Exchange supplied no SMTP address. None of the names appears in the body or
+// subject, so a search hit must come from the sender itself.
+func TestPSTUnresolvedExchangeSenderNameSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, sender, author, headers, expectedName, expectedEmail, searchTerm string
+	}{
+		{name: "sender without transport headers", sender: "Sender Zucchini", expectedName: "Sender Zucchini", searchTerm: "Zucchini"},
+		{name: "author with unusable transport from", author: "Author Kumquat", headers: "From: invalid <\r\n", expectedName: "Author Kumquat", searchTerm: "Kumquat"},
+		{name: "represented author takes precedence", sender: "Sender Zucchini", author: "Author Kumquat", expectedName: "Author Kumquat", searchTerm: "Kumquat"},
+		{name: "sender name controls remain safe", sender: "Sender Quince\r\nX-Injected: evil", expectedName: "Sender QuinceX-Injected: evil", searchTerm: "QuinceX"},
+		{name: "valid transport from takes precedence", sender: "Sender Zucchini", author: "Author Kumquat", headers: "From: Transport Person <transportunique@example.test>\r\n", expectedName: "Transport Person", expectedEmail: "transportunique@example.test", searchTerm: "transportunique"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := openIntegrationStore(t)
+			require.True(t, st.FTS5Available())
+			// PST supports a caller-selected source type, not only "pst".
+			src, err := st.GetOrCreateSource("custom-pst", "owner@example.test")
+			require.NoError(t, err)
+			exchange, dn, body := "EX", "/O=EXAMPLE/CN=PERSON", "Ordinary message body"
+			props := &properties.Message{TransportMessageHeaders: &tc.headers, Body: &body}
+			if tc.sender != "" {
+				props.SenderName, props.SenderAddressType, props.SenderEmailAddress = &tc.sender, &exchange, &dn
+			}
+			if tc.author != "" {
+				props.SentRepresentingName, props.SentRepresentingAddressType, props.SentRepresentingEmailAddress = &tc.author, &exchange, &dn
+			}
+			entry := pstreader.ExtractMessage(&pstlib.Message{Properties: props}, "Inbox")
+			require.NoError(t, entry.HeaderError)
+			raw, err := pstreader.BuildRFC5322(entry, nil)
+			require.NoError(t, err)
+			require.NoError(t, pstMessageIngester(nil)(t.Context(), st, src.ID, src.Identifier, "", nil, "pst-no-smtp", "hash", raw, time.Time{}, slog.Default()))
+
+			rows, total, err := st.SearchMessages(tc.searchTerm, 0, 10)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), total)
+			require.Len(t, rows, 1)
+			if tc.expectedEmail == "" {
+				assert.Equal(t, tc.expectedName, rows[0].From)
+			} else {
+				assert.Contains(t, rows[0].From, tc.expectedEmail)
+			}
+			assert.Equal(t, tc.expectedName, rows[0].FromName)
+			assert.Equal(t, tc.expectedEmail, rows[0].FromEmail)
+			engine := query.NewSQLiteEngine(st.DB())
+			checkQueryEngine := func() {
+				for _, fast := range []bool{false, true} {
+					var results []query.MessageSummary
+					var searchErr error
+					if fast {
+						results, searchErr = engine.SearchFast(t.Context(), search.Parse(tc.searchTerm), query.MessageFilter{}, 10, 0)
+					} else {
+						results, searchErr = engine.Search(t.Context(), search.Parse(tc.searchTerm), 10, 0)
+					}
+					require.NoError(t, searchErr)
+					require.Len(t, results, 1, "fast=%t", fast)
+					assert.Equal(t, rows[0].ID, results[0].ID)
+					assert.Equal(t, tc.expectedName, results[0].FromName)
+					assert.Equal(t, tc.expectedEmail, results[0].FromEmail)
+				}
+			}
+			checkQueryEngine()
+			detail, err := engine.GetMessage(t.Context(), rows[0].ID)
+			require.NoError(t, err)
+			require.NotNil(t, detail)
+			require.Len(t, detail.From, 1)
+			assert.Equal(t, tc.expectedName, detail.From[0].Name)
+			assert.Equal(t, tc.expectedEmail, detail.From[0].Email)
+			stored, err := st.GetMessageRaw(rows[0].ID)
+			require.NoError(t, err)
+			message, err := mail.ReadMessage(bytes.NewReader(stored))
+			require.NoError(t, err)
+			assert.Empty(t, message.Header.Get("X-Injected"))
+			if strings.Contains(tc.sender, "\r\n") {
+				encoded := strings.Join(strings.Fields(message.Header.Get("X-Msgvault-Unresolved-Sender")), "")
+				decoded, decodeErr := base64.RawURLEncoding.DecodeString(encoded)
+				require.NoError(t, decodeErr)
+				var metadata map[string]string
+				require.NoError(t, json.Unmarshal(decoded, &metadata))
+				assert.Equal(t, tc.sender, metadata["name"])
+			}
+			parsed, err := msgmime.Parse(stored)
+			require.NoError(t, err)
+			for _, address := range parsed.From {
+				assert.Equal(t, tc.expectedEmail, address.Email)
+			}
+			_, err = st.RebuildFTS(nil)
+			require.NoError(t, err)
+			resultsAfterRebuild, total, err := st.SearchMessages(tc.searchTerm, 0, 10)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), total)
+			require.Len(t, resultsAfterRebuild, 1)
+			assert.Equal(t, rows[0].ID, resultsAfterRebuild[0].ID)
+			checkQueryEngine()
+		})
+	}
 }

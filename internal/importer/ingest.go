@@ -55,7 +55,7 @@ func ingestRawMessage(
 	log *slog.Logger, images *remoteimage.Fetcher, threadID string,
 ) error {
 	return ingestRawMessageWithCompletion(ctx, st, sourceID, identifier, attachmentsDir, labelIDs,
-		sourceMsgID, rawHash, raw, fallbackDate, log, images, threadID, false)
+		sourceMsgID, rawHash, raw, fallbackDate, log, images, threadID, false, nil)
 }
 
 // ingestRawMessageWithCompletion reports, when strict, attachment storage and
@@ -66,9 +66,23 @@ func ingestRawMessage(
 func ingestRawMessageWithCompletion(ctx context.Context, st *store.Store,
 	sourceID int64, identifier, attachmentsDir string, labelIDs []int64,
 	sourceMsgID, rawHash string, raw []byte, fallbackDate time.Time,
-	log *slog.Logger, images *remoteimage.Fetcher, threadID string, strict bool,
+	log *slog.Logger, images *remoteimage.Fetcher, threadID string, strict bool, pstSender *unresolvedPSTIdentity,
 ) error {
 	parsed, parseErr := mime.ParseWithRecovery(raw, "(MIME parse error)")
+	// PST-specific metadata is supplied only by the PST importer. A parsed
+	// local-only From token is not an SMTP identity and must not suppress the
+	// fallback or become a participant address.
+	if pstSender != nil {
+		for _, from := range parsed.From {
+			if strings.Contains(from.Email, "@") {
+				pstSender = nil
+				break
+			}
+		}
+		if pstSender != nil {
+			parsed.From = nil
+		}
+	}
 	if strict && parseErr != nil {
 		log.Warn("archived malformed MIME with salvaged headers", "source_msg", sourceMsgID, "error", parseErr)
 	}
@@ -110,6 +124,14 @@ func ingestRawMessageWithCompletion(ctx context.Context, st *store.Store,
 	}
 
 	var senderID sql.NullInt64
+	if pstSender != nil {
+		key := pstSender.participantKey(sourceID, sourceMsgID)
+		id, err := st.EnsureParticipantByIdentifierContext(ctx, "pst-unresolved-sender", key, pstSender.Name)
+		if err != nil {
+			return fmt.Errorf("ensure unresolved PST sender: %w", err)
+		}
+		senderID = sql.NullInt64{Int64: id, Valid: true}
+	}
 	if len(parsed.From) > 0 && parsed.From[0].Email != "" {
 		if id, ok := participantMap[parsed.From[0].Email]; ok {
 			senderID = sql.NullInt64{Int64: id, Valid: true}
@@ -196,6 +218,9 @@ func ingestRawMessageWithCompletion(ctx context.Context, st *store.Store,
 		buildRecipientSet("cc", parsed.Cc, participantMap),
 		buildRecipientSet("bcc", parsed.Bcc, participantMap),
 	}
+	if pstSender != nil {
+		recipientSets[0] = store.RecipientSet{Type: "from", ParticipantIDs: []int64{senderID.Int64}, DisplayNames: []string{pstSender.Name}}
+	}
 
 	// Persist atomically
 	messageID, err := st.PersistMessageContext(ctx, &store.MessagePersistData{
@@ -259,6 +284,9 @@ func ingestRawMessageWithCompletion(ctx context.Context, st *store.Store,
 	// FTS: best-effort outside the transaction
 	if st.FTS5Available() {
 		fromAddr := joinEmails(parsed.From)
+		if pstSender != nil {
+			fromAddr = pstSender.Name
+		}
 		toAddrs := joinEmails(parsed.To)
 		ccAddrs := joinEmails(parsed.Cc)
 		if err := st.UpsertFTS(

@@ -168,6 +168,14 @@ func writeTransportHeaders(buf *bytes.Buffer, headers string, msg *MessageEntry)
 		switch name {
 		case "mime-version", "content-type", "content-transfer-encoding":
 			return
+		case "x-msgvault-unresolved-sender", "x-msgvault-unresolved-author":
+			// Reserve these fields for metadata generated from the PST itself.
+			// Keep transport-supplied values under distinct names instead.
+			writeHeader(buf, "X-Msgvault-Original-"+strings.TrimPrefix(name, "x-msgvault-"), strings.TrimSpace(value))
+			for _, line := range field[1:] {
+				buf.WriteString(line + "\r\n")
+			}
+			return
 		case "to", "cc", "bcc":
 			value += " " + strings.Join(field[1:], " ")
 			recipientFields[name] = append(recipientFields[name], strings.TrimSpace(value))
@@ -176,7 +184,7 @@ func writeTransportHeaders(buf *bytes.Buffer, headers string, msg *MessageEntry)
 			fullValue := strings.TrimSpace(value + " " + strings.Join(field[1:], " "))
 			addresses, err := mail.ParseAddressList(fullValue)
 			if err != nil || len(addresses) == 0 || !strings.Contains(addresses[0].Address, "@") {
-				if fallbackAuthor(msg) != nil {
+				if fallbackAuthor(msg) != nil || msg.UnresolvedSender != nil || msg.UnresolvedAuthor != nil {
 					writeHeader(buf, "X-Msgvault-Original-From", sanitizeHeaderValue(fullValue))
 					return
 				}
