@@ -122,6 +122,26 @@ func TestExtractMessage_BinaryHTML(t *testing.T) {
 	assert.Equal(t, "<p>café</p>\r\n", string(body))
 }
 
+func TestExtractMessage_UTF7Body(t *testing.T) {
+	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
+		{ID: 0x1000, Type: pstlib.PropertyTypeString8, Data: []byte("caf+AOk- and +- plus\x00")},
+		{ID: 0x3ffd, Type: pstlib.PropertyTypeInteger32, Data: []byte{0xe8, 0xfd, 0, 0}},
+	}}}
+	entry := ExtractMessage(msg, "Inbox")
+	require.NotNil(t, entry)
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "café and + plus", entry.BodyText)
+
+	msg.PropertyContext.Properties[0] = pstlib.Property{ID: 0x1013, Type: pstlib.PropertyTypeBinary, Data: []byte("<p>caf+AOk-</p>\x00")}
+	entry = ExtractMessage(msg, "Inbox")
+	require.NoError(t, entry.BodyError)
+	assert.Equal(t, "<p>café</p>", entry.BodyHTML)
+
+	msg.PropertyContext.Properties[0].Data = []byte("<p>bad +?</p>")
+	entry = ExtractMessage(msg, "Inbox")
+	assert.Error(t, entry.BodyError)
+}
+
 func TestExtractMessage_RTFOnlyIsReported(t *testing.T) {
 	msg := &pstlib.Message{Properties: &properties.Message{}, PropertyContext: &pstlib.PropertyContext{Properties: []pstlib.Property{
 		{ID: 0x1009, Type: pstlib.PropertyTypeBinary, Data: []byte("rtf")},

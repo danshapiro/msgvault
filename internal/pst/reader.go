@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cention-sany/utf7"
 	charsets "github.com/emersion/go-message/charset"
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
 	"github.com/mooijtech/go-pst/v6/pkg/properties"
@@ -128,7 +129,7 @@ func messageCodepage(msg *pstlib.Message, ids ...uint16) (string, error) {
 		case 932:
 			name = "shift_jis"
 		}
-		if enc, _ := htmlcharset.Lookup(name); enc == nil {
+		if enc, _ := htmlcharset.Lookup(name); enc == nil && value != 65000 {
 			return "", fmt.Errorf("unsupported body codepage %d", value)
 		}
 		return name, nil
@@ -213,18 +214,25 @@ func messageHTML(msg *pstlib.Message, decoded string) (string, error) {
 	}
 
 	contentType := "text/html"
+	var r io.Reader
 	if !hasHTMLDeclaredCharset(data) {
 		name, err := messageCodepage(msg, 0x3fde, 0x3ffd) // Internet, then message codepage
 		if err != nil {
 			return "", err
 		}
 		if name != "" {
-			contentType += "; charset=" + name
+			if strings.EqualFold(name, "utf-7") {
+				r = utf7.UTF7.NewDecoder().Reader(bytes.NewReader(bytes.TrimRight(data, "\x00")))
+			} else {
+				contentType += "; charset=" + name
+			}
 		}
 	}
-	r, err := htmlcharset.NewReader(bytes.NewReader(data), contentType)
-	if err != nil {
-		return "", fmt.Errorf("decode HTML body: %w", err)
+	if r == nil {
+		r, err = htmlcharset.NewReader(bytes.NewReader(data), contentType)
+		if err != nil {
+			return "", fmt.Errorf("decode HTML body: %w", err)
+		}
 	}
 	out, err := io.ReadAll(io.LimitReader(r, maxPSTBodyBytes+1))
 	if err != nil {
@@ -270,7 +278,13 @@ func messageText(msg *pstlib.Message, decoded string) (string, error) {
 	if name == "" {
 		name = "windows-1252"
 	}
-	enc, _ := htmlcharset.Lookup(name)
+	var enc encoding.Encoding
+	if strings.EqualFold(name, "utf-7") {
+		enc = utf7.UTF7
+		data = bytes.TrimRight(data, "\x00")
+	} else {
+		enc, _ = htmlcharset.Lookup(name)
+	}
 	out, err := io.ReadAll(io.LimitReader(enc.NewDecoder().Reader(bytes.NewReader(data)), maxPSTBodyBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("decode text body: %w", err)
@@ -329,7 +343,13 @@ func decodeMAPIString(msg *pstlib.Message, typ pstlib.PropertyType, data []byte)
 		if name == "" {
 			name = "windows-1252"
 		}
-		enc, _ := htmlcharset.Lookup(name)
+		var enc encoding.Encoding
+		if strings.EqualFold(name, "utf-7") {
+			enc = utf7.UTF7
+			data = bytes.TrimRight(data, "\x00")
+		} else {
+			enc, _ = htmlcharset.Lookup(name)
+		}
 		dec = enc.NewDecoder()
 	default:
 		return "", fmt.Errorf("unexpected MAPI string type %v", typ)
