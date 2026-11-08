@@ -12,16 +12,35 @@ import (
 // meetingCalendarAttachment preserves selected source properties as facts; it
 // does not infer an iCalendar UID, recurrence rule, organizer, or timezone.
 func meetingCalendarAttachment(msg *pstlib.Message) (*AttachmentEntry, error) {
-	if msg.File == nil || msg.File.NameToIDMap == nil || msg.PropertyContext == nil {
-		return nil, nil //nolint:nilnil // No named-property map means no calendar facts are available.
+	if msg.PropertyContext == nil {
+		return nil, nil //nolint:nilnil // No property context means no calendar facts are available.
 	}
 	type calendarFacts struct {
-		StartUTC          string `json:"start_utc,omitempty"`
-		EndUTC            string `json:"end_utc,omitempty"`
-		Location          string `json:"location,omitempty"`
-		RecurrencePattern string `json:"recurrence_pattern,omitempty"`
+		Version           int                `json:"version"`
+		StartUTC          string             `json:"start_utc,omitempty"`
+		EndUTC            string             `json:"end_utc,omitempty"`
+		Location          string             `json:"location,omitempty"`
+		RecurrencePattern string             `json:"recurrence_pattern,omitempty"`
+		NamedProperties   []rawNamedProperty `json:"named_properties,omitempty"`
+		NameIDStreams     *rawNameIDStreams  `json:"name_id_streams,omitempty"`
 	}
 	var facts calendarFacts
+	var err error
+	facts.NamedProperties, facts.NameIDStreams, err = preserveNamedProperties(msg)
+	if err != nil {
+		return nil, fmt.Errorf("preserve meeting named properties: %w", err)
+	}
+	if msg.File == nil || msg.File.NameToIDMap == nil {
+		if len(facts.NamedProperties) == 0 {
+			return nil, nil //nolint:nilnil // No named properties need an attachment.
+		}
+		facts.Version = 1
+		data, err := json.Marshal(facts)
+		if err != nil {
+			return nil, fmt.Errorf("encode meeting properties: %w", err)
+		}
+		return &AttachmentEntry{Filename: "pst-meeting-properties.json", MIMEType: "application/json", Content: data}, nil
+	}
 	for _, item := range []struct {
 		lid   int
 		label string
@@ -60,9 +79,10 @@ func meetingCalendarAttachment(msg *pstlib.Message) (*AttachmentEntry, error) {
 			*item.text = value
 		}
 	}
-	if facts == (calendarFacts{}) {
+	if len(facts.NamedProperties) == 0 && facts.StartUTC == "" && facts.EndUTC == "" && facts.Location == "" && facts.RecurrencePattern == "" {
 		return nil, nil //nolint:nilnil // An empty set of facts needs no attachment.
 	}
+	facts.Version = 1
 	data, err := json.Marshal(facts)
 	if err != nil {
 		return nil, fmt.Errorf("encode meeting properties: %w", err)
