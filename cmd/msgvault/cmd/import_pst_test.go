@@ -23,6 +23,8 @@ func saveImportPstState(t *testing.T) func() {
 	prevCheckpointInterval := importPstCheckpointInterval
 	prevNoAttachments := importPstNoAttachments
 	prevMaxMessageBytes := importPstMaxMessageBytes
+	prevRepairEntry := importPstRepairEntry
+	prevArchiveID := importPstArchiveID
 	return func() {
 		importPstSourceType = prevSourceType
 		importPstSkipFolders = prevSkipFolders
@@ -30,7 +32,83 @@ func saveImportPstState(t *testing.T) func() {
 		importPstCheckpointInterval = prevCheckpointInterval
 		importPstNoAttachments = prevNoAttachments
 		importPstMaxMessageBytes = prevMaxMessageBytes
+		importPstRepairEntry = prevRepairEntry
+		importPstArchiveID = prevArchiveID
 	}
+}
+
+func TestPSTRepairFlagsRequireOneArchiveAndEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		wantError string
+	}{
+		{name: "ordinary import"},
+		{name: "valid repair", args: []string{"--repair-entry=123", "--archive-id=abc123"}},
+		{name: "archive alone", args: []string{"--archive-id=abc123"}, wantError: "provided together"},
+		{name: "empty archive alone", args: []string{"--archive-id="}, wantError: "provided together"},
+		{name: "empty entry", args: []string{"--repair-entry=", "--archive-id=abc123"}, wantError: "provided together"},
+		{name: "missing archive", args: []string{"--repair-entry=123"}, wantError: "requires --archive-id"},
+		{name: "non-PST source", args: []string{"--repair-entry=123", "--archive-id=abc123", "--source-type=gmail"}, wantError: "requires --source-type=pst"},
+		{name: "invalid entry", args: []string{"--repair-entry=abc", "--archive-id=abc123"}, wantError: "positive decimal"},
+		{name: "noncanonical entry", args: []string{"--repair-entry=00123", "--archive-id=abc123"}, wantError: "positive decimal"},
+		{name: "zero entry", args: []string{"--repair-entry=0", "--archive-id=abc123"}, wantError: "positive decimal"},
+		{name: "conflicting flag", args: []string{"--repair-entry=123", "--archive-id=abc123", "--no-attachments=false"}, wantError: "cannot be used"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(saveImportPstState(t))
+			importPstSourceType, importPstRepairEntry, importPstArchiveID = "pst", "", ""
+			cmd := &cobra.Command{Use: "import-pst"}
+			cmd.Flags().StringVar(&importPstRepairEntry, "repair-entry", "", "")
+			cmd.Flags().StringVar(&importPstArchiveID, "archive-id", "", "")
+			cmd.Flags().StringVar(&importPstSourceType, "source-type", "pst", "")
+			cmd.Flags().Bool("no-attachments", false, "")
+			require.NoError(t, cmd.ParseFlags(tc.args))
+			err := validatePSTRepairFlags(cmd)
+			if tc.wantError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestPSTRepairSelectionIsForwardedToDaemon(t *testing.T) {
+	t.Cleanup(saveImportPstState(t))
+	for _, name := range []string{"repair-entry", "archive-id"} {
+		flag := importPstCmd.Flags().Lookup(name)
+		require.NotNil(t, flag)
+		oldValue, oldChanged := flag.Value.String(), flag.Changed
+		t.Cleanup(func() {
+			assert.NoError(t, flag.Value.Set(oldValue))
+			flag.Changed = oldChanged
+		})
+	}
+	require.NoError(t, importPstCmd.Flags().Set("repair-entry", "123"))
+	require.NoError(t, importPstCmd.Flags().Set("archive-id", "abc123"))
+	args, err := daemonCLIArgsFromCobra(importPstCmd, []string{"owner@example.test", "archive.pst"})
+	require.NoError(t, err)
+	assert.Contains(t, args, "--repair-entry=123")
+	assert.Contains(t, args, "--archive-id=abc123")
+}
+
+func TestPSTRepairDoesNotCreateMissingSource(t *testing.T) {
+	t.Cleanup(saveImportPstState(t))
+	importPstSourceType, importPstRepairEntry, importPstArchiveID = "pst", "123", "abc123"
+	cfg := lifecycleTestConfig(t.TempDir())
+	seed := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
+	require.NoError(t, seed.Close())
+	ctx := withStoreResolverConfig(t, cfg)
+	cmd := &cobra.Command{Use: "import-pst"}
+	cmd.SetContext(ctx)
+	err := runPSTMessageRepair(cmd, invocationFromContext(ctx), "missing@example.test", "archive.pst")
+	require.ErrorIs(t, err, store.ErrSourceNotFound)
+	st, err := store.Open(cfg.DatabaseDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, st.Close()) })
+	_, err = st.GetSourceByTypeAndIdentifier("pst", "missing@example.test")
+	assert.ErrorIs(t, err, store.ErrSourceNotFound)
 }
 
 func TestImportPstCmdHonorsMessageLimit(t *testing.T) {

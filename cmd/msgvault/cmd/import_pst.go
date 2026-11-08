@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -21,6 +22,8 @@ var (
 	importPstCheckpointInterval int
 	importPstNoAttachments      bool
 	importPstMaxMessageBytes    int64
+	importPstRepairEntry        string
+	importPstArchiveID          string
 )
 
 var importPstCmd = &cobra.Command{
@@ -35,14 +38,22 @@ are skipped automatically. The PST folder structure is preserved as labels
 The import is resumable: if interrupted with Ctrl+C, rerunning with the same
 arguments will continue from where it left off. Use --no-resume to start fresh.
 
+To repair a previously imported message, use --repair-entry with --archive-id.
+The source message ID has the form pst-<archive-id>-<entry-id>; its middle
+portion is the archive ID. The supplied PST must match that archive ID.
+
 Examples:
   msgvault init-db
   msgvault import-pst you@company.com /path/to/archive.pst
   msgvault import-pst you@outlook.com backup.pst --skip-folder "Deleted Items"
   msgvault import-pst you@outlook.com backup.pst --no-resume
+  msgvault import-pst you@outlook.com backup.pst --repair-entry 123456 --archive-id 0123456789ab
 `,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := validatePSTRepairFlags(cmd); err != nil {
+			return err
+		}
 		if importPstMaxMessageBytes < 0 {
 			return errors.New("--max-message-bytes cannot be negative")
 		}
@@ -58,6 +69,9 @@ Examples:
 
 		identifier := args[0]
 		pstPath := args[1]
+		if importPstRepairEntry != "" {
+			return runPSTMessageRepair(cmd, state, identifier, pstPath)
+		}
 
 		// Graceful Ctrl+C: first signal saves checkpoint, second exits immediately.
 		ctx, cancel := context.WithCancel(cmd.Context())
@@ -177,6 +191,79 @@ func init() {
 	importPstCmd.Flags().IntVar(&importPstCheckpointInterval, "checkpoint-interval", 200, "Save progress every N messages")
 	importPstCmd.Flags().BoolVar(&importPstNoAttachments, "no-attachments", false, "Do not store attachments to disk (messages are still imported)")
 	importPstCmd.Flags().Int64Var(&importPstMaxMessageBytes, "max-message-bytes", 0, "Maximum attachment total and serialized message size in bytes (0 uses 128 MiB default)")
+	importPstCmd.Flags().StringVar(&importPstRepairEntry, "repair-entry", "", "Repair one existing message by PST entry ID")
+	importPstCmd.Flags().StringVar(&importPstArchiveID, "archive-id", "", "Expected archive fingerprint for --repair-entry")
+}
+
+func validatePSTRepairFlags(cmd *cobra.Command) error {
+	if importPstRepairEntry == "" {
+		if importPstArchiveID != "" || cmd.Flags().Changed("archive-id") || cmd.Flags().Changed("repair-entry") {
+			return errors.New("--repair-entry and --archive-id must be provided together")
+		}
+		return nil
+	}
+	if importPstArchiveID == "" {
+		return errors.New("--repair-entry requires --archive-id")
+	}
+	if importPstSourceType != "pst" {
+		return errors.New("--repair-entry requires --source-type=pst")
+	}
+	entry, err := strconv.ParseUint(importPstRepairEntry, 10, 32)
+	if err != nil || entry == 0 || strconv.FormatUint(entry, 10) != importPstRepairEntry {
+		return errors.New("--repair-entry must be a positive decimal PST entry ID")
+	}
+	for _, name := range []string{"skip-folder", "no-resume", "checkpoint-interval", "no-attachments", "max-message-bytes"} {
+		if cmd.Flags().Changed(name) {
+			return fmt.Errorf("--%s cannot be used with --repair-entry", name)
+		}
+	}
+	return nil
+}
+
+func runPSTMessageRepair(cmd *cobra.Command, state *invocation, identifier, pstPath string) error {
+	// Repair is restricted to an existing archive and must not run startup
+	// migrations or create an empty database as a side effect.
+	st, cleanup, err := openInitializedStoreForInvocation(cmd.Context(), state)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	source, err := st.GetSourceByTypeAndIdentifier(importPstSourceType, identifier)
+	if err != nil {
+		return fmt.Errorf("find PST source: %w", err)
+	}
+	result, repairErr := importer.RepairPSTMessage(cmd.Context(), st, importer.PSTRepairOptions{
+		SourceID: source.ID, ArchivePath: pstPath, ArchiveID: importPstArchiveID,
+		EntryID: importPstRepairEntry, AttachmentsDir: state.cfg.AttachmentsDir(),
+	}, state.logger)
+	var outputErr error
+	if result.MessageID != 0 {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Message: %d\nArchive: %s\nSource message: %s\nAttachments added: %d\n", result.MessageID, result.ArchiveID, result.SourceMessageID, result.AttachmentsAdded); err != nil {
+			outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
+		}
+		if result.BodyUpdated {
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Searchable body recovered from the original MIME."); err != nil {
+				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
+			}
+		}
+		if result.BodyPreserved {
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Existing body preserved; it differs from the original MIME-derived body."); err != nil {
+				outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair result: %w", err))
+			}
+		}
+	}
+	for _, attachmentErr := range result.AttachmentErrors {
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "Attachment not stored: %v\n", attachmentErr); err != nil {
+			outputErr = errors.Join(outputErr, fmt.Errorf("write PST repair attachment error: %w", err))
+		}
+	}
+	if repairErr != nil {
+		return errors.Join(fmt.Errorf("repair PST entry: %w", repairErr), outputErr)
+	}
+	if len(result.AttachmentErrors) != 0 {
+		return errors.Join(fmt.Errorf("repair PST entry: %d attachments could not be stored", len(result.AttachmentErrors)), outputErr)
+	}
+	return outputErr
 }
 
 func runPstPostImportMigrations(
