@@ -47,6 +47,27 @@ func TestReader_Next_SplitsAndUnescapes(t *testing.T) {
 	require.ErrorIs(err, io.EOF, "expected EOF")
 }
 
+func TestReader_Next_QuotedSenderSeparator(t *testing.T) {
+	data := strings.Join([]string{
+		"From alice@example.test Mon Jan 1 00:00:00 2024",
+		"Subject: One", "", "First body",
+		`From "not a real separator" because this is ordinary body text`,
+		"",
+		`From "Example Person <person@example.test>" Mon Jan 1 00:00:01 2024`,
+		"Subject: Two", "", "Second body", "",
+	}, "\n")
+	r := NewReader(strings.NewReader(data))
+	first, err := r.Next()
+	require.NoError(t, err)
+	assert.Contains(t, string(first.Raw), `From "not a real separator" because this is ordinary body text`)
+	assert.NotContains(t, string(first.Raw), "Subject: Two")
+	second, err := r.Next()
+	require.NoError(t, err)
+	assert.Contains(t, string(second.Raw), "Subject: Two")
+	_, err = r.Next()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
 func TestReader_Next_CanDisableUnescape(t *testing.T) {
 	mboxData := strings.Join([]string{
 		"From sender@example.com Mon Jan 1 00:00:00 2024",

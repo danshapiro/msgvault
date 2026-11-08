@@ -211,6 +211,39 @@ func parseFromSeparatorDateFields(fields []string, strict bool) (time.Time, bool
 	return time.Time{}, false
 }
 
+// fromSeparatorFields keeps a quoted sender together. Some PST exporters
+// write display names containing spaces in the envelope sender position.
+func fromSeparatorFields(line string) []string {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != "From" || !strings.HasPrefix(fields[1], `"`) {
+		return fields
+	}
+	// Preserve already-supported single-token envelope senders, including
+	// unusual quoting within the token, before trying a multiword sender.
+	if _, ok := parseFromSeparatorDateFields(fields, false); ok {
+		return fields
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "From"))
+	if !strings.HasPrefix(rest, `"`) {
+		return nil
+	}
+	escaped := false
+	for i := 1; i < len(rest); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case rest[i] == '\\':
+			escaped = true
+		case rest[i] == '"':
+			if i+1 >= len(rest) || (rest[i+1] != ' ' && rest[i+1] != '\t') {
+				return nil
+			}
+			return append([]string{"From", "quoted-sender"}, strings.Fields(rest[i+1:])...)
+		}
+	}
+	return nil
+}
+
 // ParseFromSeparatorDate parses the ctime-like date portion of an mbox "From "
 // separator line.
 //
@@ -219,7 +252,7 @@ func parseFromSeparatorDateFields(fields []string, strict bool) (time.Time, bool
 // ("From <x> <ctime-like date> ...") can be misclassified; mbox writers should
 // escape such body lines (e.g. ">From ").
 func ParseFromSeparatorDate(line string) (time.Time, bool) {
-	return parseFromSeparatorDateFields(strings.Fields(line), false)
+	return parseFromSeparatorDateFields(fromSeparatorFields(line), false)
 }
 
 // ParseFromSeparatorDateStrict parses the ctime-like date portion of an mbox "From "
@@ -227,5 +260,5 @@ func ParseFromSeparatorDate(line string) (time.Time, bool) {
 // well-known timezone abbreviations. This avoids treating arbitrary abbreviations
 // as UTC.
 func ParseFromSeparatorDateStrict(line string) (time.Time, bool) {
-	return parseFromSeparatorDateFields(strings.Fields(line), true)
+	return parseFromSeparatorDateFields(fromSeparatorFields(line), true)
 }
