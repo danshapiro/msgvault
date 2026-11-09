@@ -145,6 +145,32 @@ func TestBuildStreamsRelationshipActivityUnderLowMemory(t *testing.T) {
 	assertions.Equal(int64(1_000_000), result.Activity.ConversationExpandedRows)
 }
 
+// One large group can produce over ten million membership edges in one year.
+// Exercise the whole build, including logical reduction and validation, with
+// the same memory and thread limits used by the production builder.
+func TestBuildLargeSingleGroupUnderBuilderMemoryLimit(t *testing.T) {
+	root, db := writeRelationshipBaseFixture(t, true)
+	writeSyntheticRelationshipFanOut(t, db, root, syntheticRelationshipFanOutOptions{
+		firstMessageID:   1,
+		messageCount:     24_000,
+		memberCount:      500,
+		startDate:        "2026-01-01",
+		messageType:      "chat",
+		conversationType: "group_chat",
+	})
+	require.NoError(t, setRelationshipTestMemoryLimit(db, "2GB"))
+	_, err := db.Exec("SET threads = 2")
+	require.NoError(t, err)
+	result, err := Build(context.Background(), db, BuildOptions{
+		Mode:           ModeFull,
+		StagedBaseRoot: root,
+		OutputRoot:     root,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(12_000_000), result.Activity.ConversationExpandedRows)
+	assert.Equal(t, int64(12_000_000), result.Activity.FinalRows)
+}
+
 func TestBuildIncrementalAppendsIntervalOverFanOut(t *testing.T) {
 	requirements := require.New(t)
 	assertions := assert.New(t)
