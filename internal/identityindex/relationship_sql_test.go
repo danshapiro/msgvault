@@ -158,6 +158,46 @@ func TestBuildStreamsRelationshipActivityUnderLowMemory(t *testing.T) {
 	}
 }
 
+// Retain the large-group regression at the constrained builder settings while
+// checking normalized storage and the logical membership seen by readers.
+func TestBuildLargeSingleGroupUnderBuilderMemoryLimit(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	root, db := writeRelationshipBaseFixture(t, true)
+	writeSyntheticRelationshipFanOut(t, db, root, syntheticRelationshipFanOutOptions{
+		firstMessageID: 1, messageCount: 24_000, memberCount: 500,
+		startDate: "2026-01-01", messageType: "chat", conversationType: "group_chat",
+	})
+	require.NoError(setRelationshipTestMemoryLimit(t.Context(), db, "2GB"))
+	_, err := db.ExecContext(t.Context(), "SET threads = 2")
+	require.NoError(err)
+	result, err := Build(t.Context(), db, BuildOptions{
+		Mode: ModeFull, StagedBaseRoot: root, OutputRoot: root,
+	})
+	require.NoError(err)
+	assert.Equal(int64(24_499), result.Activity.ConversationExpandedRows)
+	assert.Equal(int64(24_499), result.Activity.FinalRows)
+	// Sparse activity stores direct evidence and compact membership seeds;
+	// owner contribution rows add one row per message, independent of roster size.
+	assert.Equal(int64(48_000), relationshipParquetCount(t, db, root, DatasetActivity))
+	expanded := ExpandedActivityRelation(
+		readParquetRelation([]string{parquetDatasetGlob(root, DatasetActivity)}, true),
+		readParquetRelation([]string{parquetDatasetGlob(root, "conversation_participants")}, false),
+		readParquetRelation([]string{parquetDatasetGlob(root, "participants")}, false),
+		readParquetRelation([]string{parquetDatasetGlob(root, "participant_clusters")}, false),
+		readParquetRelation([]string{parquetDatasetGlob(root, "owner_participants")}, false),
+	)
+	var members, minMessages, maxMessages int64
+	require.NoError(db.QueryRowContext(t.Context(), `
+		SELECT count(*), min(messages), max(messages) FROM (
+			SELECT canonical_id, count(*) AS messages FROM `+expanded+`
+			WHERE is_conversation_member GROUP BY canonical_id
+		)`).Scan(&members, &minMessages, &maxMessages))
+	assert.Equal(int64(500), members)
+	assert.Equal(int64(24_000), minMessages)
+	assert.Equal(int64(24_000), maxMessages)
+}
+
 func TestBuildStoresConversationMembershipOncePerConversation(t *testing.T) {
 	requirements := require.New(t)
 	assertions := assert.New(t)
