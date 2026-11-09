@@ -153,20 +153,22 @@ func repairPSTMessageWithVerify(ctx context.Context, st *store.Store, sourceID i
 	var blocking []string
 	uncertainBody := false
 	for _, issue := range parsed.Issues {
-		if issue.Name != enmime.ErrorCharsetDeclaration || issue.Severe || !issue.BodyPart {
+		if issue.Name != enmime.ErrorCharsetDeclaration || issue.Severe || (!issue.BodyPart && !issue.UnconvertedAttachment) {
 			blocking = append(blocking, issue.Description)
 			continue
 		}
-		if !issue.UTF8Restored {
+		if issue.BodyPart && !issue.UTF8Restored {
 			uncertainBody = true
 		}
 		warning := issue.Description
-		if !issue.UTF8Restored {
+		if issue.UnconvertedAttachment {
+			warning += "; attachment bytes retained without charset conversion"
+		} else if !issue.UTF8Restored {
 			warning += "; body encoding is uncertain, so the existing body will be preserved if repair succeeds"
 		}
 		result.Warnings = append(result.Warnings, warning)
 		if log != nil {
-			log.Warn("PST repair MIME charset detection warning", "message", messageID, "warning", issue.Description, "body_preserved", !issue.UTF8Restored)
+			log.Warn("PST repair MIME charset detection warning", "message", messageID, "warning", issue.Description, "body_preserved", issue.BodyPart && !issue.UTF8Restored)
 		}
 	}
 	if len(blocking) != 0 {

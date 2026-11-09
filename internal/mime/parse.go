@@ -60,10 +60,11 @@ type Message struct {
 // ParseIssue retains the parser's structured diagnostics for callers that
 // need to distinguish potentially lossy errors from charset detection warnings.
 type ParseIssue struct {
-	Name, Description string
-	Severe            bool
-	BodyPart          bool
-	UTF8Restored      bool
+	Name, Description     string
+	Severe                bool
+	BodyPart              bool
+	UTF8Restored          bool
+	UnconvertedAttachment bool
 }
 
 // Address represents an email address with optional display name.
@@ -185,6 +186,11 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 		if part != nil {
 			issue.BodyPart = isBodyPart(part)
 			issue.UTF8Restored = restoredUTF8[part]
+			// When detection fails and no charset is present, enmime leaves
+			// the transfer-decoded bytes untouched. Other charset warnings do
+			// not establish this and must not be treated as lossless.
+			issue.UnconvertedAttachment = !issue.BodyPart && e.Name == enmime.ErrorCharsetDeclaration &&
+				strings.HasPrefix(e.Detail, "charset could not be detected:") && part.Charset == "" && part.OrigCharset == ""
 		}
 		msg.Issues = append(msg.Issues, issue)
 	}
