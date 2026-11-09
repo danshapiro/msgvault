@@ -264,7 +264,7 @@ func TestFetchGroupParticipantsMissingTable(t *testing.T) {
 	require.NoError(err)
 
 	members, err := fetchGroupParticipants(t.Context(), db, "120255501234567-987654321@g.us")
-	require.NoError(err)
+	require.ErrorContains(err, "group roster schema unavailable")
 	assert.Empty(members)
 }
 
@@ -307,7 +307,7 @@ func TestFetchGroupParticipantsPresent(t *testing.T) {
 		MemberJID:    "12025550125@s.whatsapp.net",
 		MemberUser:   "12025550125",
 		MemberServer: "s.whatsapp.net",
-		Admin:        0,
+		Admin:        -1,
 	}, members[1])
 
 	empty, err := fetchGroupParticipants(t.Context(), db, "120255501234567-222222222@g.us")
@@ -329,7 +329,7 @@ func TestFetchGroupParticipantsOtherErrorPropagates(t *testing.T) {
 				);
 				CREATE TABLE group_participants (gjid TEXT, jid TEXT);
 			`,
-			wantErrMsg: "no such column: gp.admin",
+			wantErrMsg: "group roster schema unavailable",
 		},
 		{
 			name: "missing required jid table",
@@ -346,7 +346,7 @@ func TestFetchGroupParticipantsOtherErrorPropagates(t *testing.T) {
 				CREATE VIEW group_participants AS
 				SELECT gjid, jid, admin FROM group_participants_shadow;
 			`,
-			wantErrMsg: "no such table: main.group_participants_shadow",
+			wantErrMsg: "group roster schema unavailable",
 		},
 	}
 
@@ -364,7 +364,6 @@ func TestFetchGroupParticipantsOtherErrorPropagates(t *testing.T) {
 			members, err := fetchGroupParticipants(t.Context(), db, "120255501234567-987654321@g.us")
 			assert.Nil(members)
 			require.Error(err)
-			require.ErrorContains(err, "fetch group participants")
 			require.ErrorContains(err, tt.wantErrMsg)
 		})
 	}

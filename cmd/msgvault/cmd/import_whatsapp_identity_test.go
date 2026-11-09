@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json/v2"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,32 +21,40 @@ import (
 
 const whatsappIdentityTestPhone = "+15555550100"
 
-func TestImportWhatsAppConfirmsDefaultIdentityWithRecoverableErrors(t *testing.T) {
+func TestImportWhatsAppReportsPartialWithoutConfirmingIdentity(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	home := t.TempDir()
 	fixture := createWhatsAppIdentityFixture(t, true, false)
 	output, err := runWhatsAppIdentityCommand(t, home, fixture, false)
 
-	require.NoError(err)
-	assert.Contains(output, "Confirmed identity "+whatsappIdentityTestPhone)
-	assert.Contains(output, "phone-e164")
+	require.ErrorContains(err, "WhatsApp import incomplete")
+	assert.NotContains(output, "Confirmed identity")
 	assert.Contains(output, "Messages:       3 processed, 1 added, 0 updated, 2 skipped")
 	assert.Contains(output, "Errors:         1")
 
 	identities := whatsappIdentityTestIdentities(t, home)
-	require.Len(identities, 1)
-	assert.Equal(whatsappIdentityTestPhone, identities[0].Address)
-	assert.Equal("phone-e164", identities[0].SourceSignal)
+	assert.Empty(identities)
+	receipt := decodeWhatsAppImportReceipt(t, output)
+	assert.Equal("partial", receipt.Status)
+	assert.Equal(int64(1), receipt.Errors)
+	assert.Equal(int64(3), receipt.Processed)
+	assert.Equal(int64(1), receipt.Upserted)
+	assert.Equal(int64(2), receipt.Skipped)
 }
 
 func TestImportWhatsAppConfirmsDefaultIdentityOnCleanImport(t *testing.T) {
+	assert := assert.New(t)
 	home := t.TempDir()
 	fixture := createWhatsAppIdentityFixture(t, false, false)
-	_, err := runWhatsAppIdentityCommand(t, home, fixture, false)
+	output, err := runWhatsAppIdentityCommand(t, home, fixture, false)
 
 	require.NoError(t, err)
-	assert.Len(t, whatsappIdentityTestIdentities(t, home), 1)
+	assert.Len(whatsappIdentityTestIdentities(t, home), 1)
+	receipt := decodeWhatsAppImportReceipt(t, output)
+	assert.Equal("complete", receipt.Status)
+	assert.Zero(receipt.Errors)
+	assert.EqualValues(1, receipt.Added)
 }
 
 func TestImportWhatsAppDoesNotConfirmIdentityWithNoDefaultIdentity(t *testing.T) {
@@ -53,7 +62,7 @@ func TestImportWhatsAppDoesNotConfirmIdentityWithNoDefaultIdentity(t *testing.T)
 	fixture := createWhatsAppIdentityFixture(t, true, false)
 	_, err := runWhatsAppIdentityCommand(t, home, fixture, true)
 
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "WhatsApp import incomplete")
 	assert.Empty(t, whatsappIdentityTestIdentities(t, home))
 	assert.Len(t, whatsappIdentityTestSources(t, home), 1)
 }
@@ -79,18 +88,47 @@ func TestImportWhatsAppDoesNotCreateSourceForUnknownDatabase(t *testing.T) {
 }
 
 func TestImportWhatsAppIdentityIsIdempotent(t *testing.T) {
+	assert := assert.New(t)
 	require := require.New(t)
 	home := t.TempDir()
-	fixture := createWhatsAppIdentityFixture(t, true, false)
+	fixture := createWhatsAppIdentityFixture(t, false, false)
 
 	_, err := runWhatsAppIdentityCommand(t, home, fixture, false)
 	require.NoError(err)
-	_, err = runWhatsAppIdentityCommand(t, home, fixture, false)
+	output, err := runWhatsAppIdentityCommand(t, home, fixture, false)
 	require.NoError(err)
 
 	identities := whatsappIdentityTestIdentities(t, home)
 	require.Len(identities, 1)
-	assert.Equal(t, whatsappIdentityTestPhone, identities[0].Address)
+	assert.Equal(whatsappIdentityTestPhone, identities[0].Address)
+	receipt := decodeWhatsAppImportReceipt(t, output)
+	assert.Equal("complete", receipt.Status)
+	assert.Zero(receipt.Added)
+	assert.EqualValues(1, receipt.Skipped)
+}
+
+type whatsAppImportReceipt struct {
+	Version   int    `json:"version"`
+	Status    string `json:"status"`
+	Errors    int64  `json:"errors"`
+	Processed int64  `json:"messages_processed"`
+	Upserted  int64  `json:"messages_upserted"`
+	Added     int64  `json:"messages_added"`
+	Updated   int64  `json:"messages_updated"`
+	Skipped   int64  `json:"messages_skipped"`
+}
+
+func decodeWhatsAppImportReceipt(t *testing.T, output string) whatsAppImportReceipt {
+	t.Helper()
+	require.Equal(t, 1, strings.Count(output, "WHATSAPP_IMPORT_RESULT="))
+	_, encoded, found := strings.Cut(output, "WHATSAPP_IMPORT_RESULT=")
+	require.True(t, found)
+	encoded, _, _ = strings.Cut(encoded, "\n")
+	var result whatsAppImportReceipt
+	require.NoError(t, json.Unmarshal([]byte(encoded), &result))
+	assert.Equal(t, 1, result.Version)
+	assert.Equal(t, result.Added+result.Updated, result.Upserted)
+	return result
 }
 
 func runWhatsAppIdentityCommand(

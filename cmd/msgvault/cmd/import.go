@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -140,7 +141,7 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Println("\nImport interrupted. Run again to continue.")
-			return rebuildCacheAfterWrite(ctx, dbPath, state)
+			return errors.Join(fmt.Errorf("WhatsApp import interrupted: %w", ctx.Err()), rebuildCacheAfterWrite(ctx, dbPath, state))
 		}
 		return fmt.Errorf("import failed: %w", err)
 	}
@@ -150,7 +151,7 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	post := context.WithoutCancel(ctx)
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment in account_identity.go.
-	if !noDefaultIdentityImportWhatsApp && summary.SourceID != 0 {
+	if !noDefaultIdentityImportWhatsApp && summary.Errors == 0 && summary.SourceID != 0 {
 		confirmDefaultIdentity(post, cmd.OutOrStdout(), s, summary.SourceID, importPhone, importPhone, "phone-e164", state.logger)
 	}
 
@@ -172,7 +173,11 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 
 	// Print summary.
 	fmt.Println()
-	fmt.Println("Import complete!")
+	if summary.Errors > 0 {
+		fmt.Println("Import partially completed!")
+	} else {
+		fmt.Println("Import complete!")
+	}
 	fmt.Printf("  Duration:       %s\n", summary.Duration.Round(time.Second))
 	fmt.Printf("  Chats:          %d\n", summary.ChatsProcessed)
 	fmt.Printf("  Messages:       %d processed, %d added, %d updated, %d skipped\n",
@@ -193,7 +198,39 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		fmt.Printf("  Rate:           %.0f messages/sec\n", rate)
 	}
 
-	return rebuildCacheAfterWrite(ctx, dbPath, state)
+	if err := rebuildCacheAfterWrite(ctx, dbPath, state); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WhatsApp import interrupted: %w", err)
+	}
+	status := "complete"
+	if summary.Errors > 0 {
+		status = "partial"
+	}
+	result := struct {
+		Version           int              `json:"version"`
+		Status            string           `json:"status"`
+		Errors            int64            `json:"errors"`
+		ErrorCounts       map[string]int64 `json:"error_counts"`
+		SkippedCounts     map[string]int64 `json:"skipped_counts"`
+		GroupRoster       string           `json:"group_roster"`
+		MessagesProcessed int64            `json:"messages_processed"`
+		MessagesUpserted  int64            `json:"messages_upserted"`
+		MessagesAdded     int64            `json:"messages_added"`
+		MessagesUpdated   int64            `json:"messages_updated"`
+		MessagesSkipped   int64            `json:"messages_skipped"`
+	}{1, status, summary.Errors, summary.ErrorCounts, summary.SkippedCounts, summary.GroupRoster, summary.MessagesProcessed,
+		summary.MessagesAdded + summary.MessagesUpdated, summary.MessagesAdded, summary.MessagesUpdated, summary.MessagesSkipped}
+	encoded, err := json.Marshal(result, json.Deterministic(true))
+	if err != nil {
+		return fmt.Errorf("encode import result: %w", err)
+	}
+	fmt.Printf("WHATSAPP_IMPORT_RESULT=%s\n", encoded)
+	if summary.Errors > 0 {
+		return fmt.Errorf("WhatsApp import incomplete: %d errors", summary.Errors)
+	}
+	return nil
 }
 
 // parseWhatsAppDateWindow parses --after/--before like import-imessage does:

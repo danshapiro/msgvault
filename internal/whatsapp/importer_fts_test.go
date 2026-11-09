@@ -11,7 +11,7 @@ import (
 )
 
 func TestImportReportsFTSWriteErrors(t *testing.T) {
-	waDBPath := createGroupParticipantsImportFixture(t, nil)
+	waDBPath := testBackup(t, modernRoster)
 	progress := &importProgressRecorder{}
 	st := testutil.NewSQLiteTestStore(t)
 	require.True(t, st.FTS5Available(), "fts5 build tag set but FTS5 unavailable")
@@ -28,7 +28,7 @@ func TestImportReportsFTSWriteErrors(t *testing.T) {
 	assert.Equal(t, int64(2), summary.Errors)
 	assert.Len(t, progress.errors, 2)
 	for _, progressErr := range progress.errors {
-		assert.Contains(t, progressErr, "upsert FTS:")
+		assert.Contains(t, progressErr, "index message:")
 		assert.Contains(t, progressErr, "messages_fts")
 	}
 }

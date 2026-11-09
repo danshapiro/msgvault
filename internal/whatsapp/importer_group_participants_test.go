@@ -82,7 +82,12 @@ func TestImportGroupChatWithoutGroupParticipantsTable(t *testing.T) {
 	summary, err := NewImporter(st, progress).Import(t.Context(), waDBPath, opts)
 	require.NoError(err)
 	t.Logf("recorded import errors: %v", progress.errors)
-	assert.Equal(int64(0), summary.Errors)
+	assert.Equal(int64(1), summary.Errors)
+	assert.Equal("unavailable", summary.GroupRoster)
+	assert.Equal(int64(1), summary.ErrorCounts["group_roster_schema"])
+	var status string
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status FROM sync_runs`).Scan(&status))
+	assert.Equal("failed", status)
 	assert.NotContains(strings.Join(progress.errors, "\n"), "fetch group participants for")
 	assert.NotContains(strings.Join(progress.errors, "\n"), "no such table: group_participants")
 	assert.Equal(int64(2), summary.MessagesAdded)
@@ -149,7 +154,9 @@ func TestImportGroupChatWithPopulatedGroupParticipants(t *testing.T) {
 
 	summary, err := NewImporter(st, nil).Import(t.Context(), waDBPath, opts)
 	require.NoError(err)
-	assert.Equal(int64(0), summary.Errors)
+	assert.Equal(int64(1), summary.Errors)
+	assert.Equal("partial", summary.GroupRoster)
+	assert.Equal(int64(1), summary.ErrorCounts["group_roster_rank"])
 
 	var adminRole string
 	err = st.DB().QueryRowContext(t.Context(), st.Rebind(`

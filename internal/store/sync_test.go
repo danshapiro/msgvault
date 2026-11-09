@@ -625,6 +625,16 @@ func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) 
 		name  string
 		write func() error
 	}{
+		{name: "preserve unresolved attribution", write: func() error {
+			_, err := stale.UpsertMessagePreservingAttributionContext(t.Context(), &store.Message{
+				SourceID: f.Source.ID, ConversationID: conversationID,
+				SourceMessageID: "generation-fence-message", MessageType: "whatsapp",
+			})
+			return err
+		}},
+		{name: "observed roster role", write: func() error {
+			return stale.SetConversationParticipantRoleContext(t.Context(), conversationID, participantID, "admin")
+		}},
 		{name: "email conversation", write: func() error {
 			_, err := stale.EnsureConversation(t.Context(), f.Source.ID, "stale-email-thread", "Stale")
 			return err

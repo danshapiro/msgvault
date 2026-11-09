@@ -106,7 +106,7 @@ func (imp *Importer) importApple(
 	opts ImportOptions,
 ) (summary *ImportSummary, retErr error) {
 	startedAt := time.Now()
-	summary = &ImportSummary{}
+	summary = &ImportSummary{GroupRoster: "complete", ErrorCounts: make(map[string]int64), SkippedCounts: make(map[string]int64)}
 
 	source, err := imp.store.GetOrCreateSource("whatsapp", opts.Phone)
 	if err != nil {
@@ -163,6 +163,7 @@ func (imp *Importer) importApple(
 	}
 	if duplicateRows > 0 {
 		summary.Errors++
+		summary.ErrorCounts["duplicate_stanza"]++
 		imp.progress.OnError(fmt.Errorf(
 			"skipping %d Apple text messages whose stanza IDs are duplicated",
 			duplicateRows,

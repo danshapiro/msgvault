@@ -47,7 +47,7 @@ func TestImportWhatsAppCancelAtSyncCompletionRecordsDefaultIdentity(t *testing.T
 		return runCtx
 	}, home, fixture, false)
 	require.True(canceled(), "the cancel must land as the sync completes")
-	require.NoError(err)
+	require.ErrorIs(err, context.Canceled)
 	identities := whatsappIdentityTestIdentities(t, home)
 	require.Len(identities, 1, "the owner identity must be recorded")
 	assert.Equal(t, whatsappIdentityTestPhone, identities[0].Address)

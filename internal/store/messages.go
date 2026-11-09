@@ -1413,7 +1413,18 @@ func ensureConversation(
 // snapshot, so it uses the no-envelope fallback of
 // messageIdentityAttributionMatch; refreshMessageAttributionWith later settles
 // rows whose envelope disagrees.
-func upsertMessageSQL(now string) string {
+func upsertMessageSQL(now string, preserveMissingSender bool) string {
+	attributionUpdate := `sender_id = excluded.sender_id,
+		is_from_me = excluded.is_from_me,
+		source_is_from_me = excluded.source_is_from_me,
+		identity_is_from_me = excluded.identity_is_from_me`
+	if preserveMissingSender {
+		// Missing source identity is not evidence that known attribution vanished.
+		attributionUpdate = `sender_id = COALESCE(excluded.sender_id, messages.sender_id),
+		is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.is_from_me ELSE excluded.is_from_me END,
+		source_is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.source_is_from_me ELSE excluded.source_is_from_me END,
+		identity_is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.identity_is_from_me ELSE excluded.identity_is_from_me END`
+	}
 	return fmt.Sprintf(`
 	WITH attribution AS (
 		SELECT
@@ -1452,16 +1463,13 @@ func upsertMessageSQL(now string) string {
 		sent_at = excluded.sent_at,
 		received_at = excluded.received_at,
 		internal_date = excluded.internal_date,
-		sender_id = excluded.sender_id,
-		is_from_me = excluded.is_from_me,
-		source_is_from_me = excluded.source_is_from_me,
-		identity_is_from_me = excluded.identity_is_from_me,
+		%[2]s,
 		subject = excluded.subject,
 		snippet = excluded.snippet,
 		size_estimate = excluded.size_estimate,
 		has_attachments = CASE WHEN ? THEN messages.has_attachments ELSE excluded.has_attachments END,
 		attachment_count = CASE WHEN ? THEN messages.attachment_count ELSE excluded.attachment_count END,
-		is_sent = COALESCE(CAST(? AS BOOLEAN), messages.is_sent)`, now)
+		is_sent = COALESCE(CAST(? AS BOOLEAN), messages.is_sent)`, now, attributionUpdate)
 }
 
 // UpsertMessage inserts or updates a message.
@@ -1472,6 +1480,17 @@ func (s *Store) UpsertMessage(msg *Message) (int64, error) {
 
 // UpsertMessageContext honors cancellation during UpsertMessage.
 func (s *Store) UpsertMessageContext(ctx context.Context, msg *Message) (int64, error) {
+	return s.upsertMessageContext(ctx, msg, false)
+}
+
+// UpsertMessagePreservingAttributionContext retains an existing sender and its
+// attribution flags when the new source snapshot cannot resolve the sender.
+// It uses the same fenced transaction, journals and projections as any upsert.
+func (s *Store) UpsertMessagePreservingAttributionContext(ctx context.Context, msg *Message) (int64, error) {
+	return s.upsertMessageContext(ctx, msg, true)
+}
+
+func (s *Store) upsertMessageContext(ctx context.Context, msg *Message, preserveMissingSender bool) (int64, error) {
 	if msg == nil {
 		return 0, errors.New("upsert message requires a message")
 	}
@@ -1488,7 +1507,7 @@ func (s *Store) UpsertMessageContext(ctx context.Context, msg *Message) (int64, 
 			}
 		}
 		var err error
-		id, err = upsertMessageWith(q, s.dialect, msg)
+		id, err = upsertMessageWithMode(q, s.dialect, msg, preserveMissingSender)
 		if err != nil {
 			return err
 		}
@@ -1523,6 +1542,10 @@ type bodylessMessageJournalState struct {
 }
 
 func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
+	return upsertMessageWithMode(q, d, msg, false)
+}
+
+func upsertMessageWithMode(q querier, d Dialect, msg *Message, preserveMissingSender bool) (int64, error) {
 	journalCandidate := isBodylessMessageJournalCandidate(msg)
 	var prior bodylessMessageJournalState
 	if journalCandidate {
@@ -1544,7 +1567,7 @@ func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
 			return 0, fmt.Errorf("read bodyless message journal state: %w", err)
 		}
 	}
-	sql := upsertMessageSQL(d.Now())
+	sql := upsertMessageSQL(d.Now(), preserveMissingSender)
 	sourceIsFromMe := msg.IsFromMe && !msg.IdentityDerivedIsFromMe
 	identityIsFromMe := msg.IsFromMe && msg.IdentityDerivedIsFromMe
 	args := []any{
@@ -1580,6 +1603,12 @@ func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
 		).Scan(&id); err != nil {
 			return 0, err
 		}
+	}
+	if preserveMissingSender && !msg.SenderID.Valid && prior.found {
+		// Journal the effective sender retained by the SQL conflict update.
+		retained := *msg
+		retained.SenderID = prior.senderID
+		msg = &retained
 	}
 	if journalCandidate && needsBodylessMessageJournal(prior, msg) {
 		if err := appendBodylessMessageChange(q, d, id, prior, msg); err != nil {
@@ -3944,6 +3973,25 @@ func (s *Store) GetRandomMessageIDs(sourceID int64, limit int) ([]int64, error) 
 	return ids, rows.Err()
 }
 
+// PreviousFTSSenderContext captures sender search text before a body update
+// invalidates the old document. PostgreSQL falls back to the retained sender.
+func (s *Store) PreviousFTSSenderContext(ctx context.Context, messageID int64) (string, error) {
+	var fromAddr sql.NullString
+	if s.fts5Available && !s.IsPostgreSQL() {
+		err := s.db.QueryRowContext(ctx, `SELECT from_addr FROM messages_fts WHERE rowid = ?`, messageID).Scan(&fromAddr)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("read previous search sender: %w", err)
+		}
+	}
+	if !fromAddr.Valid {
+		err := s.db.QueryRowContext(ctx, `SELECT p.phone_number FROM messages m LEFT JOIN participants p ON p.id = m.sender_id WHERE m.id = ?`, messageID).Scan(&fromAddr)
+		if err != nil {
+			return "", fmt.Errorf("read previous sender: %w", err)
+		}
+	}
+	return fromAddr.String, nil
+}
+
 // UpsertFTS inserts or updates the FTS index for a message.
 // Indexing is a no-op if FTS is not available, but sync-scoped views still
 // enforce the generation fence and message ownership before skipping the write.
@@ -5935,6 +5983,19 @@ func (s *Store) EnsureConversationParticipantContext(ctx context.Context, conver
 		return write(boundQuerier{ctx: ctx, q: s.db})
 	}
 	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
+}
+
+// SetConversationParticipantRoleContext reconciles one observed roster role.
+// Members absent from this snapshot keep their historical membership and role.
+func (s *Store) SetConversationParticipantRoleContext(ctx context.Context, conversationID, participantID int64, role string) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if err := s.requireSyncConversationSourceTx(q, conversationID); err != nil {
+			return err
+		}
+		return mergeConversationParticipantsWith(q, s.dialect, conversationID,
+			[]ConversationParticipantRef{{ParticipantID: participantID, Role: role}})
+	})
 }
 
 // ConversationParticipantRef identifies one current member of a conversation.

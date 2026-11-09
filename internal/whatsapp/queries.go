@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -110,6 +111,20 @@ func fetchChats(ctx context.Context, db *sql.DB) ([]waChat, error) {
 		chats = append(chats, c)
 	}
 	return chats, rows.Err()
+}
+
+// countUnprocessedMessages distinguishes intentional hidden-chat exclusions
+// from messages that cannot be routed to an existing chat identity.
+func countUnprocessedMessages(ctx context.Context, db *sql.DB) (hidden, orphan int64, err error) {
+	err = db.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE WHEN c._id IS NOT NULL AND COALESCE(c.hidden, 0) <> 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN c._id IS NULL OR (COALESCE(c.hidden, 0) = 0 AND j._id IS NULL) THEN 1 ELSE 0 END), 0)
+		FROM message m LEFT JOIN chat c ON c._id = m.chat_row_id
+		LEFT JOIN jid j ON j._id = c.jid_row_id`).Scan(&hidden, &orphan)
+	if err != nil {
+		return 0, 0, fmt.Errorf("account for unprocessed messages: %w", err)
+	}
+	return hidden, orphan, nil
 }
 
 // fetchMessages returns messages for a chat, batched after a given _id.
@@ -316,28 +331,74 @@ func scanReactionChunk(rows *sql.Rows, result map[int64][]waReaction) error {
 	return rows.Err()
 }
 
-// fetchGroupParticipants returns all participants of a group chat.
-// The group_participants table is optional in newer WhatsApp Android schemas.
-// When absent, it returns an empty result without an error.
-// In the WhatsApp schema, group_participants.gjid and .jid are TEXT fields
-// containing raw JID strings (e.g., "447700900000@s.whatsapp.net"),
-// not integer row IDs.
+// groupRosterSchema recognizes supported layouts instead of treating an
+// unreadable roster as a complete empty group.
+func groupRosterSchema(ctx context.Context, db *sql.DB) string {
+	if hasColumn(ctx, db, "group_participant_user", "group_jid_row_id") &&
+		hasColumn(ctx, db, "group_participant_user", "user_jid_row_id") &&
+		hasColumn(ctx, db, "group_participant_user", "rank") &&
+		hasColumn(ctx, db, "group_participant_user", "pending") {
+		return "modern"
+	}
+	if hasColumn(ctx, db, "group_participants", "gjid") &&
+		hasColumn(ctx, db, "group_participants", "jid") &&
+		hasColumn(ctx, db, "group_participants", "admin") {
+		return "legacy"
+	}
+	return "unavailable"
+}
+
+// countOrphanRosterGroups catches entries whose group cannot be reached by a
+// per-chat lookup. A hidden chat is present even though it is not imported.
+func countOrphanRosterGroups(ctx context.Context, db *sql.DB) (int64, error) {
+	var query string
+	switch groupRosterSchema(ctx, db) {
+	case "modern":
+		query = `SELECT COUNT(*) FROM group_participant_user p LEFT JOIN jid g ON g._id = p.group_jid_row_id WHERE g._id IS NULL OR NOT EXISTS (SELECT 1 FROM chat c WHERE c.jid_row_id = g._id)`
+	case "legacy":
+		query = `SELECT COUNT(*) FROM group_participants p LEFT JOIN jid g ON g.raw_string = p.gjid WHERE g._id IS NULL OR NOT EXISTS (SELECT 1 FROM chat c WHERE c.jid_row_id = g._id)`
+	default:
+		return 0, nil
+	}
+	var count int64
+	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, fmt.Errorf("check group roster references: %w", err)
+	}
+	return count, nil
+}
+
+// fetchGroupParticipants reads legacy or modern rosters. Modern LIDs resolve
+// only through jid_map; they must never be interpreted as phone numbers.
+// Modern rank (1=admin, 2=superadmin) and pending=1 as unaccepted membership
+// are corroborated by the independent WAInsight importer, not an official
+// WhatsApp specification:
+// https://github.com/akhil-dara/WAInsight/blob/main/backend/app/ingestion/chat_ingester.py
 func fetchGroupParticipants(ctx context.Context, db *sql.DB, groupJIDRawString string) ([]waGroupMember, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT
-			gp.gjid,
-			gp.jid,
-			COALESCE(j.user, ''),
-			COALESCE(j.server, ''),
-			COALESCE(gp.admin, 0)
-		FROM group_participants gp
-		LEFT JOIN jid j ON gp.jid = j.raw_string
-		WHERE gp.gjid = ?
-	`, groupJIDRawString)
-	if err != nil {
-		if isTableNotFound(err) && strings.HasSuffix(err.Error(), "no such table: group_participants") {
-			return nil, nil
+	var query string
+	switch groupRosterSchema(ctx, db) {
+	case "modern":
+		if !hasColumn(ctx, db, "jid_map", "lid_row_id") || !hasColumn(ctx, db, "jid_map", "jid_row_id") {
+			return nil, errors.New("modern group roster cannot resolve LIDs: jid_map unavailable")
 		}
+		query = `SELECT g.raw_string, COALESCE(u.raw_string, ''),
+			COALESCE(phone.user, u.user, ''), COALESCE(phone.server, u.server, ''),
+			COALESCE(p.rank, -1), COALESCE(p.pending, -1)
+			FROM group_participant_user p
+			JOIN jid g ON g._id = p.group_jid_row_id
+			LEFT JOIN jid u ON u._id = p.user_jid_row_id
+			LEFT JOIN jid_map jm ON jm.lid_row_id = u._id
+			LEFT JOIN jid phone ON phone._id = jm.jid_row_id
+			WHERE g.raw_string = ?`
+	case "legacy":
+		query = `SELECT gp.gjid, gp.jid, COALESCE(j.user, ''), COALESCE(j.server, ''),
+			COALESCE(gp.admin, -1), 0
+			FROM group_participants gp LEFT JOIN jid j ON gp.jid = j.raw_string
+			WHERE gp.gjid = ?`
+	default:
+		return nil, errors.New("group roster schema unavailable")
+	}
+	rows, err := db.QueryContext(ctx, query, groupJIDRawString)
+	if err != nil {
 		return nil, fmt.Errorf("fetch group participants: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
@@ -345,10 +406,7 @@ func fetchGroupParticipants(ctx context.Context, db *sql.DB, groupJIDRawString s
 	var members []waGroupMember
 	for rows.Next() {
 		var m waGroupMember
-		if err := rows.Scan(
-			&m.GroupJID, &m.MemberJID,
-			&m.MemberUser, &m.MemberServer, &m.Admin,
-		); err != nil {
+		if err := rows.Scan(&m.GroupJID, &m.MemberJID, &m.MemberUser, &m.MemberServer, &m.Admin, &m.Pending); err != nil {
 			return nil, fmt.Errorf("scan group participant: %w", err)
 		}
 		members = append(members, m)
