@@ -148,6 +148,9 @@ func TestImportAppleTextMessages(t *testing.T) {
 	assert.Equal(int64(9), summary.MessagesProcessed)
 	assert.Equal(int64(4), summary.MessagesAdded)
 	assert.Equal(int64(5), summary.MessagesSkipped)
+	assert.Equal(map[string]int64{
+		"type_1": 1, "missing_key": 1, "empty_text": 1, "duplicate_stanza": 2,
+	}, summary.SkippedCounts)
 	assert.Equal(int64(4), summary.Participants)
 	assert.Equal(int64(1), summary.Errors)
 
@@ -752,7 +755,7 @@ func assertStoreCount(t *testing.T, db *sql.DB, table string, want int) {
 	assert.Equal(t, want, got, table)
 }
 
-func TestImportAppleSkippedChatWarningsRecorded(t *testing.T) {
+func TestImportApplePartialWarningsRemainFailedOnRerun(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	path := createAppleType7DuplicateFixture(t)
@@ -760,14 +763,28 @@ func TestImportAppleSkippedChatWarningsRecorded(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	importer := NewImporter(st, nil)
 	opts := ImportOptions{Phone: "+15555550100", BatchSize: 2}
-	summary, err := importer.Import(t.Context(), path, opts)
+	source, err := st.GetOrCreateSourceContext(t.Context(), "whatsapp", opts.Phone)
 	require.NoError(err)
-	require.Positive(summary.MessagesProcessed)
-	summary, err = importer.Import(t.Context(), path, opts)
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE sources SET last_sync_at = '2000-01-01 00:00:00' WHERE id = ?`), source.ID)
 	require.NoError(err)
-	assert.Zero(summary.MessagesProcessed)
-	assert.Equal(int64(1), summary.Errors)
-	run, err := st.GetLatestSync(summary.SourceID)
+	before, err := st.GetSourceByID(source.ID)
 	require.NoError(err)
-	assert.Equal(int64(1), run.ErrorsCount)
+	for attempt := range 2 {
+		summary, err := importer.Import(t.Context(), path, opts)
+		require.NoError(err)
+		assert.Equal(int64(5), summary.MessagesProcessed, "partial runs must not activate completed-chat markers")
+		assert.Equal(int64(1), summary.Errors)
+		assert.Equal(int64(4), summary.SkippedCounts["duplicate_stanza"])
+		assert.Equal(int64(attempt), summary.SkippedCounts["unchanged"])
+		run, err := st.GetLatestSync(summary.SourceID)
+		require.NoError(err)
+		assert.Equal("failed", run.Status)
+		assert.Equal(summary.MessagesProcessed, run.MessagesProcessed)
+		assert.Equal(summary.MessagesAdded, run.MessagesAdded)
+		assert.Equal(summary.MessagesUpdated, run.MessagesUpdated)
+		assert.Equal(summary.Errors, run.ErrorsCount)
+	}
+	after, err := st.GetSourceByID(source.ID)
+	require.NoError(err)
+	assert.Equal(before.LastSyncAt, after.LastSyncAt, "partial input must not advance source freshness")
 }

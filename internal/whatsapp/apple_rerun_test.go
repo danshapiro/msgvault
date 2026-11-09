@@ -117,6 +117,7 @@ func TestImportAppleRerunSkipsUnchangedMessages(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(int64(0), second.MessagesAdded)
 	assert.Equal(second.MessagesProcessed, second.MessagesSkipped)
+	assert.Equal(int64(4), second.SkippedCounts["unchanged"])
 	assert.Empty(rewrittenAppleMessages(t, st))
 	assertStoreCount(t, st.DB(), "messages", 4)
 }

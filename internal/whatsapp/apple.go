@@ -125,24 +125,28 @@ func (imp *Importer) importApple(
 	scoped.store = imp.store.ScopedToSync(source.ID, syncID)
 	imp = &scoped
 	defer func() {
+		// Record committed progress even after the caller cancels the import.
+		finishCtx := context.WithoutCancel(ctx)
+		var checkpoint *store.Checkpoint
 		if summary != nil {
-			retErr = errors.Join(retErr, imp.store.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
+			checkpoint = &store.Checkpoint{
 				MessagesProcessed: summary.MessagesProcessed, MessagesAdded: summary.MessagesAdded,
 				MessagesUpdated: summary.MessagesUpdated, ErrorsCount: summary.Errors,
-			}))
+			}
+			retErr = errors.Join(retErr, imp.store.UpdateSyncCheckpointContext(finishCtx, syncID, checkpoint))
 		}
-		if retErr != nil {
-			if summary != nil {
-				_ = imp.store.FailSyncWithCheckpoint(syncID, retErr.Error(), &store.Checkpoint{
-					MessagesProcessed: summary.MessagesProcessed, MessagesAdded: summary.MessagesAdded,
-					MessagesUpdated: summary.MessagesUpdated, ErrorsCount: summary.Errors,
-				})
-			} else {
-				_ = imp.store.FailSync(syncID, retErr.Error())
+		syncErr := retErr
+		if syncErr == nil && summary != nil && summary.Errors > 0 {
+			// Return the summary for the CLI receipt, but never complete a partial sync.
+			syncErr = fmt.Errorf("partial WhatsApp import: %d errors", summary.Errors)
+		}
+		if syncErr != nil {
+			if err := imp.store.FailSyncWithCheckpointContext(finishCtx, syncID, syncErr.Error(), checkpoint); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("fail Apple sync: %w", err))
 			}
 			return
 		}
-		if err := imp.store.CompleteSyncAndPreserveSourceCursorContext(context.WithoutCancel(ctx), syncID, source.ID, ""); err != nil {
+		if err := imp.store.CompleteSyncAndPreserveSourceCursorContext(finishCtx, syncID, source.ID, ""); err != nil {
 			retErr = fmt.Errorf("complete sync: %w", err)
 		}
 	}()
@@ -367,8 +371,9 @@ func (imp *Importer) importApple(
 					continue
 				}
 				summary.MessagesProcessed++
-				if !isImportableAppleMessage(sourceMessage, duplicateStanzas) {
+				if reason := appleMessageSkipReason(sourceMessage, duplicateStanzas); reason != "" {
 					summary.MessagesSkipped++
+					summary.SkippedCounts[reason]++
 					continue
 				}
 
@@ -425,6 +430,7 @@ func (imp *Importer) importApple(
 					}
 					if unchanged {
 						summary.MessagesSkipped++
+						summary.SkippedCounts["unchanged"]++
 						continue
 					}
 				}
@@ -818,13 +824,22 @@ func mapAppleMessage(
 // 7 for URL messages; these codes differ from Android. Keep this filter in
 // sync with fetchDuplicateAppleTextStanzas.
 func isImportableAppleMessage(message appleMessage, duplicateStanzas map[string]struct{}) bool {
-	if (message.MessageType != 0 && message.MessageType != 7) ||
-		!message.Text.Valid || strings.TrimSpace(message.Text.String) == "" ||
-		strings.TrimSpace(message.StanzaID) == "" {
-		return false
+	return appleMessageSkipReason(message, duplicateStanzas) == ""
+}
+
+func appleMessageSkipReason(message appleMessage, duplicateStanzas map[string]struct{}) string {
+	switch {
+	case message.MessageType != 0 && message.MessageType != 7:
+		return fmt.Sprintf("type_%d", message.MessageType)
+	case !message.Text.Valid || strings.TrimSpace(message.Text.String) == "":
+		return "empty_text"
+	case strings.TrimSpace(message.StanzaID) == "":
+		return "missing_key"
 	}
-	_, duplicate := duplicateStanzas[message.StanzaID]
-	return !duplicate
+	if _, duplicate := duplicateStanzas[message.StanzaID]; duplicate {
+		return "duplicate_stanza"
+	}
+	return ""
 }
 
 func appleMessageTimestamp(value appleTimestampValue) sql.NullTime {

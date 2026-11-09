@@ -12,12 +12,14 @@ import (
 
 // createAppleMarkerFixture adds the Core Data Z_OPT columns and Z_METADATA
 // store identity that a real ChatStorage.sqlite carries to the shared chat
-// fixture.
+// fixture. Duplicate text rows become media rows so marker reuse starts from
+// a complete import. Partial-warning retries have their own regression test.
 func createAppleMarkerFixture(t *testing.T) string {
 	t.Helper()
 	path := createAppleChatFixture(t)
 	execAppleFixture(t, path, appleMarkerSchema+`
 		INSERT INTO Z_METADATA VALUES (1, 'store-uuid-a', NULL);
+		UPDATE ZWAMESSAGE SET ZMESSAGETYPE = 1 WHERE ZSTANZAID = 'duplicate-text';
 	`)
 	return path
 }
@@ -42,8 +44,9 @@ func TestImportAppleCompletesAndUpdatesSourceFreshness(t *testing.T) {
 	require.NoError(err)
 	require.True(before.LastSyncAt.Valid)
 
-	_, err = NewImporter(st, nil).Import(t.Context(), createAppleChatFixture(t), opts)
+	summary, err := NewImporter(st, nil).Import(t.Context(), createAppleType7Fixture(t), opts)
 	require.NoError(err)
+	require.Zero(summary.Errors)
 	after, err := st.GetSourceByID(source.ID)
 	require.NoError(err)
 	require.True(after.LastSyncAt.Valid)
@@ -63,6 +66,7 @@ func TestImportAppleRerunSkipsUnchangedChats(t *testing.T) {
 	importer := NewImporter(st, nil)
 	first, err := importer.Import(t.Context(), chatDBPath, appleTestOptions())
 	require.NoError(err)
+	require.Zero(first.Errors)
 	require.Equal(int64(4), first.MessagesAdded)
 	markAppleMessagesUnwritten(t, st)
 

@@ -41,6 +41,13 @@ func TestImportWhatsAppReportsPartialWithoutConfirmingIdentity(t *testing.T) {
 	assert.Equal(int64(3), receipt.Processed)
 	assert.Equal(int64(1), receipt.Upserted)
 	assert.Equal(int64(2), receipt.Skipped)
+	assert.Equal(map[string]int64{"duplicate_stanza": 2}, receipt.SkippedCounts)
+	assert.Equal(map[string]int64{"duplicate_stanza": 1}, receipt.ErrorCounts)
+	run := whatsappIdentityTestLatestSync(t, home)
+	assert.Equal("failed", run.Status)
+	assert.Equal(receipt.Errors, run.ErrorsCount)
+	assert.Equal(receipt.Processed, run.MessagesProcessed)
+	assert.Equal(receipt.Added, run.MessagesAdded)
 }
 
 func TestImportWhatsAppConfirmsDefaultIdentityOnCleanImport(t *testing.T) {
@@ -105,17 +112,56 @@ func TestImportWhatsAppIdentityIsIdempotent(t *testing.T) {
 	assert.Equal("complete", receipt.Status)
 	assert.Zero(receipt.Added)
 	assert.EqualValues(1, receipt.Skipped)
+	assert.Equal(map[string]int64{"unchanged": 1}, receipt.SkippedCounts)
+}
+
+func TestImportWhatsAppAppleNormalSkipsRemainComplete(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	home := t.TempDir()
+	fixture := createWhatsAppIdentityFixture(t, false, false)
+	db, err := sql.Open("sqlite3", fixture)
+	require.NoError(err)
+	_, err = db.ExecContext(t.Context(), `INSERT INTO ZWAMESSAGE VALUES
+		(2, 1, NULL, 'image-message', 0, 700000001, 'caption', 1, '15555550101@s.whatsapp.net'),
+		(3, 1, NULL, 'unsupported-message', 0, 700000002, 'text', 8, '15555550101@s.whatsapp.net'),
+		(4, 1, NULL, 'empty-message', 0, 700000003, '   ', 0, '15555550101@s.whatsapp.net'),
+		(5, 1, NULL, '   ', 0, 700000004, 'text', 7, '15555550101@s.whatsapp.net')`)
+	require.NoError(err)
+	require.NoError(db.Close())
+	for attempt := range 2 {
+		output, err := runWhatsAppIdentityCommand(t, home, fixture, false)
+		require.NoError(err)
+		receipt := decodeWhatsAppImportReceipt(t, output)
+		assert.Equal("complete", receipt.Status)
+		assert.Zero(receipt.Errors)
+		assert.Equal(int64(5), receipt.Processed)
+		assert.Equal(int64(4+attempt), receipt.Skipped)
+		expected := map[string]int64{"type_1": 1, "type_8": 1, "empty_text": 1, "missing_key": 1}
+		if attempt > 0 {
+			expected["unchanged"] = 1
+		}
+		assert.Equal(expected, receipt.SkippedCounts)
+		run := whatsappIdentityTestLatestSync(t, home)
+		assert.Equal("completed", run.Status)
+		assert.Equal(receipt.Errors, run.ErrorsCount)
+		assert.Equal(receipt.Processed, run.MessagesProcessed)
+		assert.Equal(receipt.Added, run.MessagesAdded)
+		assert.Equal(receipt.Updated, run.MessagesUpdated)
+	}
 }
 
 type whatsAppImportReceipt struct {
-	Version   int    `json:"version"`
-	Status    string `json:"status"`
-	Errors    int64  `json:"errors"`
-	Processed int64  `json:"messages_processed"`
-	Upserted  int64  `json:"messages_upserted"`
-	Added     int64  `json:"messages_added"`
-	Updated   int64  `json:"messages_updated"`
-	Skipped   int64  `json:"messages_skipped"`
+	Version       int              `json:"version"`
+	Status        string           `json:"status"`
+	Errors        int64            `json:"errors"`
+	Processed     int64            `json:"messages_processed"`
+	Upserted      int64            `json:"messages_upserted"`
+	Added         int64            `json:"messages_added"`
+	Updated       int64            `json:"messages_updated"`
+	Skipped       int64            `json:"messages_skipped"`
+	SkippedCounts map[string]int64 `json:"skipped_counts"`
+	ErrorCounts   map[string]int64 `json:"error_counts"`
 }
 
 func decodeWhatsAppImportReceipt(t *testing.T, output string) whatsAppImportReceipt {
@@ -128,7 +174,26 @@ func decodeWhatsAppImportReceipt(t *testing.T, output string) whatsAppImportRece
 	require.NoError(t, json.Unmarshal([]byte(encoded), &result))
 	assert.Equal(t, 1, result.Version)
 	assert.Equal(t, result.Added+result.Updated, result.Upserted)
+	var skipped int64
+	for _, count := range result.SkippedCounts {
+		skipped += count
+	}
+	assert.Equal(t, result.Skipped, skipped, "receipt skip categories must account for every skipped message")
 	return result
+}
+
+func whatsappIdentityTestLatestSync(t *testing.T, home string) *store.SyncRun {
+	t.Helper()
+	require := require.New(t)
+	db, err := store.Open(filepath.Join(home, "msgvault.db"))
+	require.NoError(err)
+	defer func() { _ = db.Close() }()
+	sources, err := db.GetSourcesByIdentifier(whatsappIdentityTestPhone)
+	require.NoError(err)
+	require.Len(sources, 1)
+	run, err := db.GetLatestSync(sources[0].ID)
+	require.NoError(err)
+	return run
 }
 
 func runWhatsAppIdentityCommand(
