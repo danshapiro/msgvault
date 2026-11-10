@@ -282,6 +282,7 @@ func openAnalyzedList(tb testing.TB, n int) (*Store, string) {
 func TestListMessages_AnalyzedFullQuery(t *testing.T) {
 	for _, n := range []int{80000, 160000} {
 		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			assert := assert.New(t)
 			s, path := openAnalyzedList(t, n)
 			var messages []APIMessage
 			var total int64
@@ -291,34 +292,34 @@ func TestListMessages_AnalyzedFullQuery(t *testing.T) {
 				require.NoError(t, err)
 			})
 			require.Len(t, messages, 20)
-			assert.Equal(t, int64(n*38/40), total)
+			assert.Equal(int64(n*38/40), total)
 			ids := analyzedListIDs(n, nil, nil)
 			for i, message := range messages {
 				id := ids[40+i]
-				assert.Equal(t, id, message.ID)
-				assert.Equal(t, int64(1+id%10), message.SourceID)
-				assert.Equal(t, fmt.Sprintf("thread-%d", 1+id%10), message.SourceConversationID)
-				assert.Equal(t, fmt.Sprintf("message-%d", id), message.SourceMessageID)
-				assert.Equal(t, fmt.Sprintf("Subject %d", id), message.Subject)
-				assert.Equal(t, fmt.Sprintf("Snippet %d", id), message.Snippet)
-				assert.True(t, analyzedListDate(int(id)).Equal(message.SentAt))
-				assert.Equal(t, "Sender <sender@example.test>", message.From)
-				assert.Equal(t, "sender@example.test", message.FromEmail)
-				assert.Equal(t, "Sender", message.FromName)
-				assert.Equal(t, []string{"To <to@example.test>"}, message.To)
-				assert.Equal(t, []string{"Cc <cc@example.test>"}, message.Cc)
-				assert.Equal(t, []string{"Bcc <bcc@example.test>"}, message.Bcc)
-				assert.Equal(t, []string{"Synthetic"}, message.Labels)
-				assert.True(t, message.HasAttachments)
-				assert.True(t, message.HiddenTextPresent)
-				assert.Equal(t, int64(1000)+id, message.SizeEstimate)
+				assert.Equal(id, message.ID)
+				assert.Equal(int64(1+id%10), message.SourceID)
+				assert.Equal(fmt.Sprintf("thread-%d", 1+id%10), message.SourceConversationID)
+				assert.Equal(fmt.Sprintf("message-%d", id), message.SourceMessageID)
+				assert.Equal(fmt.Sprintf("Subject %d", id), message.Subject)
+				assert.Equal(fmt.Sprintf("Snippet %d", id), message.Snippet)
+				assert.True(analyzedListDate(int(id)).Equal(message.SentAt))
+				assert.Equal("Sender <sender@example.test>", message.From)
+				assert.Equal("sender@example.test", message.FromEmail)
+				assert.Equal("Sender", message.FromName)
+				assert.Equal([]string{"To <to@example.test>"}, message.To)
+				assert.Equal([]string{"Cc <cc@example.test>"}, message.Cc)
+				assert.Equal([]string{"Bcc <bcc@example.test>"}, message.Bcc)
+				assert.Equal([]string{"Synthetic"}, message.Labels)
+				assert.True(message.HasAttachments)
+				assert.True(message.HiddenTextPresent)
+				assert.Equal(int64(1000)+id, message.SizeEstimate)
 			}
 			countPlan := explainPlan(t, s, countSQL)
 			pagePlan := explainPlan(t, s, pageSQL, 20, 40)
 			t.Logf("count plan:\n%s\nfull page plan:\n%s", countPlan, pagePlan)
-			assert.Contains(t, countPlan, "idx_messages_live_sent_at")
-			assert.Contains(t, pagePlan, "idx_messages_live_sent_at")
-			assert.NotContains(t, pagePlan, "TEMP B-TREE")
+			assert.Contains(countPlan, "idx_messages_live_sent_at")
+			assert.Contains(pagePlan, "idx_messages_live_sent_at")
+			assert.NotContains(pagePlan, "TEMP B-TREE")
 			measureListCLI(t, s, path, n, "count", countSQL)
 			measureListCLI(t, s, path, n, "page", pageSQL, 20, 40)
 			measureListCLI(t, s, path, n, "deep-page", pageSQL, 20, n/2)
@@ -386,43 +387,45 @@ func measureListTrim(t *testing.T, s *Store, path string, n int) {
 }
 
 func TestListMessages_TrimProjectionSemantics(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	path := filepath.Join(t.TempDir(), "trim.db")
 	s, err := OpenForTest(t.Context(), path)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, s.Close()) })
-	require.NoError(t, s.InitSchema())
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(s.Close()) })
+	require.NoError(s.InitSchema())
 	source, err := s.GetOrCreateSourceContext(t.Context(), "test", "projection@example.test")
-	require.NoError(t, err)
+	require.NoError(err)
 	conversation, err := s.EnsureConversation(t.Context(), source.ID, "projection", "Synthetic")
-	require.NoError(t, err)
+	require.NoError(err)
 	_, err = s.DB().ExecContext(t.Context(), `INSERT INTO participants (id, email_address, display_name) VALUES
 		(1, 'null@example.test', NULL), (2, 'empty@example.test', ''),
 		(3, NULL, NULL), (4, 'space@example.test', char(9) || ' Name ' || char(10))`)
-	require.NoError(t, err)
+	require.NoError(err)
 	for id := 1; id <= 5; id++ {
 		message := seedMessage(t, s, source.ID, conversation, strconv.Itoa(id), "Synthetic", "")
 		if id <= 4 {
-			require.NoError(t, s.ReplaceMessageRecipientsContext(t.Context(), message, "from", []int64{int64(id)}, nil))
+			require.NoError(s.ReplaceMessageRecipientsContext(t.Context(), message, "from", []int64{int64(id)}, nil))
 		}
 	}
 	want, wantTotal, err := s.ListMessagesContext(t.Context(), 0, 10, nil)
-	require.NoError(t, err)
-	require.Len(t, want, 5)
-	assert.Equal(t, "", want[0].From, "missing sender")
-	assert.Equal(t, "\t Name \n <space@example.test>", want[1].From, "tabs/newlines survive SQLite trim")
-	assert.Equal(t, "", want[2].From, "NULL sender email/name")
-	assert.Equal(t, "empty@example.test", want[3].From)
-	assert.Equal(t, "null@example.test", want[4].From)
+	require.NoError(err)
+	require.Len(want, 5)
+	assert.Equal("", want[0].From, "missing sender")
+	assert.Equal("\t Name \n <space@example.test>", want[1].From, "tabs/newlines survive SQLite trim")
+	assert.Equal("", want[2].From, "NULL sender email/name")
+	assert.Equal("empty@example.test", want[3].From)
+	assert.Equal("null@example.test", want[4].From)
 	var calls atomic.Int64
 	db := newListTrimDB(t, path, &calls)
-	defer func() { require.NoError(t, db.Close()) }()
+	defer func() { require.NoError(db.Close()) }()
 	original := s.db.DB
 	s.db.DB = db
 	defer func() { s.db.DB = original }()
 	got, gotTotal, err := s.ListMessagesContext(t.Context(), 0, 10, nil)
-	require.NoError(t, err)
-	assert.Equal(t, wantTotal, gotTotal)
-	assert.Equal(t, want, got, "full real sender projections are unchanged by the transparent hook")
+	require.NoError(err)
+	assert.Equal(wantTotal, gotTotal)
+	assert.Equal(want, got, "full real sender projections are unchanged by the transparent hook")
 }
 
 func measureListCLI(t *testing.T, s *Store, path string, n int, kind, query string, args ...int) {
@@ -490,6 +493,7 @@ func TestListMessages_AnalyzedPagesAndScopes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
 			ctx := t.Context()
 			if tc.authorized != nil {
 				ctx = sourcescope.WithSourceIDs(ctx, tc.authorized)
@@ -503,66 +507,69 @@ func TestListMessages_AnalyzedPagesAndScopes(t *testing.T) {
 					messages, total, err = s.ListMessagesContext(ctx, offset, 20, tc.requested)
 					require.NoError(t, err)
 				})
-				assert.Equal(t, int64(len(want)), total)
+				assert.Equal(int64(len(want)), total)
 				var got []int64
 				for _, message := range messages {
 					got = append(got, message.ID)
 				}
 				start := min(offset, len(want))
 				expected := want[start:min(start+20, len(want))]
-				assert.Equal(t, len(expected), len(got))
-				assert.Equal(t, append([]int64{}, expected...), append([]int64{}, got...))
+				assert.Equal(len(expected), len(got))
+				assert.Equal(append([]int64{}, expected...), append([]int64{}, got...))
 				if tc.scoped {
-					assert.NotContains(t, count, "INDEXED BY")
-					assert.NotContains(t, page, "INDEXED BY")
+					assert.NotContains(count, "INDEXED BY")
+					assert.NotContains(page, "INDEXED BY")
 				}
 			}
 		})
 	}
+	require := require.New(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	start := time.Now()
 	_, _, err := s.ListMessagesContext(ctx, 0, 20, nil)
-	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(err, context.Canceled)
 	assert.Less(t, time.Since(start), 5*time.Second)
 	messages, _, err := s.ListMessagesContext(t.Context(), 0, 20, nil)
-	require.NoError(t, err)
-	require.Len(t, messages, 20)
+	require.NoError(err)
+	require.Len(messages, 20)
 }
 
 func TestListMessages_LiveIndexSetup(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 	path := filepath.Join(t.TempDir(), "index-setup.db")
 	s, err := OpenForTest(t.Context(), path)
-	require.NoError(t, err)
-	require.NoError(t, s.InitSchema())
+	require.NoError(err)
+	require.NoError(s.InitSchema())
 	var name string
-	require.NoError(t, s.DB().QueryRowContext(t.Context(),
+	require.NoError(s.DB().QueryRowContext(t.Context(),
 		"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_live_sent_at'").Scan(&name))
-	assert.Equal(t, "idx_messages_live_sent_at", name)
+	assert.Equal("idx_messages_live_sent_at", name)
 	_, err = s.DB().ExecContext(t.Context(), "DROP INDEX idx_messages_live_sent_at")
-	require.NoError(t, err)
+	require.NoError(err)
 	_, _, err = s.ListMessagesContext(t.Context(), 0, 20, nil)
-	require.ErrorContains(t, err, "idx_messages_live_sent_at", "missing required setup remains an explicit error")
+	require.ErrorContains(err, "idx_messages_live_sent_at", "missing required setup remains an explicit error")
 	_, err = s.DB().ExecContext(t.Context(),
 		"UPDATE archive_metadata SET value=? WHERE key='schema_version'", strconv.Itoa(SchemaVersion-1))
-	require.NoError(t, err)
-	require.NoError(t, s.Close())
+	require.NoError(err)
+	require.NoError(s.Close())
 
 	// InitSchema also installs the index for an older archive missing it.
 	s, err = OpenForTest(t.Context(), path)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, s.Close()) })
-	require.NoError(t, s.InitSchema())
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(s.Close()) })
+	require.NoError(s.InitSchema())
 	version, err := s.SchemaVersionContext(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, SchemaVersion, version)
+	require.NoError(err)
+	assert.Equal(SchemaVersion, version)
 	messages, total, err := s.ListMessagesContext(t.Context(), 0, 20, nil)
-	require.NoError(t, err)
-	assert.Empty(t, messages)
-	assert.Zero(t, total)
-	require.NoError(t, s.DB().QueryRowContext(t.Context(),
+	require.NoError(err)
+	assert.Empty(messages)
+	assert.Zero(total)
+	require.NoError(s.DB().QueryRowContext(t.Context(),
 		"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_live_sent_at'").Scan(&name))
-	assert.Equal(t, "idx_messages_live_sent_at", name)
+	assert.Equal("idx_messages_live_sent_at", name)
 }
 
 func TestListMessages_PostgreSQLQueryRemainsPortable(t *testing.T) {

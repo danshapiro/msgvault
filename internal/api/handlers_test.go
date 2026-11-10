@@ -3643,15 +3643,16 @@ func TestCLIAttachmentServesPackedBlob(t *testing.T) {
 }
 
 func TestHandleListMessages_SQLiteFallbackOrderingAndScope(t *testing.T) {
+	rootRequire := require.New(t)
 	st := testutil.NewTestStore(t)
 	var sources []int64
 	var conversations []int64
 	for _, address := range []string{"first@example.test", "second@example.test"} {
 		source, err := st.GetOrCreateSourceContext(t.Context(), "test", address)
-		require.NoError(t, err)
+		rootRequire.NoError(err)
 		sources = append(sources, source.ID)
 		conversation, err := st.EnsureConversation(t.Context(), source.ID, "synthetic-http", "Synthetic")
-		require.NoError(t, err)
+		rootRequire.NoError(err)
 		conversations = append(conversations, conversation)
 	}
 	date := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -3672,12 +3673,12 @@ func TestHandleListMessages_SQLiteFallbackOrderingAndScope(t *testing.T) {
 			message.SentAt = sql.NullTime{Time: date.AddDate(10, 0, 0), Valid: true}
 		}
 		id, err := st.UpsertMessageContext(t.Context(), message)
-		require.NoError(t, err)
+		rootRequire.NoError(err)
 		ids = append(ids, id)
 	}
-	require.NoError(t, st.MarkMessageDeletedContext(t.Context(), sources[0], "fallback-6"))
+	rootRequire.NoError(st.MarkMessageDeletedContext(t.Context(), sources[0], "fallback-6"))
 	_, err := st.MergeDuplicates(t.Context(), ids[2], []int64{ids[7]}, "synthetic-http")
-	require.NoError(t, err)
+	rootRequire.NoError(err)
 	cfg := config.NewDefaultConfig()
 	cfg.Data.DataDir = t.TempDir()
 	srv := NewServerWithOptions(ServerOptions{Config: cfg, Store: st, Logger: testLogger()})
@@ -3692,6 +3693,8 @@ func TestHandleListMessages_SQLiteFallbackOrderingAndScope(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
 			ctx := t.Context()
 			if tc.authorized != nil {
 				ctx = sourcescope.WithSourceIDs(ctx, tc.authorized)
@@ -3701,20 +3704,20 @@ func TestHandleListMessages_SQLiteFallbackOrderingAndScope(t *testing.T) {
 				request := httptest.NewRequestWithContext(ctx, http.MethodGet,
 					fmt.Sprintf("/api/v1/messages?page=%d&page_size=2", page), nil)
 				srv.Handler(nil).ServeHTTP(w, request)
-				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				require.Equal(http.StatusOK, w.Code, w.Body.String())
 				var response MessageListResponse
-				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
-				assert.Equal(t, int64(len(tc.want)), response.Total)
-				assert.Equal(t, page, response.Page)
-				assert.Equal(t, 2, response.PageSize)
+				require.NoError(json.Unmarshal(w.Body.Bytes(), &response))
+				assert.Equal(int64(len(tc.want)), response.Total)
+				assert.Equal(page, response.Page)
+				assert.Equal(2, response.PageSize)
 				start := min((page-1)*2, len(tc.want))
 				want := tc.want[start:min(start+2, len(tc.want))]
 				got := make([]int64, 0, len(response.Messages))
 				for _, message := range response.Messages {
 					got = append(got, message.ID)
 				}
-				assert.Equal(t, len(want), len(got))
-				assert.Equal(t, append([]int64{}, want...), got)
+				assert.Equal(len(want), len(got))
+				assert.Equal(append([]int64{}, want...), got)
 			}
 		})
 	}
