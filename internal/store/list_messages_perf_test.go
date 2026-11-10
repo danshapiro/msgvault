@@ -297,7 +297,7 @@ func TestListMessages_AnalyzedFullQuery(t *testing.T) {
 			for i, message := range messages {
 				id := ids[40+i]
 				assert.Equal(id, message.ID)
-				assert.Equal(int64(1+id%10), message.SourceID)
+				assert.Equal(1+id%10, message.SourceID)
 				assert.Equal(fmt.Sprintf("thread-%d", 1+id%10), message.SourceConversationID)
 				assert.Equal(fmt.Sprintf("message-%d", id), message.SourceMessageID)
 				assert.Equal(fmt.Sprintf("Subject %d", id), message.Subject)
@@ -332,8 +332,8 @@ var trimDriverSequence atomic.Int64
 
 // newListTrimDB uses a supported connection hook only on a test-owned pool.
 // SQLite's default trim removes U+0020 only, and propagates NULL.
-func newListTrimDB(t testing.TB, path string, calls *atomic.Int64) *sql.DB {
-	t.Helper()
+func newListTrimDB(tb testing.TB, path string, calls *atomic.Int64) *sql.DB {
+	tb.Helper()
 	driver := fmt.Sprintf("list-trim-%d", trimDriverSequence.Add(1))
 	sql.Register(driver, &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 		if err := sqliteutil.RegisterFunctions(conn); err != nil {
@@ -357,7 +357,7 @@ func newListTrimDB(t testing.TB, path string, calls *atomic.Int64) *sql.DB {
 		}, true)
 	}})
 	db, err := sql.Open(driver, appendSQLiteParams(path, testSQLiteParams))
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	setSQLitePoolSize(db)
 	return db
 }
@@ -411,9 +411,9 @@ func TestListMessages_TrimProjectionSemantics(t *testing.T) {
 	want, wantTotal, err := s.ListMessagesContext(t.Context(), 0, 10, nil)
 	require.NoError(err)
 	require.Len(want, 5)
-	assert.Equal("", want[0].From, "missing sender")
+	assert.Empty(want[0].From, "missing sender")
 	assert.Equal("\t Name \n <space@example.test>", want[1].From, "tabs/newlines survive SQLite trim")
-	assert.Equal("", want[2].From, "NULL sender email/name")
+	assert.Empty(want[2].From, "NULL sender email/name")
 	assert.Equal("empty@example.test", want[3].From)
 	assert.Equal("null@example.test", want[4].From)
 	var calls atomic.Int64
@@ -514,7 +514,7 @@ func TestListMessages_AnalyzedPagesAndScopes(t *testing.T) {
 				}
 				start := min(offset, len(want))
 				expected := want[start:min(start+20, len(want))]
-				assert.Equal(len(expected), len(got))
+				assert.Len(got, len(expected))
 				assert.Equal(append([]int64{}, expected...), append([]int64{}, got...))
 				if tc.scoped {
 					assert.NotContains(count, "INDEXED BY")

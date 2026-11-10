@@ -1452,7 +1452,9 @@ func TestEditConfigPreservesDisplacedArtifactWhenConflictRollbackFails(t *testin
 	recovered, readErr := os.ReadFile(artifacts[0])
 	require.NoError(readErr)
 	assert.Equal(t, beforeText, string(recovered))
-	assert.Contains(t, err.Error(), artifacts[0])
+	resolvedArtifact, resolveErr := filepath.EvalSymlinks(artifacts[0])
+	require.NoError(resolveErr)
+	assert.Contains(t, err.Error(), resolvedArtifact)
 }
 
 func TestConditionalReplaceRollbackPreservesLaterWriter(t *testing.T) {

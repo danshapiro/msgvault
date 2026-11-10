@@ -3716,7 +3716,7 @@ func TestHandleListMessages_SQLiteFallbackOrderingAndScope(t *testing.T) {
 				for _, message := range response.Messages {
 					got = append(got, message.ID)
 				}
-				assert.Equal(len(want), len(got))
+				assert.Len(got, len(want))
 				assert.Equal(append([]int64{}, want...), got)
 			}
 		})
