@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -1028,6 +1027,41 @@ func newExploreDuckDBFixtureWithClusters(
 	options identityCacheFixtureOptions,
 ) (*query.DuckDBEngine, string) {
 	tb.Helper()
+	messageSelect := "SELECT *, false AS archive_only FROM (VALUES " + messageValues + ") AS t(" +
+		"id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month)"
+	return newExploreDuckDBFixtureFromSelects(tb, []string{messageSelect}, recipientValues, clusterValues, lastMessageID, options, query.DuckDBOptions{})
+}
+
+// newGeneratedExploreFixture keeps the native ordered-result regression larger
+// than a native output chunk without constructing an archive-sized Go slice.
+func newGeneratedExploreFixture(tb testing.TB, n int64) (*query.DuckDBEngine, string) {
+	tb.Helper()
+	require.Positive(tb, n)
+	started := time.Now()
+	const projection = `SELECT i::BIGINT AS id, (1 + i %% 2)::BIGINT AS source_id,
+       'synthetic-' || i AS source_message_id, (101 + i %% 3)::BIGINT AS conversation_id,
+       'Synthetic' AS subject, 'Synthetic snippet' AS snippet,
+       TIMESTAMP '2026-07-18 00:00:00' + (i %% 4096) * INTERVAL 1 SECOND AS sent_at,
+       100::BIGINT AS size_estimate, false AS has_attachments,
+       0::INTEGER AS attachment_count, NULL::TIMESTAMP AS deleted_from_source_at,
+       1::BIGINT AS sender_id, NULL::BIGINT AS owner_participant_id,
+       'email' AS message_type, NULL::VARCHAR AS list_id, false AS is_from_me,
+       2026 AS year, 7 AS month, false AS archive_only
+FROM range(%d, %d) AS r(i)`
+	engine, dir := newExploreDuckDBFixtureFromSelects(tb, []string{
+		fmt.Sprintf(projection, 1, n/2+1), fmt.Sprintf(projection, n/2+1, n+1),
+	}, exploreFixtureDefaultRecipients, "", n, identityCacheFixtureOptions{}, query.DuckDBOptions{Threads: 4})
+	tb.Logf("generated %d messages in %s", n, time.Since(started))
+	return engine, dir
+}
+
+// Each SELECT writes one disjoint message partition; all other fixture tables
+// and the complete committed publication are shared with the small fixtures.
+func newExploreDuckDBFixtureFromSelects(
+	tb testing.TB, messageSelects []string, recipientValues, clusterValues string, lastMessageID int64,
+	options identityCacheFixtureOptions, engineOptions query.DuckDBOptions,
+) (*query.DuckDBEngine, string) {
+	tb.Helper()
 	clusters, noClusters := clusterValues, clusterValues == ""
 	if noClusters {
 		clusters = `(0::BIGINT, 0::BIGINT)`
@@ -1041,11 +1075,6 @@ func newExploreDuckDBFixtureWithClusters(
 		dir, file, columns, values string
 		empty                      bool
 	}{
-		{
-			dir: "messages/year=2026", file: "messages.parquet",
-			columns: "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month",
-			values:  messageValues,
-		},
 		{dir: "sources", file: "sources.parquet", columns: "id, account_email, source_type", values: `(1::BIGINT, 'archive-a@example.com', 'gmail'), (2::BIGINT, 'archive-b@example.com', 'imap')`},
 		{dir: "participants", file: "participants.parquet", columns: "id, email_address, domain, display_name, phone_number", values: `(1::BIGINT, 'alice@example.com', 'example.com', 'Alice', ''), (2::BIGINT, 'bob@members.example', 'members.example', 'Bob', '')`},
 		{dir: "participant_identifiers", file: "participant_identifiers.parquet", columns: "participant_id, identifier_type, identifier_value, display_value, is_primary", values: `(1::BIGINT, 'email', 'alice@example.com', 'alice@example.com', true), (2::BIGINT, 'email', 'bob@members.example', 'bob@members.example', true)`},
@@ -1066,13 +1095,21 @@ func newExploreDuckDBFixtureWithClusters(
 			where = " WHERE false"
 		}
 		path := filepath.ToSlash(filepath.Join(dir, table.file))
-		projection := "*"
-		if strings.HasPrefix(table.dir, "messages/") {
-			projection += ", false AS archive_only"
-		}
-		_, err := db.ExecContext(tb.Context(), fmt.Sprintf("COPY (SELECT %s FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", projection, table.values, table.columns, where, path))
+		_, err := db.ExecContext(tb.Context(), fmt.Sprintf("COPY (SELECT * FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", table.values, table.columns, where, path))
 		require.NoError(tb, err, "write %s", table.dir)
 	}
+	messageDir := filepath.Join(analyticsDir, "messages", "year=2026")
+	require.NoError(tb, os.MkdirAll(messageDir, 0o755))
+	for i, messageSelect := range messageSelects {
+		filename := "messages.parquet"
+		if i > 0 {
+			filename = fmt.Sprintf("messages-%d.parquet", i)
+		}
+		path := filepath.ToSlash(filepath.Join(messageDir, filename))
+		_, err := db.ExecContext(tb.Context(), fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET)", messageSelect, path))
+		require.NoError(tb, err, "write messages partition %d", i)
+	}
+
 	ensureIdentityCacheFixtureDatasets(tb, db, analyticsDir, options)
 	fingerprint, err := query.CacheDatasetFingerprint(analyticsDir)
 	require.NoError(tb, err)
@@ -1084,7 +1121,10 @@ func newExploreDuckDBFixtureWithClusters(
 	require.NoError(tb, err)
 	require.NoError(tb, os.WriteFile(query.CacheStatePath(analyticsDir), state, 0o600))
 
-	engine, err := query.NewDuckDBEngine(tb.Context(), analyticsDir, "", nil)
+	// No writer connection is needed while querying the published fixture.
+	// Release its native pool before opening the bounded reader.
+	require.NoError(tb, db.Close())
+	engine, err := query.NewDuckDBEngine(tb.Context(), analyticsDir, "", nil, engineOptions)
 	require.NoError(tb, err)
 	tb.Cleanup(func() { require.NoError(tb, engine.Close()) })
 	return engine, analyticsDir

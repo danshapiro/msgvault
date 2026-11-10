@@ -21,6 +21,10 @@ type Policy struct {
 	Threads              int
 	TempDirectory        string
 	MaxTempDirectorySize string
+	// PreserveInsertionOrder works around native DuckDB 2.0.0 prepared-result
+	// ordering for interactive reads. SQL ORDER BY must still be respected;
+	// builders retain their unordered streaming policy.
+	PreserveInsertionOrder bool
 }
 
 // InteractiveOverrides contains optional interactive/daemon-query policy
@@ -45,10 +49,11 @@ type BuilderOverrides struct {
 // InteractivePolicy returns the bounded policy for daemon-side queries.
 func InteractivePolicy(tempDirectory string) Policy {
 	return Policy{
-		MemoryLimit:          "512MB",
-		Threads:              min(runtime.GOMAXPROCS(0), 4),
-		TempDirectory:        tempDirectory,
-		MaxTempDirectorySize: "2GB",
+		MemoryLimit:            "512MB",
+		Threads:                min(runtime.GOMAXPROCS(0), 4),
+		TempDirectory:          tempDirectory,
+		MaxTempDirectorySize:   "2GB",
+		PreserveInsertionOrder: true,
 	}
 }
 
@@ -80,10 +85,11 @@ func BuilderPolicyWithOverrides(tempDirectory string, overrides BuilderOverrides
 		memoryLimit = defaultBuilderMemoryLimit()
 	}
 	policy := Policy{
-		MemoryLimit:          memoryLimit,
-		Threads:              min(runtime.GOMAXPROCS(0), 2),
-		TempDirectory:        tempDirectory,
-		MaxTempDirectorySize: "32GB",
+		MemoryLimit:            memoryLimit,
+		Threads:                min(runtime.GOMAXPROCS(0), 2),
+		TempDirectory:          tempDirectory,
+		MaxTempDirectorySize:   "32GB",
+		PreserveInsertionOrder: false,
 	}
 	if overrides.Threads != 0 {
 		policy.Threads = overrides.Threads
@@ -160,7 +166,7 @@ func Apply(ctx context.Context, db *sql.DB, policy Policy) error {
 		{name: "memory_limit", sql: "SET memory_limit = '" + policy.MemoryLimit + "'"},
 		{name: "threads", sql: fmt.Sprintf("SET threads = %d", policy.Threads)},
 		{name: "async_threads", sql: fmt.Sprintf("SET async_threads = %d", policy.Threads)},
-		{name: "preserve_insertion_order", sql: "SET preserve_insertion_order = false"},
+		{name: "preserve_insertion_order", sql: fmt.Sprintf("SET preserve_insertion_order = %t", policy.PreserveInsertionOrder)},
 		{name: "temp_directory", sql: "SET temp_directory = '" + quotedTemp + "'"},
 		{name: "max_temp_directory_size", sql: "SET max_temp_directory_size = '" + policy.MaxTempDirectorySize + "'"},
 	}

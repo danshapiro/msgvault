@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -79,32 +80,47 @@ func TestBuilderPolicyWithOverrides(t *testing.T) {
 }
 
 func TestPolicyAppliesEffectiveSettings(t *testing.T) {
-	assert, require := assert.New(t), require.New(t)
-	tempDir := filepath.Join(t.TempDir(), "spill")
-	policy := Policy{
-		MemoryLimit:          "512MB",
-		Threads:              3,
-		TempDirectory:        tempDir,
-		MaxTempDirectorySize: "2GB",
+	for _, test := range []struct {
+		name    string
+		policy  func(string) Policy
+		ordered bool
+	}{
+		{"interactive default", InteractivePolicy, true},
+		{"interactive override", func(dir string) Policy {
+			return InteractivePolicyWithOverrides(dir, InteractiveOverrides{MemoryLimit: "384MB", Threads: 3, MaxTempDirectorySize: "1GB"})
+		}, true},
+		{"builder default", BuilderPolicy, false},
+		{"builder override", func(dir string) Policy {
+			return BuilderPolicyWithOverrides(dir, BuilderOverrides{MemoryLimit: "1536MB", Threads: 3, MaxTempDirectorySize: "12GB"})
+		}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertions, requirements := assert.New(t), require.New(t)
+			tempDir := filepath.Join(t.TempDir(), "spill")
+			policy := test.policy(tempDir)
+			db, err := Open(t.Context(), policy)
+			requirements.NoError(err)
+			t.Cleanup(func() { requirements.NoError(db.Close()) })
+			requirements.NoError(db.PingContext(t.Context()))
+			assertions.DirExists(tempDir)
+			// Read effective settings on the actual connection; DuckDB renders
+			// byte sizes truncated to one decimal in the chosen binary unit.
+			var threads, asyncThreads int
+			var preserveOrder bool
+			var spillDir string
+			var memory, temp string
+			requirements.NoError(db.QueryRowContext(t.Context(), `SELECT current_setting('threads'), current_setting('async_threads'),
+				current_setting('preserve_insertion_order'), current_setting('temp_directory'),
+				current_setting('memory_limit'), current_setting('max_temp_directory_size')`).
+				Scan(&threads, &asyncThreads, &preserveOrder, &spillDir, &memory, &temp))
+			assertions.Equal(policy.Threads, threads)
+			assertions.Equal(policy.Threads, asyncThreads)
+			assertions.Equal(test.ordered, preserveOrder)
+			assertions.Equal(tempDir, spillDir)
+			assertions.InDelta(policyBytes(t, policy.MemoryLimit), policyBytes(t, memory), policyBytes(t, "0.1 "+strings.Fields(memory)[1]))
+			assertions.InDelta(policyBytes(t, policy.MaxTempDirectorySize), policyBytes(t, temp), policyBytes(t, "0.1 "+strings.Fields(temp)[1]))
+		})
 	}
-	db, err := Open(t.Context(), policy)
-	require.NoError(err)
-	t.Cleanup(func() {
-		require.NoError(db.Close())
-	})
-
-	require.NoError(db.PingContext(t.Context()))
-	assert.DirExists(tempDir)
-	var threads, asyncThreads int
-	var preserveOrder bool
-	var spillDir string
-	require.NoError(db.QueryRowContext(t.Context(), `SELECT current_setting('threads'), current_setting('async_threads'),
-		current_setting('preserve_insertion_order'), current_setting('temp_directory')`).
-		Scan(&threads, &asyncThreads, &preserveOrder, &spillDir))
-	assert.Equal(policy.Threads, threads)
-	assert.Equal(policy.Threads, asyncThreads)
-	assert.False(preserveOrder, "exports must be able to stream unordered results")
-	assert.Equal(tempDir, spillDir)
 }
 
 func TestPolicyRejectsIncompleteOrUnsafeSettings(t *testing.T) {
@@ -135,4 +151,17 @@ func TestPolicyRejectsIncompleteOrUnsafeSettings(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+// DuckDB renders byte settings with a rounded binary suffix, while policy
+// inputs also accept decimal suffixes.
+func policyBytes(t *testing.T, value string) float64 {
+	t.Helper()
+	parts := regexp.MustCompile(`(?i)^([0-9.]+)\s*([kmgt]?i?b)$`).FindStringSubmatch(value)
+	require.Len(t, parts, 3)
+	number, err := strconv.ParseFloat(parts[1], 64)
+	require.NoError(t, err)
+	unit, ok := map[string]float64{"B": 1, "MB": 1e6, "GB": 1e9, "MIB": 1 << 20, "GIB": 1 << 30}[strings.ToUpper(parts[2])]
+	require.True(t, ok, "unexpected byte unit %s", value)
+	return number * unit
 }

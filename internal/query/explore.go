@@ -174,6 +174,11 @@ func (e *DuckDBEngine) ExploreCoverage(
 		result.EligibleCount++
 		batch = append(batch, id)
 		if len(batch) == batchSize {
+			// database/sql observes cancellation asynchronously; never deliver
+			// another batch after a visitor has canceled this context.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if visit != nil {
 				if err := visit(batch); err != nil {
 					return nil, err
@@ -186,6 +191,9 @@ func (e *DuckDBEngine) ExploreCoverage(
 		return nil, fmt.Errorf("iterate analytical coverage messages: %w", err)
 	}
 	if len(batch) > 0 && visit != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := visit(batch); err != nil {
 			return nil, err
 		}
