@@ -146,6 +146,12 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int, sour
 	authorizedScope, authorizedArgs := sourceScopeClause(ctx, "m.source_id")
 	scope += authorizedScope
 	args = append(args, authorizedArgs...)
+	messageTable := "messages m"
+	if !s.IsPostgreSQL() && scope == "" {
+		// Full statistics can favor a deletion-index skip-scan and sort.
+		// Unrestricted live listings must retain their existing ordered index.
+		messageTable += " INDEXED BY idx_messages_live_sent_at"
+	}
 	// Get total count. Use the canonical live-messages predicate so
 	// dedup-hidden rows (deleted_at) are excluded alongside source-
 	// deleted rows.
@@ -165,7 +171,7 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int, sour
 			m.has_attachments,
 			m.hidden_text_present,
 			m.size_estimate
-		FROM messages m
+		FROM %s
 		LEFT JOIN message_recipients mr ON mr.id = (
 			SELECT mr2.id FROM message_recipients mr2
 			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
@@ -176,7 +182,7 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int, sour
 		WHERE %s
 		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC
 		LIMIT ? OFFSET ?
-	`, participantSummarySenderSQL, LiveMessagesWhere("m", true)+scope)
+	`, participantSummarySenderSQL, messageTable, LiveMessagesWhere("m", true)+scope)
 
 	var (
 		total    int64
@@ -186,7 +192,7 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int, sour
 	err := RunIndependentReads(ctx, s.db.DB,
 		func(ctx context.Context) error {
 			return s.db.QueryRowContext(ctx,
-				"SELECT COUNT(*) FROM messages m WHERE "+LiveMessagesWhere("m", true)+scope, args...,
+				"SELECT COUNT(*) FROM "+messageTable+" WHERE "+LiveMessagesWhere("m", true)+scope, args...,
 			).Scan(&total)
 		},
 		func(ctx context.Context) error {

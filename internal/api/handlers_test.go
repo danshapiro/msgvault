@@ -49,6 +49,7 @@ import (
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/sourcescope"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/synctechsms"
 	"go.kenn.io/msgvault/internal/testutil"
@@ -3639,6 +3640,84 @@ func TestCLIAttachmentServesPackedBlob(t *testing.T) {
 		assert.Equal("application/octet-stream", w.Header().Get("Content-Type"), "Content-Type")
 		assert.Equal(looseContent, w.Body.Bytes(), "data")
 	})
+}
+
+func TestHandleListMessages_SQLiteFallbackOrderingAndScope(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	var sources []int64
+	var conversations []int64
+	for _, address := range []string{"first@example.test", "second@example.test"} {
+		source, err := st.GetOrCreateSourceContext(t.Context(), "test", address)
+		require.NoError(t, err)
+		sources = append(sources, source.ID)
+		conversation, err := st.EnsureConversation(t.Context(), source.ID, "synthetic-http", "Synthetic")
+		require.NoError(t, err)
+		conversations = append(conversations, conversation)
+	}
+	date := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	var ids []int64
+	for i := range 8 {
+		message := &store.Message{SourceID: sources[i%2], ConversationID: conversations[i%2],
+			SourceMessageID: fmt.Sprintf("fallback-%d", i), MessageType: "email"}
+		switch i {
+		case 1:
+			message.SentAt = sql.NullTime{Time: date.AddDate(-10, 0, 0), Valid: true}
+		case 2:
+			message.SentAt = sql.NullTime{Time: date, Valid: true}
+		case 3:
+			message.ReceivedAt = sql.NullTime{Time: date, Valid: true}
+		case 4:
+			message.InternalDate = sql.NullTime{Time: date, Valid: true}
+		case 5:
+			message.SentAt = sql.NullTime{Time: date.AddDate(10, 0, 0), Valid: true}
+		}
+		id, err := st.UpsertMessageContext(t.Context(), message)
+		require.NoError(t, err)
+		ids = append(ids, id)
+	}
+	require.NoError(t, st.MarkMessageDeletedContext(t.Context(), sources[0], "fallback-6"))
+	_, err := st.MergeDuplicates(t.Context(), ids[2], []int64{ids[7]}, "synthetic-http")
+	require.NoError(t, err)
+	cfg := config.NewDefaultConfig()
+	cfg.Data.DataDir = t.TempDir()
+	srv := NewServerWithOptions(ServerOptions{Config: cfg, Store: st, Logger: testLogger()})
+	cases := []struct {
+		name       string
+		authorized []int64
+		want       []int64
+	}{
+		{name: "unrestricted", want: []int64{ids[5], ids[4], ids[3], ids[2], ids[1], ids[0]}},
+		{name: "authorized", authorized: sources[:1], want: []int64{ids[4], ids[2], ids[0]}},
+		{name: "empty-authorization", authorized: []int64{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tc.authorized != nil {
+				ctx = sourcescope.WithSourceIDs(ctx, tc.authorized)
+			}
+			for page := 1; page <= 4; page++ {
+				w := httptest.NewRecorder()
+				request := httptest.NewRequestWithContext(ctx, http.MethodGet,
+					fmt.Sprintf("/api/v1/messages?page=%d&page_size=2", page), nil)
+				srv.Handler(nil).ServeHTTP(w, request)
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				var response MessageListResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+				assert.Equal(t, int64(len(tc.want)), response.Total)
+				assert.Equal(t, page, response.Page)
+				assert.Equal(t, 2, response.PageSize)
+				start := min((page-1)*2, len(tc.want))
+				want := tc.want[start:min(start+2, len(tc.want))]
+				got := make([]int64, 0, len(response.Messages))
+				for _, message := range response.Messages {
+					got = append(got, message.ID)
+				}
+				assert.Equal(t, len(want), len(got))
+				assert.Equal(t, append([]int64{}, want...), got)
+			}
+		})
+	}
 }
 
 func TestHandleListMessages(t *testing.T) {
