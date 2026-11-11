@@ -120,6 +120,13 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 	}()
 
 	imp.progress.OnStart()
+	retainedEvents, classificationErr := imp.classifyRetainedSystemEvents(ctx, waDB, source.ID, func(err error) {
+		reportError("system_event_classification", err)
+	})
+	summary.SystemEventsClassified += retainedEvents.classified
+	if classificationErr != nil {
+		reportError("system_event_classification", classificationErr)
+	}
 	if opts.Limit > 0 {
 		reportError("limit", errors.New("message limit makes this import incomplete"))
 	}
@@ -379,6 +386,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 			for _, waMsg := range messages {
 				summary.MessagesProcessed++
 				afterID = waMsg.RowID
+				if _, blocked := retainedEvents.blockedKeys[waMsg.KeyID]; blocked {
+					summary.MessagesSkipped++
+					summary.SkippedCounts["system_event_conflict"]++
+					continue
+				}
 
 				// Skip system messages and calls.
 				if isSkippedType(waMsg.MessageType) {

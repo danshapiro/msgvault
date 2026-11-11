@@ -16,6 +16,55 @@ type whatsAppSourceRecord struct {
 	TimestampMillis int64  `json:"timestamp_millis"`
 }
 
+// ArchivedWhatsAppSystemEventCandidate pairs one senderless historical message
+// with its retained Android payload. It does not read bodies or infer a type.
+type ArchivedWhatsAppSystemEventCandidate struct {
+	MessageID      int64
+	ConversationID int64
+	Key            string
+	SentAt         sql.NullTime
+	RawData        []byte
+	RawDecodeError error
+}
+
+// ScanWhatsAppSystemEventCandidatesContext pages only this source's senderless
+// Android messages with retained originals. Source/date validation and the
+// supported type check remain the caller's responsibility before annotation.
+func (s *Store) ScanWhatsAppSystemEventCandidatesContext(ctx context.Context, sourceID, afterID int64, limit int) ([]ArchivedWhatsAppSystemEventCandidate, error) {
+	if sourceID <= 0 || afterID < 0 || limit <= 0 || limit > 1000 {
+		return nil, errors.New("WhatsApp system event scan requires a source and a page of 1–1000 messages")
+	}
+	if err := s.requireSyncSource(sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, s.Rebind(`SELECT m.id,m.conversation_id,m.source_message_id,m.sent_at,r.raw_data,r.compression,r.encryption_version
+		FROM messages m JOIN message_raw r ON r.message_id=m.id
+		WHERE m.source_id=? AND m.id>? AND m.message_type='whatsapp'
+			AND m.sender_id IS NULL AND r.raw_format='whatsapp_json'
+		ORDER BY m.id LIMIT ?`), sourceID, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("scan retained WhatsApp system event candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var result []ArchivedWhatsAppSystemEventCandidate
+	for rows.Next() {
+		var candidate ArchivedWhatsAppSystemEventCandidate
+		var raw []byte
+		var compression sql.NullString
+		var encryptionVersion int
+		if err := rows.Scan(&candidate.MessageID, &candidate.ConversationID, &candidate.Key, &candidate.SentAt, &raw, &compression, &encryptionVersion); err != nil {
+			return nil, fmt.Errorf("read retained WhatsApp system event candidate: %w", err)
+		}
+		if encryptionVersion != 0 {
+			candidate.RawDecodeError = errors.New("retained WhatsApp source uses unsupported encryption")
+		} else {
+			candidate.RawData, candidate.RawDecodeError = decodeMessageRaw(raw, compression)
+		}
+		result = append(result, candidate)
+	}
+	return result, rows.Err()
+}
+
 // ObserveWhatsAppSystemEventContext annotates a legacy archived row only when
 // a source observation identifies the same message, conversation, and date as
 // a supported system event. Type 112 is an advanced-chat-privacy setting; other
