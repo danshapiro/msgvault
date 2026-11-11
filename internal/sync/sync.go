@@ -1321,6 +1321,7 @@ func (s *Syncer) recoverExpiredHistoryAttempt(
 	fullSummary.MessagesSkipped += catchup.MessagesSkipped
 	fullSummary.BytesDownloaded += catchup.BytesDownloaded
 	fullSummary.Errors += catchup.Errors
+	fullSummary.UnresolvedMessages = catchup.UnresolvedMessages
 	fullSummary.EndTime = catchup.EndTime
 	fullSummary.Duration = fullSummary.EndTime.Sub(fullSummary.StartTime)
 	fullSummary.FinalHistoryID = catchup.FinalHistoryID
@@ -1653,10 +1654,17 @@ func (s *Syncer) full(
 			completionHistoryID = currentHistoryID
 		}
 	}
+	if source.SourceType == sourceTypeGmail {
+		if err := s.reportUnresolvedMessages(ctx, source.ID, summary); err != nil {
+			s.failStoppedSync(state.syncID, err)
+			return nil, err
+		}
+	}
 	historyIDStr := strconv.FormatUint(completionHistoryID, 10)
 	if state.checkpoint.ErrorsCount > 0 {
 		s.logger.Warn("full sync completed with errors",
 			"errors", state.checkpoint.ErrorsCount,
+			"unresolved_messages", summary.UnresolvedMessages,
 			"history_id", historyIDStr)
 	}
 	// Complete ordinary full sync before best-effort provider maintenance;
@@ -1835,6 +1843,9 @@ func (s *Syncer) prepareMessage(
 		parsed, parseErr = mime.Parse(raw.Raw)
 		if parseErr != nil {
 			return nil, fmt.Errorf("strictly parse MIME message %s: %w", raw.ID, parseErr)
+		}
+		if parsed.Incomplete {
+			return nil, fmt.Errorf("strictly parse MIME message %s: incomplete MIME content", raw.ID)
 		}
 	} else {
 		parsed, parseErr = mime.ParseWithRecovery(

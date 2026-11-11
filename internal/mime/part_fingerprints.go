@@ -74,16 +74,26 @@ type rawPartHashes struct {
 // NextRawPart preserves transfer encoding; the parsed tree supplies boundaries
 // and the headers must agree before the raw framing is trusted.
 func fingerprintRawParts(body io.Reader, part *enmime.Part, hashes map[string]rawPartHashes) bool {
-	if part.Boundary == "" {
-		if part.FirstChild != nil {
-			return false
-		}
+	return walkRawParts(body, part, func(body io.Reader, part *enmime.Part) bool {
 		h := sha256.New()
 		if _, err := io.Copy(h, body); err != nil {
 			return false
 		}
 		hashes[part.PartID] = rawPartHashes{content: hex.EncodeToString(h.Sum(nil))}
 		return true
+	}, func(part *enmime.Part, hash string) {
+		hashes[part.PartID] = rawPartHashes{preamble: hash}
+	})
+}
+
+// walkRawParts trusts raw framing only when it accounts for exactly the parsed
+// children, their headers, and every closing multipart delimiter.
+func walkRawParts(body io.Reader, part *enmime.Part, leaf func(io.Reader, *enmime.Part) bool, preambleHash func(*enmime.Part, string)) bool {
+	if part.Boundary == "" || isTextBoundaryLeaf(part) {
+		if part.FirstChild != nil {
+			return false
+		}
+		return leaf(body, part)
 	}
 
 	reader := bufio.NewReader(body)
@@ -102,14 +112,16 @@ func fingerprintRawParts(body io.Reader, part *enmime.Part, hashes map[string]ra
 		}
 		_, _ = preamble.Write(line)
 	}
-	hashes[part.PartID] = rawPartHashes{preamble: hex.EncodeToString(preamble.Sum(nil))}
+	if preambleHash != nil {
+		preambleHash(part, hex.EncodeToString(preamble.Sum(nil)))
+	}
 	readerParts := multipart.NewReader(io.MultiReader(bytes.NewReader(delimiter), reader), part.Boundary)
 	for child := part.FirstChild; child != nil; child = child.NextSibling {
 		rawChild, err := readerParts.NextRawPart()
 		if err != nil || fingerprintHeaders(rawChild.Header, false) != fingerprintHeaders(child.Header, false) {
 			return false
 		}
-		if !fingerprintRawParts(rawChild, child, hashes) {
+		if !walkRawParts(rawChild, child, leaf, preambleHash) {
 			return false
 		}
 	}

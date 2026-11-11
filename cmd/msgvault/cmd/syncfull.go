@@ -707,7 +707,9 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(ctx conte
 	fmt.Printf("  Messages:      %d found, %d added, %d skipped\n",
 		summary.MessagesFound, summary.MessagesAdded, summary.MessagesSkipped)
 	fmt.Printf("  Downloaded:    %.2f MB\n", float64(summary.BytesDownloaded)/(1024*1024))
-	if summary.Errors > 0 {
+	if src.SourceType != sourceTypeIMAP {
+		writeGmailSyncErrors(os.Stdout, summary)
+	} else if summary.Errors > 0 {
 		fmt.Printf("  Errors:        %d\n", summary.Errors)
 	}
 	if summary.WasResumed {

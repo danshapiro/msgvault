@@ -451,6 +451,7 @@ func TestGmailRecoveryResumedCatchupKeepsAcquisitionCounts(t *testing.T) {
 	assert.Equal(lists, e.Mock.ListMessagesCalls)
 	assert.Equal(int64(2), summary.MessagesAdded, "new-ok from enumeration and history-only from catch-up")
 	assert.Equal(int64(2), summary.Errors, "enumeration failure plus its failed acquisition retry during catch-up")
+	assert.Equal(int64(1), summary.UnresolvedMessages, "recovery reports the current message once, not both attempts")
 	assertRawDataExists(t, e.Store, "new-ok")
 	assertRawDataExists(t, e.Store, "history-only")
 }

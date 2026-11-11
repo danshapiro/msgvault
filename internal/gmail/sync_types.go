@@ -32,6 +32,10 @@ type SyncSummary struct {
 	FinalHistoryID   uint64
 	WasResumed       bool
 	ResumedFromToken string
+
+	// UnresolvedMessages counts distinct messages with outstanding fetch or
+	// ingest work at completion. Errors remains the cumulative attempt count.
+	UnresolvedMessages int64
 }
 
 // SyncProgressWithDate is an optional extension of SyncProgress

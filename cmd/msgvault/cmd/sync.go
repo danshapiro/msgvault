@@ -352,9 +352,7 @@ func runIncrementalSync(ctx context.Context, s *store.Store, getOAuthMgr func(ct
 	fmt.Printf("  Changes:       %d processed, %d added\n",
 		summary.MessagesFound, summary.MessagesAdded)
 	fmt.Printf("  Downloaded:    %.2f MB\n", float64(summary.BytesDownloaded)/(1024*1024))
-	if summary.Errors > 0 {
-		fmt.Printf("  Errors:        %d\n", summary.Errors)
-	}
+	writeGmailSyncErrors(os.Stdout, summary)
 
 	elapsed := time.Since(startTime)
 	logger.Info("incremental sync completed",

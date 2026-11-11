@@ -109,6 +109,7 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	}
 	restoreDeclaredUTF8(raw, root)
 	normalizeMalformedContentTypes(root)
+	downgradeUnusedTextBoundaries(raw, root)
 
 	env, err := envelopeParser.EnvelopeFromPart(root)
 	if err != nil {

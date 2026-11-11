@@ -6043,6 +6043,7 @@ func TestIncrementalSyncSameRunRecoveryThenPurge(t *testing.T) {
 	summary := runIncrementalSync(t, env)
 	require.Equal(int64(1), summary.Errors)
 	require.Equal(int64(1), summary.MessagesAdded)
+	assert.Zero(summary.UnresolvedMessages, "the later successful acquisition settled the earlier error")
 	assert.Equal([]string{id, id}, env.Mock.GetMessageCalls)
 	items, err := env.Store.ListSyncRunItems(summary.SyncRunID, store.SyncRunItemStatusResolved, 10)
 	require.NoError(err)

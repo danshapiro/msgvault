@@ -4652,6 +4652,14 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	if err != nil {
 		return nil, fmt.Errorf("gmail sync failed: %w", err)
 	}
+	if summary.UnresolvedMessages > 0 {
+		logger.Warn("gmail sync has unresolved messages",
+			"email", accountEmail,
+			"unresolved_messages", summary.UnresolvedMessages,
+			"error_attempts", summary.Errors,
+		)
+		return summary, fmt.Errorf("gmail sync has %d unresolved message(s)", summary.UnresolvedMessages)
+	}
 	return summary, nil
 }
 

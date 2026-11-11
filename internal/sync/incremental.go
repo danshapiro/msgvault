@@ -148,6 +148,10 @@ func (s *Syncer) incrementalWithRecovery(
 	// owed (never succeeded, previously failed, or stale).
 	if startHistoryID >= profile.HistoryID && len(pendingReplayIDs) == 0 {
 		s.logger.Info("already up to date")
+		if err := s.reportUnresolvedMessages(ctx, source.ID, summary); err != nil {
+			s.failStoppedSync(syncID, err)
+			return nil, err
+		}
 		if err := s.completeSyncWithoutHook(
 			ctx, syncID, source.ID, strconv.FormatUint(profile.HistoryID, 10), true,
 		); err != nil {
@@ -385,10 +389,15 @@ func (s *Syncer) incrementalWithRecovery(
 	// Acquisition errors with durable retry debt may advance, including during
 	// recovery catch-up. Label and deletion persistence failures return above
 	// to retain History for the next attempt.
+	if err := s.reportUnresolvedMessages(ctx, source.ID, summary); err != nil {
+		s.failStoppedSync(syncID, err)
+		return nil, err
+	}
 	historyIDStr := strconv.FormatUint(profile.HistoryID, 10)
 	if checkpoint.ErrorsCount > 0 {
 		s.logger.Warn("incremental sync completed with errors",
 			"errors", checkpoint.ErrorsCount,
+			"unresolved_messages", summary.UnresolvedMessages,
 			"history_id", historyIDStr)
 	}
 	// Mark sync complete before running best-effort provider maintenance.
