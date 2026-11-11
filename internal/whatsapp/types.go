@@ -135,21 +135,24 @@ func DefaultOptions() ImportOptions {
 
 // ImportSummary holds statistics from a completed import.
 type ImportSummary struct {
-	Duration          time.Duration
-	SourceID          int64
-	ChatsProcessed    int64
-	MessagesProcessed int64
-	MessagesAdded     int64
-	MessagesUpdated   int64
-	MessagesSkipped   int64
-	ReactionsAdded    int64
-	AttachmentsFound  int64
-	MediaCopied       int64
-	Participants      int64
-	Errors            int64
-	GroupRoster       string // source roster read coverage: complete, partial, or unavailable
-	ErrorCounts       map[string]int64
-	SkippedCounts     map[string]int64
+	Duration                 time.Duration
+	SourceID                 int64
+	ChatsProcessed           int64
+	MessagesProcessed        int64
+	MessagesAdded            int64
+	MessagesUpdated          int64
+	MessagesSkipped          int64
+	ReactionsAdded           int64
+	AttachmentsFound         int64
+	MediaCopied              int64
+	Participants             int64
+	Errors                   int64
+	GroupRoster              string // source roster read coverage: complete, partial, or unavailable
+	ErrorCounts              map[string]int64
+	SkippedCounts            map[string]int64
+	IdentityLimitationCounts map[string]int64 // retained source references with unavailable optional phone association
+	IdentitiesWithoutPhone   int64            // distinct account-scoped source LIDs observed without a phone mapping
+	SystemEventsClassified   int64            // existing legacy rows newly annotated from exact source evidence
 }
 
 // ImportProgress provides callbacks for import progress reporting.

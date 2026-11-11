@@ -517,10 +517,13 @@ func fetchLidMap(ctx context.Context, db *sql.DB) (map[int64]waLidMapping, error
 	rows, err := db.QueryContext(ctx, `
 		SELECT
 			jm.lid_row_id,
+			lid_jid._id,
+			phone_jid._id,
 			COALESCE(phone_jid.user, ''),
 			COALESCE(phone_jid.server, '')
 		FROM jid_map jm
-		JOIN jid phone_jid ON jm.jid_row_id = phone_jid._id
+		LEFT JOIN jid lid_jid ON jm.lid_row_id = lid_jid._id
+		LEFT JOIN jid phone_jid ON jm.jid_row_id = phone_jid._id
 	`)
 	if err != nil {
 		if isTableNotFound(err) {
@@ -532,8 +535,14 @@ func fetchLidMap(ctx context.Context, db *sql.DB) (map[int64]waLidMapping, error
 
 	for rows.Next() {
 		var m waLidMapping
-		if err := rows.Scan(&m.LidRowID, &m.PhoneUser, &m.PhoneServer); err != nil {
+		var lidID, phoneID sql.NullInt64
+		if err := rows.Scan(&m.LidRowID, &lidID, &phoneID, &m.PhoneUser, &m.PhoneServer); err != nil {
 			return nil, fmt.Errorf("scan lid mapping: %w", err)
+		}
+		// Absence of a mapping is optional enrichment. An explicit mapping
+		// with missing identities or an unusable phone is source corruption.
+		if !lidID.Valid || !phoneID.Valid || normalizePhone(m.PhoneUser, m.PhoneServer) == "" {
+			return nil, errors.New("WhatsApp LID has a dangling or unusable authoritative phone mapping")
 		}
 		if previous, ok := result[m.LidRowID]; ok && (previous.PhoneUser != m.PhoneUser || previous.PhoneServer != m.PhoneServer) {
 			return nil, errors.New("WhatsApp LID has conflicting authoritative phone mappings")

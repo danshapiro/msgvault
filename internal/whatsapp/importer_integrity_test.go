@@ -81,10 +81,10 @@ func TestImportModernRosterAndIdempotentReimport(t *testing.T) {
 	assert.Equal(2, total)
 }
 
-func TestImportMissingOrUnresolvedRosterIsFailedSync(t *testing.T) {
+func TestImportMissingOrInvalidRosterIsFailedSync(t *testing.T) {
 	for _, tc := range []struct{ name, roster, status string }{
 		{"unsupported", "", "unavailable"},
-		{"unresolved", modernRoster + `INSERT INTO group_participant_user VALUES (3, 1, 4, 0, 0);`, "partial"},
+		{"missing identity", modernRoster + `INSERT INTO group_participant_user VALUES (3, 1, 999, 0, 0);`, "partial"},
 		{"pending", modernRoster + `INSERT INTO group_participant_user VALUES (3, 1, 4, 0, 1);`, "partial"},
 		{"unknown rank", modernRoster + `INSERT INTO group_participant_user VALUES (3, 1, 4, 9, 0);`, "partial"},
 	} {
@@ -183,8 +183,9 @@ func TestUnresolvedRosterMemberCanBeResolvedOnLaterImport(t *testing.T) {
 	imp := NewImporter(st, nil)
 	first, err := imp.Import(t.Context(), backup, opts)
 	require.NoError(err)
-	assert.EqualValues(1, first.ErrorCounts["group_roster_unresolved"])
-	assert.Equal("partial", first.GroupRoster)
+	assert.Zero(first.Errors)
+	assert.EqualValues(1, first.IdentityLimitationCounts["group_roster_phone_unavailable"])
+	assert.Equal("complete", first.GroupRoster)
 
 	// An updated source backup provides an authoritative mapping later.
 	db, err := sql.Open("sqlite3", backup)
@@ -366,7 +367,8 @@ func TestUnresolvedReimportPreservesPreviousSenderAttributionAndSearch(t *testin
 	require.NoError(db.Close())
 	result, err := imp.Import(t.Context(), backup, opts)
 	require.NoError(err)
-	assert.EqualValues(1, result.ErrorCounts["sender_unresolved"])
+	assert.Zero(result.Errors)
+	assert.EqualValues(1, result.IdentityLimitationCounts["sender_phone_unavailable"])
 	var senderAfter int64
 	var isFrom, sourceFrom, identityFrom bool
 	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT sender_id,is_from_me,source_is_from_me,identity_is_from_me FROM messages WHERE source_message_id='message-1'`).Scan(&senderAfter, &isFrom, &sourceFrom, &identityFrom))
@@ -528,8 +530,9 @@ func TestObservedRosterRolesReconcileWithoutRemovingHistoricalMembers(t *testing
 	require.NoError(db.Close())
 	partial, err := imp.Import(t.Context(), backup, opts)
 	require.NoError(err)
-	assert.Equal("partial", partial.GroupRoster)
-	assert.EqualValues(1, partial.ErrorCounts["group_roster_unresolved"])
+	assert.Zero(partial.Errors)
+	assert.Equal("complete", partial.GroupRoster)
+	assert.EqualValues(1, partial.IdentityLimitationCounts["group_roster_phone_unavailable"])
 	assert.Equal("member", roleFor("+15550001111"))
 	assert.Equal("admin", roleFor("+15550004444"))
 
@@ -542,7 +545,9 @@ func TestObservedRosterRolesReconcileWithoutRemovingHistoricalMembers(t *testing
 	for range 2 {
 		result, err := imp.Import(t.Context(), backup, opts)
 		require.NoError(err)
-		assert.Equal("partial", result.GroupRoster)
+		assert.Zero(result.Errors)
+		assert.Equal("complete", result.GroupRoster)
+		assert.EqualValues(1, result.IdentityLimitationCounts["group_roster_phone_unavailable"])
 		assert.Equal("admin", roleFor("+15550001111"))
 		assert.Equal("admin", roleFor("+15550004444"))
 	}

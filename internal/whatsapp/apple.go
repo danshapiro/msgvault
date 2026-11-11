@@ -106,7 +106,7 @@ func (imp *Importer) importApple(
 	opts ImportOptions,
 ) (summary *ImportSummary, retErr error) {
 	startedAt := time.Now()
-	summary = &ImportSummary{GroupRoster: "complete", ErrorCounts: make(map[string]int64), SkippedCounts: make(map[string]int64)}
+	summary = &ImportSummary{GroupRoster: "complete", ErrorCounts: make(map[string]int64), SkippedCounts: make(map[string]int64), IdentityLimitationCounts: make(map[string]int64)}
 
 	source, err := imp.store.GetOrCreateSource("whatsapp", opts.Phone)
 	if err != nil {

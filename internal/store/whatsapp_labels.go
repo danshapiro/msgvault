@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const whatsAppService = "whatsapp"
+
 // ObserveWhatsAppLIDLabelContext retains source presentation separately from
 // the stable account-scoped identity. It never asserts a phone/person match.
 // An empty label from an older snapshot cannot clear an observed name, and a
@@ -35,7 +37,7 @@ func (s *Store) ObserveWhatsAppLIDLabelContext(ctx context.Context, sourceID int
 		if err := tx.QueryRowContext(ctx, `SELECT identifier,source_type FROM sources WHERE id=?`, sourceID).Scan(&sourceAccount, &sourceType); err != nil {
 			return fmt.Errorf("read WhatsApp label source: %w", err)
 		}
-		if sourceType != "whatsapp" || sourceAccount != account {
+		if sourceType != whatsAppService || sourceAccount != account {
 			return errors.New("WhatsApp label belongs to a different source account")
 		}
 		var id int64

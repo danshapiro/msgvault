@@ -11,7 +11,7 @@ import (
 // cannot erase newer evidence, even after an opaque identity is resolved.
 func (imp *Importer) importReactions(ctx context.Context, messageID int64, reactions []waReaction,
 	lids *lidResolver, lidMap map[int64]waLidMapping, selfID int64,
-	reportError func(string, error),
+	reportError func(string, error), reportIdentityLimitation func(string, string),
 ) int64 {
 	latest := make(map[int64]waReaction)
 	ambiguous := make(map[int64]bool)
@@ -23,10 +23,10 @@ func (imp *Importer) importReactions(ctx context.Context, messageID int64, react
 			// Explicit source self evidence takes precedence over a missing JID.
 		case r.SenderServer.Valid && r.SenderServer.String == "lid":
 			phone := resolveLidSender(r.SenderJIDRowID, r.SenderServer.String, lidMap)
-			if phone == "" {
-				reportError("reaction_unresolved", errors.New("reaction sender LID cannot be resolved"))
-			}
 			participantID, err = lids.ensure(ctx, r.SenderRawString.String, phone)
+			if err == nil && phone == "" {
+				reportIdentityLimitation("reaction_phone_unavailable", r.SenderRawString.String)
+			}
 		case r.SenderUser.Valid && r.SenderUser.String != "":
 			phone := normalizePhone(r.SenderUser.String, r.SenderServer.String)
 			if phone == "" {

@@ -40,7 +40,9 @@ func TestOpaqueIdentitiesPreserveAndResolveRosterSenderAndReaction(t *testing.T)
 
 	first, err := imp.Import(t.Context(), backup, opts)
 	requirements.NoError(err)
-	assertions.EqualValues(3, first.Errors)
+	assertions.Zero(first.Errors)
+	assertions.EqualValues(1, first.IdentitiesWithoutPhone)
+	assertions.Equal(map[string]int64{"group_roster_phone_unavailable": 1, "sender_phone_unavailable": 1, "reaction_phone_unavailable": 1}, first.IdentityLimitationCounts)
 	var originalSender sql.NullInt64
 	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT sender_id FROM messages WHERE source_message_id='message-1'`).Scan(&originalSender))
 	requirements.True(originalSender.Valid, "an unresolved source identity must still be retained")
@@ -63,7 +65,9 @@ UPDATE message_add_on SET _id=20 WHERE _id=10;
 UPDATE message_add_on_reaction SET message_add_on_row_id=20 WHERE message_add_on_row_id=10;`)
 	second, err := imp.Import(t.Context(), backup, opts)
 	requirements.NoError(err)
-	assertions.EqualValues(3, second.Errors)
+	assertions.Zero(second.Errors)
+	assertions.EqualValues(1, second.IdentitiesWithoutPhone)
+	assertions.Equal(map[string]int64{"group_roster_phone_unavailable": 1, "sender_phone_unavailable": 1, "reaction_phone_unavailable": 1}, second.IdentityLimitationCounts)
 	assertions.Zero(second.MessagesAdded)
 	var sender int64
 	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT sender_id FROM messages WHERE source_message_id='message-1'`).Scan(&sender))
@@ -108,7 +112,9 @@ func TestOpaqueIdentitiesAreScopedToTheSourceAccount(t *testing.T) {
 		opts.Phone = account
 		result, err := imp.Import(t.Context(), backup, opts)
 		requirements.NoError(err)
-		assertions.EqualValues(3, result.Errors)
+		assertions.Zero(result.Errors)
+		assertions.EqualValues(1, result.IdentitiesWithoutPhone)
+		assertions.Equal(map[string]int64{"group_roster_phone_unavailable": 1, "sender_phone_unavailable": 1, "reaction_phone_unavailable": 1}, result.IdentityLimitationCounts)
 	}
 	var first, second sql.NullInt64
 	rows, err := st.DB().QueryContext(t.Context(), `SELECT sender_id FROM messages WHERE source_message_id='message-1' ORDER BY source_id`)
@@ -232,7 +238,10 @@ INSERT INTO message VALUES (4,20,1,'direct-lid-out',NULL,1700000003000,0,'direct
 	imp := NewImporter(st, nil)
 	first, err := imp.Import(t.Context(), backup, opts)
 	requirements.NoError(err)
-	assertions.Positive(first.Errors)
+	assertions.Zero(first.Errors)
+	assertions.EqualValues(1, first.IdentitiesWithoutPhone)
+	assertions.EqualValues(1, first.IdentityLimitationCounts["participant_phone_unavailable"])
+	assertions.EqualValues(1, first.IdentityLimitationCounts["sender_phone_unavailable"])
 	var opaque sql.NullInt64
 	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT sender_id FROM messages WHERE source_message_id='direct-lid-in'`).Scan(&opaque))
 	requirements.True(opaque.Valid)

@@ -37,7 +37,7 @@ func (s *Store) ObserveWhatsAppSystemEventContext(
 		if err := tx.QueryRowContext(ctx, `SELECT source_type FROM sources WHERE id=?`, sourceID).Scan(&sourceKind); err != nil {
 			return fmt.Errorf("read WhatsApp system event source: %w", err)
 		}
-		if sourceKind != "whatsapp" {
+		if sourceKind != whatsAppService {
 			return errors.New("WhatsApp system event requires a WhatsApp source")
 		}
 		var messageID, archivedConversation int64
@@ -53,7 +53,7 @@ func (s *Store) ObserveWhatsAppSystemEventContext(
 		if err != nil {
 			return fmt.Errorf("read legacy WhatsApp system event: %w", err)
 		}
-		if messageKind != "whatsapp" || archivedConversation != conversationID || !sent.Valid || !sent.Time.Equal(time.UnixMilli(timestampMillis)) {
+		if messageKind != whatsAppService || archivedConversation != conversationID || !sent.Valid || !sent.Time.Equal(time.UnixMilli(timestampMillis)) {
 			return errors.New("WhatsApp system event conflicts with archived message identity or date")
 		}
 		observed := whatsAppSourceRecord{Kind: "system_event", MessageType: sourceType, TimestampMillis: timestampMillis}

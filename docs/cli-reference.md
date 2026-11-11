@@ -2325,6 +2325,21 @@ The `--phone` flag is required and must be in E.164 format (e.g., `+447700900000
 
 Android `msgstore.db` imports fail with an error when `--after` or `--before` is set.
 
+Android identities without phone mappings are retained under account-scoped
+WhatsApp IDs. Available source usernames and masked display labels help identify
+them, but never establish a phone number or merge people. Curated names and
+confirmed phone associations take precedence. Replaying an older backup without
+a username does not erase an observed username.
+
+The summary reports missing phone mappings separately from import errors. The
+`WHATSAPP_IMPORT_RESULT=` JSON record includes `identities_without_phone` and
+`identity_limitation_counts`; a complete import can still have these limitations.
+Missing records, dangling or conflicting mappings, and conflicting reaction
+states remain errors. Only the exact empty reserved baseline row is excluded
+from orphan errors. Existing records proven by the source to be type-112 system
+notices receive a reversible metadata classification; unknown historical records
+remain unchanged.
+
 See [Text Messages](/docs/usage/text-messages/) for usage examples.
 
 ---

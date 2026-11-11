@@ -192,6 +192,12 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	if summary.Errors > 0 {
 		fmt.Printf("  Errors:         %d\n", summary.Errors)
 	}
+	if summary.IdentitiesWithoutPhone > 0 {
+		fmt.Printf("  Phone mapping:  unavailable for %d source identities; retained by WhatsApp ID\n", summary.IdentitiesWithoutPhone)
+	}
+	if summary.SystemEventsClassified > 0 {
+		fmt.Printf("  System events:  %d existing records classified\n", summary.SystemEventsClassified)
+	}
 
 	if summary.MessagesAdded > 0 {
 		rate := float64(summary.MessagesAdded) / summary.Duration.Seconds()
@@ -209,19 +215,28 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		status = "partial"
 	}
 	result := struct {
-		Version           int              `json:"version"`
-		Status            string           `json:"status"`
-		Errors            int64            `json:"errors"`
-		ErrorCounts       map[string]int64 `json:"error_counts"`
-		SkippedCounts     map[string]int64 `json:"skipped_counts"`
-		GroupRoster       string           `json:"group_roster"`
-		MessagesProcessed int64            `json:"messages_processed"`
-		MessagesUpserted  int64            `json:"messages_upserted"`
-		MessagesAdded     int64            `json:"messages_added"`
-		MessagesUpdated   int64            `json:"messages_updated"`
-		MessagesSkipped   int64            `json:"messages_skipped"`
-	}{1, status, summary.Errors, summary.ErrorCounts, summary.SkippedCounts, summary.GroupRoster, summary.MessagesProcessed,
-		summary.MessagesAdded + summary.MessagesUpdated, summary.MessagesAdded, summary.MessagesUpdated, summary.MessagesSkipped}
+		Version                  int              `json:"version"`
+		Status                   string           `json:"status"`
+		Errors                   int64            `json:"errors"`
+		ErrorCounts              map[string]int64 `json:"error_counts"`
+		SkippedCounts            map[string]int64 `json:"skipped_counts"`
+		GroupRoster              string           `json:"group_roster"`
+		MessagesProcessed        int64            `json:"messages_processed"`
+		MessagesUpserted         int64            `json:"messages_upserted"`
+		MessagesAdded            int64            `json:"messages_added"`
+		MessagesUpdated          int64            `json:"messages_updated"`
+		MessagesSkipped          int64            `json:"messages_skipped"`
+		IdentityLimitationCounts map[string]int64 `json:"identity_limitation_counts"`
+		IdentitiesWithoutPhone   int64            `json:"identities_without_phone"`
+		SystemEventsClassified   int64            `json:"system_events_classified"`
+	}{
+		Version: 1, Status: status, Errors: summary.Errors, ErrorCounts: summary.ErrorCounts,
+		SkippedCounts: summary.SkippedCounts, GroupRoster: summary.GroupRoster,
+		MessagesProcessed: summary.MessagesProcessed, MessagesUpserted: summary.MessagesAdded + summary.MessagesUpdated,
+		MessagesAdded: summary.MessagesAdded, MessagesUpdated: summary.MessagesUpdated, MessagesSkipped: summary.MessagesSkipped,
+		IdentityLimitationCounts: summary.IdentityLimitationCounts, IdentitiesWithoutPhone: summary.IdentitiesWithoutPhone,
+		SystemEventsClassified: summary.SystemEventsClassified,
+	}
 	encoded, err := json.Marshal(result, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("encode import result: %w", err)
