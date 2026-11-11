@@ -17,75 +17,81 @@ func TestLIDLabelReaderSupportsOptionalAndOlderSchemas(t *testing.T) {
 		{"username", `CREATE TABLE lid_display_name(lid_row_id INTEGER PRIMARY KEY,display_name TEXT NOT NULL,username TEXT);INSERT INTO lid_display_name VALUES(4,'+1········11','sample_user');`, "sample_user", "+1········11"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
 			backup := testBackup(t, unresolvedIdentityFixture+tc.ddl)
 			db, err := sql.Open("sqlite3", backup)
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			requirements.NoError(err)
+			t.Cleanup(func() { requirements.NoError(db.Close()) })
 			labels, err := fetchLIDLabels(t.Context(), db)
-			require.NoError(t, err)
+			requirements.NoError(err)
 			if tc.name == "absent" {
-				assert.Empty(t, labels)
+				assertions.Empty(labels)
 				return
 			}
 			label, ok := labels["22222@lid"]
-			require.True(t, ok)
-			require.Len(t, labels, 1)
-			assert.Equal(t, tc.wantUsername, label.Username)
-			assert.Equal(t, tc.wantDisplay, label.DisplayName)
+			requirements.True(ok)
+			requirements.Len(labels, 1)
+			assertions.Equal(tc.wantUsername, label.Username)
+			assertions.Equal(tc.wantDisplay, label.DisplayName)
 		})
 	}
 }
 
 func TestLIDLabelReaderReportsMalformedAndCanceledReads(t *testing.T) {
+	requirements := require.New(t)
 	backup := testBackup(t, unresolvedIdentityFixture+`CREATE TABLE lid_display_name(unexpected INTEGER);`)
 	db, err := sql.Open("sqlite3", backup)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	requirements.NoError(err)
+	t.Cleanup(func() { requirements.NoError(db.Close()) })
 	_, err = fetchLIDLabels(t.Context(), db)
-	require.Error(t, err)
+	requirements.Error(err)
 	canceled, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err = fetchLIDLabels(canceled, db)
-	require.ErrorIs(t, err, context.Canceled)
+	requirements.ErrorIs(err, context.Canceled)
 }
 
 func TestLIDResolverUsesSourceLabelsWithoutMergingIdentity(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
 	backup := testBackup(t, unresolvedIdentityFixture+`CREATE TABLE lid_display_name(lid_row_id INTEGER PRIMARY KEY,display_name TEXT NOT NULL,username TEXT);INSERT INTO lid_display_name VALUES(4,'+1········11','sample_user');`)
 	db, err := sql.Open("sqlite3", backup)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	requirements.NoError(err)
+	t.Cleanup(func() { requirements.NoError(db.Close()) })
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSourceContext(t.Context(), "whatsapp", "+15550001111")
-	require.NoError(t, err)
+	requirements.NoError(err)
 	resolver, err := newLIDResolver(t.Context(), db, st, source.ID, source.Identifier)
-	require.NoError(t, err)
+	requirements.NoError(err)
 	var jid string
-	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT raw_string FROM jid WHERE _id=4`).Scan(&jid))
+	requirements.NoError(db.QueryRowContext(t.Context(), `SELECT raw_string FROM jid WHERE _id=4`).Scan(&jid))
 	id, err := resolver.ensure(t.Context(), jid, "")
-	require.NoError(t, err)
+	requirements.NoError(err)
 	var name string
 	var phone sql.NullString
-	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(`SELECT display_name,phone_number FROM participants WHERE id=?`), id).Scan(&name, &phone))
-	assert.Equal(t, "@sample_user", name)
-	assert.False(t, phone.Valid)
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`SELECT display_name,phone_number FROM participants WHERE id=?`), id).Scan(&name, &phone))
+	assertions.Equal("@sample_user", name)
+	assertions.False(phone.Valid)
 	again, err := resolver.ensure(t.Context(), jid, "")
-	require.NoError(t, err)
-	assert.Equal(t, id, again)
+	requirements.NoError(err)
+	assertions.Equal(id, again)
 	canceled, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err = resolver.ensure(canceled, jid, "")
-	require.ErrorIs(t, err, context.Canceled, "cached observations must still honor cancellation")
+	requirements.ErrorIs(err, context.Canceled, "cached observations must still honor cancellation")
 }
 
 func TestLIDLabelReaderRejectsConflictingLabelsForSameRawIdentity(t *testing.T) {
+	requirements := require.New(t)
 	backup := testBackup(t, unresolvedIdentityFixture+`
  CREATE TABLE lid_display_name(lid_row_id INTEGER PRIMARY KEY,display_name TEXT NOT NULL,username TEXT);
  INSERT INTO jid VALUES(6,'22222','lid','22222@lid');
  INSERT INTO lid_display_name VALUES(4,'','sample_user');
  INSERT INTO lid_display_name VALUES(6,'','other_user');`)
 	db, err := sql.Open("sqlite3", backup)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	requirements.NoError(err)
+	t.Cleanup(func() { requirements.NoError(db.Close()) })
 	_, err = fetchLIDLabels(t.Context(), db)
-	require.ErrorContains(t, err, "conflicting display labels")
+	requirements.ErrorContains(err, "conflicting display labels")
 }
