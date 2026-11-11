@@ -55,6 +55,7 @@ type waMedia struct {
 type waReaction struct {
 	MessageRowID    int64          // FK to message._id
 	SenderJIDRowID  sql.NullInt64  // jid of reactor
+	FromMe          sql.NullInt64  // explicit self flag, absent in older schemas
 	SenderRawString sql.NullString // jid.raw_string
 	SenderUser      sql.NullString // jid.user
 	SenderServer    sql.NullString // jid.server

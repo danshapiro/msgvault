@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"strconv"
 	"strings"
 )
@@ -24,6 +25,14 @@ func classifyParticipantIdentifier(
 		classification.ServiceSlug = "telegram"
 	case kind == "whatsapp":
 		classification.ServiceSlug = "whatsapp"
+		if encoded, _, ok := strings.Cut(strings.TrimPrefix(value, whatsAppLIDPrefix), ":"); strings.HasPrefix(value, whatsAppLIDPrefix) && ok {
+			account, err := base64.RawURLEncoding.DecodeString(encoded)
+			if err != nil || len(account) == 0 {
+				return participantIdentifierClassification{}, false
+			}
+			classification.ScopeKind = new("account")
+			classification.ScopeValue = new(string(account))
+		}
 	case kind == "matrix":
 		classification.ServiceSlug = "matrix"
 		if separator := strings.Index(value, ":"); separator > 0 && separator+1 < len(value) {

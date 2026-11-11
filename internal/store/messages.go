@@ -1413,17 +1413,33 @@ func ensureConversation(
 // snapshot, so it uses the no-envelope fallback of
 // messageIdentityAttributionMatch; refreshMessageAttributionWith later settles
 // rows whose envelope disagrees.
-func upsertMessageSQL(now string, preserveMissingSender bool) string {
+type senderUpdatePolicy int
+
+const (
+	replaceSender senderUpdatePolicy = iota
+	preserveMissingSender
+	preserveExistingSender
+)
+
+func upsertMessageSQL(now string, policy senderUpdatePolicy) string {
 	attributionUpdate := `sender_id = excluded.sender_id,
 		is_from_me = excluded.is_from_me,
 		source_is_from_me = excluded.source_is_from_me,
 		identity_is_from_me = excluded.identity_is_from_me`
-	if preserveMissingSender {
+	if policy == preserveMissingSender {
 		// Missing source identity is not evidence that known attribution vanished.
 		attributionUpdate = `sender_id = COALESCE(excluded.sender_id, messages.sender_id),
 		is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.is_from_me ELSE excluded.is_from_me END,
 		source_is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.source_is_from_me ELSE excluded.source_is_from_me END,
 		identity_is_from_me = CASE WHEN excluded.sender_id IS NULL THEN messages.identity_is_from_me ELSE excluded.identity_is_from_me END`
+	}
+	if policy == preserveExistingSender {
+		// An opaque provider identity may fill a missing sender, but cannot
+		// replace earlier attribution or change independently confirmed flags.
+		attributionUpdate = `sender_id = COALESCE(messages.sender_id, excluded.sender_id),
+		is_from_me = messages.is_from_me,
+		source_is_from_me = messages.source_is_from_me,
+		identity_is_from_me = messages.identity_is_from_me`
 	}
 	return fmt.Sprintf(`
 	WITH attribution AS (
@@ -1480,17 +1496,25 @@ func (s *Store) UpsertMessage(msg *Message) (int64, error) {
 
 // UpsertMessageContext honors cancellation during UpsertMessage.
 func (s *Store) UpsertMessageContext(ctx context.Context, msg *Message) (int64, error) {
-	return s.upsertMessageContext(ctx, msg, false)
+	return s.upsertMessageContext(ctx, msg, replaceSender)
 }
 
 // UpsertMessagePreservingAttributionContext retains an existing sender and its
 // attribution flags when the new source snapshot cannot resolve the sender.
 // It uses the same fenced transaction, journals and projections as any upsert.
 func (s *Store) UpsertMessagePreservingAttributionContext(ctx context.Context, msg *Message) (int64, error) {
-	return s.upsertMessageContext(ctx, msg, true)
+	return s.upsertMessageContext(ctx, msg, preserveMissingSender)
 }
 
-func (s *Store) upsertMessageContext(ctx context.Context, msg *Message, preserveMissingSender bool) (int64, error) {
+// UpsertMessagePreservingExistingAttributionContext permits an unresolved
+// provider participant to fill a missing sender without replacing stronger
+// previously archived attribution. It retains the ordinary sync fence,
+// journals, and projections.
+func (s *Store) UpsertMessagePreservingExistingAttributionContext(ctx context.Context, msg *Message) (int64, error) {
+	return s.upsertMessageContext(ctx, msg, preserveExistingSender)
+}
+
+func (s *Store) upsertMessageContext(ctx context.Context, msg *Message, policy senderUpdatePolicy) (int64, error) {
 	if msg == nil {
 		return 0, errors.New("upsert message requires a message")
 	}
@@ -1507,7 +1531,7 @@ func (s *Store) upsertMessageContext(ctx context.Context, msg *Message, preserve
 			}
 		}
 		var err error
-		id, err = upsertMessageWithMode(q, s.dialect, msg, preserveMissingSender)
+		id, err = upsertMessageWithMode(q, s.dialect, msg, policy)
 		if err != nil {
 			return err
 		}
@@ -1542,10 +1566,10 @@ type bodylessMessageJournalState struct {
 }
 
 func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
-	return upsertMessageWithMode(q, d, msg, false)
+	return upsertMessageWithMode(q, d, msg, replaceSender)
 }
 
-func upsertMessageWithMode(q querier, d Dialect, msg *Message, preserveMissingSender bool) (int64, error) {
+func upsertMessageWithMode(q querier, d Dialect, msg *Message, policy senderUpdatePolicy) (int64, error) {
 	journalCandidate := isBodylessMessageJournalCandidate(msg)
 	var prior bodylessMessageJournalState
 	if journalCandidate {
@@ -1567,7 +1591,7 @@ func upsertMessageWithMode(q querier, d Dialect, msg *Message, preserveMissingSe
 			return 0, fmt.Errorf("read bodyless message journal state: %w", err)
 		}
 	}
-	sql := upsertMessageSQL(d.Now(), preserveMissingSender)
+	sql := upsertMessageSQL(d.Now(), policy)
 	sourceIsFromMe := msg.IsFromMe && !msg.IdentityDerivedIsFromMe
 	identityIsFromMe := msg.IsFromMe && msg.IdentityDerivedIsFromMe
 	args := []any{
@@ -1604,10 +1628,12 @@ func upsertMessageWithMode(q querier, d Dialect, msg *Message, preserveMissingSe
 			return 0, err
 		}
 	}
-	if preserveMissingSender && !msg.SenderID.Valid && prior.found {
+	if prior.found && ((policy == preserveMissingSender && !msg.SenderID.Valid) || policy == preserveExistingSender) {
 		// Journal the effective sender retained by the SQL conflict update.
 		retained := *msg
-		retained.SenderID = prior.senderID
+		if prior.senderID.Valid {
+			retained.SenderID = prior.senderID
+		}
 		msg = &retained
 	}
 	if journalCandidate && needsBodylessMessageJournal(prior, msg) {
@@ -4919,187 +4945,192 @@ func (s *Store) MergeParticipantsContext(ctx context.Context, oldID, newID int64
 	// fence, serializing the curated binding check with promotion and
 	// link/unlink mutations before this transaction repoints any references.
 	return s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
-		if err := s.lockParticipantDirectoryMutationTxContext(
-			ctx, tx,
-		); err != nil {
-			return err
-		}
-		if err := s.lockParticipantObservationMergeTx(
-			ctx, tx, oldID, newID,
-		); err != nil {
-			return err
-		}
-		if err := s.verifyParticipantsExistTxContext(ctx, tx, oldID, newID); err != nil {
-			return err
-		}
-		edges, err := s.loadComponentEdgesTxContext(ctx, tx, oldID, newID)
+		return s.mergeParticipantsTxContext(ctx, tx, oldID, newID)
+	})
+}
+
+// mergeParticipantsTxContext requires the exclusive attribution transaction.
+func (s *Store) mergeParticipantsTxContext(ctx context.Context, tx *loggedTx, oldID, newID int64) error {
+	if err := s.lockParticipantDirectoryMutationTxContext(
+		ctx, tx,
+	); err != nil {
+		return err
+	}
+	if err := s.lockParticipantObservationMergeTx(
+		ctx, tx, oldID, newID,
+	); err != nil {
+		return err
+	}
+	if err := s.verifyParticipantsExistTxContext(ctx, tx, oldID, newID); err != nil {
+		return err
+	}
+	edges, err := s.loadComponentEdgesTxContext(ctx, tx, oldID, newID)
+	if err != nil {
+		return err
+	}
+	personID, unionMembers, err := s.personForClusterUnionTx(
+		ctx, tx, oldID, newID, edges,
+	)
+	if err != nil {
+		return err
+	}
+	personRevisionBumped := false
+	if personID != 0 {
+		changed, err := s.mergePersonBindingsTx(
+			ctx, tx, personID, oldID, unionMembers)
 		if err != nil {
 			return err
 		}
-		personID, unionMembers, err := s.personForClusterUnionTx(
-			ctx, tx, oldID, newID, edges,
-		)
-		if err != nil {
-			return err
-		}
-		personRevisionBumped := false
-		if personID != 0 {
-			changed, err := s.mergePersonBindingsTx(
-				ctx, tx, personID, oldID, unionMembers)
-			if err != nil {
+		if changed {
+			if err := s.bumpPersonRevisionsTx(
+				ctx, tx, personID); err != nil {
 				return err
 			}
-			if changed {
-				if err := s.bumpPersonRevisionsTx(
-					ctx, tx, personID); err != nil {
-					return err
-				}
-				personRevisionBumped = true
-			}
+			personRevisionBumped = true
 		}
+	}
 
-		// The merge must not lose contact metadata: fill gaps on the survivor
-		// from the absorbed row, carrying the email's analytics domain with it.
-		// Email and phone are UNIQUE, so the absorbed row must release each
-		// value before the survivor can take it.
-		var oldEmail, oldDomain, oldPhone sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT NULLIF(email_address, ''), NULLIF(domain, ''), NULLIF(phone_number, '') FROM participants WHERE id = ?`, oldID).
-			Scan(&oldEmail, &oldDomain, &oldPhone); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE participants SET email_address = NULL, phone_number = NULL WHERE id = ?`, oldID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
+	// The merge must not lose contact metadata: fill gaps on the survivor
+	// from the absorbed row, carrying the email's analytics domain with it.
+	// Email and phone are UNIQUE, so the absorbed row must release each
+	// value before the survivor can take it.
+	var oldEmail, oldDomain, oldPhone sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT NULLIF(email_address, ''), NULLIF(domain, ''), NULLIF(phone_number, '') FROM participants WHERE id = ?`, oldID).
+		Scan(&oldEmail, &oldDomain, &oldPhone); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE participants SET email_address = NULL, phone_number = NULL WHERE id = ?`, oldID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 			UPDATE participants SET
 				email_address = COALESCE(NULLIF(email_address, ''), ?),
 				domain        = COALESCE(NULLIF(domain, ''), ?),
 				phone_number  = COALESCE(NULLIF(phone_number, ''), ?)
 			WHERE id = ?`, oldEmail, oldDomain, oldPhone, newID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET sender_id = ? WHERE sender_id = ?`, newID, oldID); err != nil {
-			return err
-		}
-		// Drop old rows that would collide with an existing row of the new
-		// participant, then repoint the remainder.
-		if err := repointReactionSourceEvents(ctx, tx, oldID, newID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE messages SET sender_id = ? WHERE sender_id = ?`, newID, oldID); err != nil {
+		return err
+	}
+	// Drop old rows that would collide with an existing row of the new
+	// participant, then repoint the remainder.
+	if err := repointReactionSourceEvents(ctx, tx, oldID, newID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 			DELETE FROM reactions WHERE participant_id = ? AND EXISTS (
 				SELECT 1 FROM reactions r2 WHERE r2.message_id = reactions.message_id
 				  AND r2.participant_id = ? AND r2.reaction_type = reactions.reaction_type
 				  AND r2.reaction_value = reactions.reaction_value)`, oldID, newID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE reactions SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
-			return err
-		}
-		// Collide on the full unique key including the normalized envelope
-		// address (idx_message_recipients_envelope), not just (message_id,
-		// recipient_type): a row of the absorbed participant whose envelope
-		// snapshot differs from every surviving row's must survive the
-		// repoint, or the merge would destroy the immutable alias evidence
-		// identity discovery classifies from.
-		if _, err := tx.ExecContext(ctx, `
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE reactions SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		return err
+	}
+	// Collide on the full unique key including the normalized envelope
+	// address (idx_message_recipients_envelope), not just (message_id,
+	// recipient_type): a row of the absorbed participant whose envelope
+	// snapshot differs from every surviving row's must survive the
+	// repoint, or the merge would destroy the immutable alias evidence
+	// identity discovery classifies from.
+	if _, err := tx.ExecContext(ctx, `
 			DELETE FROM message_recipients WHERE participant_id = ? AND EXISTS (
 				SELECT 1 FROM message_recipients m2 WHERE m2.message_id = message_recipients.message_id
 				  AND m2.participant_id = ? AND m2.recipient_type = message_recipients.recipient_type
 				  AND LOWER(COALESCE(m2.email_address, '')) = LOWER(COALESCE(message_recipients.email_address, '')))`, oldID, newID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE message_recipients SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE message_recipients SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 			DELETE FROM conversation_participants WHERE participant_id = ? AND EXISTS (
 				SELECT 1 FROM conversation_participants c2 WHERE c2.conversation_id = conversation_participants.conversation_id
 				  AND c2.participant_id = ?)`, oldID, newID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE conversation_participants SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		return err
+	}
+	// Identifier values are globally unique, so a plain repoint suffices.
+	if _, err := tx.ExecContext(ctx, `UPDATE participant_identifiers SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		return err
+	}
+	if err := s.rewriteObservationsForMergeTx(
+		ctx, tx, oldID, newID,
+	); err != nil {
+		return err
+	}
+	if err := s.rewriteIdentityMatchCandidatesForMergeTx(
+		ctx, tx, oldID, newID, edges,
+	); err != nil {
+		return err
+	}
+	// Sender and identifier repoints can add or remove identity evidence.
+	// Repair the primary-store provenance before committing the merge.
+	if err := refreshParticipantMessageAttributionContext(
+		ctx, tx, newID,
+	); err != nil {
+		return err
+	}
+	if err := s.refreshAccountAttributionForParticipantsTx(ctx, tx, []int64{oldID, newID}); err != nil {
+		return err
+	}
+	// Repoint (and, if needed, restructure) any link edges referencing
+	// oldID before the delete below drops them via ON DELETE CASCADE.
+	if err := s.rewriteLinksForMergeContext(ctx, tx, oldID, newID); err != nil {
+		return err
+	}
+	// Candidate and link endpoints must both reference the survivor before
+	// unsupported generated matches are withdrawn. Otherwise an owned link
+	// can evade cleanup because it still names the absorbed participant.
+	if err := s.reconcileObservationIdentityMatchesForParticipantTxContext(
+		ctx, tx, newID,
+	); err != nil {
+		return err
+	}
+	// Bump unconditionally, even when the merge touched no link edges:
+	// absorbing a participant whose email matches a confirmed account
+	// identity changes owner_participants' content (the baked dataset
+	// still lists the deleted oldID), and the refresh this triggers is
+	// cheap and idempotent, so it is not worth tracking that case
+	// separately from the link-touching one.
+	if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
+		return err
+	}
+	// Also bump the account-identity revision: the primary rows were
+	// repaired above, but existing message Parquet shards still bake the
+	// pre-merge attribution and require a full rebuild.
+	if err := s.bumpAccountIdentityRevisionContext(ctx, tx); err != nil {
+		return err
+	}
+	if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
+		return err
+	}
+	if err := rewritePersonMergeParticipantLineageTx(
+		ctx, tx, oldID, newID,
+	); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM participants WHERE id = ?`, oldID)
+	if err != nil {
+		return err
+	}
+	if personID != 0 {
+		if err := s.publishPersonIdentityScopeChangesTx(
+			ctx, tx, []int64{personID},
+			peoplesweep.EvidenceEffectIdentityReassigned); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE conversation_participants SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
-			return err
-		}
-		// Identifier values are globally unique, so a plain repoint suffices.
-		if _, err := tx.ExecContext(ctx, `UPDATE participant_identifiers SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
-			return err
-		}
-		if err := s.rewriteObservationsForMergeTx(
-			ctx, tx, oldID, newID,
-		); err != nil {
-			return err
-		}
-		if err := s.rewriteIdentityMatchCandidatesForMergeTx(
-			ctx, tx, oldID, newID, edges,
-		); err != nil {
-			return err
-		}
-		// Sender and identifier repoints can add or remove identity evidence.
-		// Repair the primary-store provenance before committing the merge.
-		if err := refreshParticipantMessageAttributionContext(
-			ctx, tx, newID,
-		); err != nil {
-			return err
-		}
-		if err := s.refreshAccountAttributionForParticipantsTx(ctx, tx, []int64{oldID, newID}); err != nil {
-			return err
-		}
-		// Repoint (and, if needed, restructure) any link edges referencing
-		// oldID before the delete below drops them via ON DELETE CASCADE.
-		if err := s.rewriteLinksForMergeContext(ctx, tx, oldID, newID); err != nil {
-			return err
-		}
-		// Candidate and link endpoints must both reference the survivor before
-		// unsupported generated matches are withdrawn. Otherwise an owned link
-		// can evade cleanup because it still names the absorbed participant.
-		if err := s.reconcileObservationIdentityMatchesForParticipantTxContext(
-			ctx, tx, newID,
-		); err != nil {
-			return err
-		}
-		// Bump unconditionally, even when the merge touched no link edges:
-		// absorbing a participant whose email matches a confirmed account
-		// identity changes owner_participants' content (the baked dataset
-		// still lists the deleted oldID), and the refresh this triggers is
-		// cheap and idempotent, so it is not worth tracking that case
-		// separately from the link-touching one.
-		if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
-			return err
-		}
-		// Also bump the account-identity revision: the primary rows were
-		// repaired above, but existing message Parquet shards still bake the
-		// pre-merge attribution and require a full rebuild.
-		if err := s.bumpAccountIdentityRevisionContext(ctx, tx); err != nil {
-			return err
-		}
-		if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
-			return err
-		}
-		if err := rewritePersonMergeParticipantLineageTx(
-			ctx, tx, oldID, newID,
-		); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM participants WHERE id = ?`, oldID)
-		if err != nil {
-			return err
-		}
-		if personID != 0 {
-			if err := s.publishPersonIdentityScopeChangesTx(
-				ctx, tx, []int64{personID},
-				peoplesweep.EvidenceEffectIdentityReassigned); err != nil {
-				return err
-			}
-			if personRevisionBumped {
-				return s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(
-					ctx, tx, personID)
-			}
-			return s.invalidatePersonEnrichmentIdentitiesTx(
+		if personRevisionBumped {
+			return s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(
 				ctx, tx, personID)
 		}
-		return nil
-	})
+		return s.invalidatePersonEnrichmentIdentitiesTx(
+			ctx, tx, personID)
+	}
+	return nil
 }
 
 // ParticipantByIdentifier returns the participant an identifier points at,

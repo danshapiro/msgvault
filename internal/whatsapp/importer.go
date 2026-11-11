@@ -142,6 +142,14 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 		if hiddenCount > 0 {
 			summary.SkippedCounts["hidden_chat"] += hiddenCount
 		}
+		if excluded, err := countExcludedOrphanTypes(ctx, waDB); err != nil {
+			reportError("message_coverage", err)
+		} else {
+			for kind, count := range excluded {
+				summary.SkippedCounts[fmt.Sprintf("type_%d", kind)] += count
+				orphanCount -= count
+			}
+		}
 		if orphanCount > 0 {
 			summary.SkippedCounts["missing_chat"] += orphanCount
 			summary.Errors += orphanCount
@@ -166,6 +174,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 		syncErr = err
 		return nil, fmt.Errorf("fetch lid map: %w", err)
 	}
+	lids := &lidResolver{store: imp.store, sourceID: source.ID, account: opts.Phone, seen: make(map[string]lidResolution)}
 
 	batchSize := opts.BatchSize
 	if batchSize <= 0 {
@@ -212,8 +221,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 			if chat.Server == "lid" {
 				phone = resolveLidSender(sql.NullInt64{Int64: chat.JIDRowID, Valid: true}, chat.Server, lidMap)
 			}
-			if phone != "" {
-				if participantID, err := imp.store.EnsureParticipantByPhone(ctx, phone, "", "whatsapp"); err != nil {
+			if phone == "" && chat.Server == "lid" {
+				reportError("participant_unresolved", errors.New("direct chat participant LID has no authoritative phone mapping"))
+			}
+			if phone != "" || chat.Server == "lid" {
+				if participantID, err := lids.ensure(ctx, chat.RawString, phone); err != nil {
 					reportError("participant", fmt.Errorf("ensure participant %s: %w", phone, err))
 				} else {
 					summary.Participants++
@@ -227,8 +239,8 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 			}
 		}
 
-		// Group rosters in current backups use LIDs. Only mapped phone JIDs
-		// or the explicit self identity are safe to add as participants.
+		// Retain opaque LIDs as account-scoped participants; membership evidence
+		// does not require asserting an unproven phone or person identity.
 		if isGroupChat(chat) {
 			if groupRosterSchema(ctx, waDB) == "unavailable" {
 				if summary.GroupRoster != "unavailable" {
@@ -253,9 +265,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						phone := normalizePhone(member.MemberUser, member.MemberServer)
 						if phone == "" {
 							reportError("group_roster_unresolved", errors.New("group member identity cannot be resolved to a phone number"))
-							continue
+							if !strings.HasSuffix(member.MemberJID, "@lid") {
+								continue
+							}
 						}
-						participantID, err = imp.store.EnsureParticipantByPhone(ctx, phone, "", "whatsapp")
+						participantID, err = lids.ensure(ctx, member.MemberJID, phone)
 						if err != nil {
 							reportError("group_roster_write", fmt.Errorf("ensure group participant: %w", err))
 							continue
@@ -366,6 +380,8 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 
 				// Resolve sender.
 				var senderID sql.NullInt64
+				senderUnresolved := false
+				directSenderPhone := ""
 				if waMsg.FromMe == 1 {
 					senderID = sql.NullInt64{Int64: selfParticipantID, Valid: true}
 				} else if waMsg.SenderServer.Valid && waMsg.SenderServer.String == "lid" {
@@ -373,15 +389,15 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					// because lid user strings can be 15 digits and pass E.164
 					// validation despite not being real phone numbers.
 					phone := resolveLidSender(waMsg.SenderJIDRowID, waMsg.SenderServer.String, lidMap)
-					if phone != "" {
-						pid, err := imp.store.EnsureParticipantByPhone(ctx, phone, "", "whatsapp")
-						if err != nil {
-							reportError("participant", fmt.Errorf("ensure sender participant %s: %w", phone, err))
-						} else {
-							senderID = sql.NullInt64{Int64: pid, Valid: true}
-						}
-					} else {
+					if phone == "" {
+						senderUnresolved = true
 						reportError("sender_unresolved", errors.New("message sender LID cannot be resolved to a phone number"))
+					}
+					pid, err := lids.ensure(ctx, waMsg.SenderRawString.String, phone)
+					if err != nil {
+						reportError("participant", fmt.Errorf("retain sender identity: %w", err))
+					} else {
+						senderID = sql.NullInt64{Int64: pid, Valid: true}
 					}
 				} else if waMsg.SenderUser.Valid && waMsg.SenderUser.String != "" {
 					phone := normalizePhone(waMsg.SenderUser.String, waMsg.SenderServer.String)
@@ -401,15 +417,18 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					if chat.Server == "lid" {
 						phone = resolveLidSender(sql.NullInt64{Int64: chat.JIDRowID, Valid: true}, chat.Server, lidMap)
 					}
-					if phone != "" {
-						pid, err := imp.store.EnsureParticipantByPhone(ctx, phone, "", "whatsapp")
+					directSenderPhone = phone
+					if phone == "" {
+						senderUnresolved = true
+						reportError("sender_unresolved", errors.New("direct message sender cannot be resolved"))
+					}
+					if phone != "" || chat.Server == "lid" {
+						pid, err := lids.ensure(ctx, chat.RawString, phone)
 						if err == nil {
 							senderID = sql.NullInt64{Int64: pid, Valid: true}
 						} else {
 							reportError("participant", fmt.Errorf("ensure direct sender: %w", err))
 						}
-					} else {
-						reportError("sender_unresolved", errors.New("direct message sender cannot be resolved"))
 					}
 				} else {
 					reportError("sender_unresolved", errors.New("group message sender identity is missing"))
@@ -430,10 +449,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 				// Build and upsert the message.
 				msg := mapMessage(waMsg, conversationID, source.ID, senderID)
 				var messageID int64
-				if senderID.Valid {
+				preserveSender := senderUnresolved || !senderID.Valid
+				if !preserveSender {
 					messageID, err = imp.store.UpsertMessageContext(ctx, &msg)
 				} else {
-					messageID, err = imp.store.UpsertMessagePreservingAttributionContext(ctx, &msg)
+					messageID, err = imp.store.UpsertMessagePreservingExistingAttributionContext(ctx, &msg)
 				}
 				if err != nil {
 					reportError("message", fmt.Errorf("upsert message %s: %w", waMsg.KeyID, err))
@@ -455,7 +475,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 				// before writing if this source no longer resolves its identity.
 				var priorSearchSender string
 				var priorSearchErr error
-				if !senderID.Valid && existingMessageID != 0 {
+				if preserveSender && existingMessageID != 0 {
 					priorSearchSender, priorSearchErr = imp.store.PreviousFTSSenderContext(ctx, messageID)
 					if priorSearchErr != nil {
 						reportError("search_index", fmt.Errorf("preserve previous search sender: %w", priorSearchErr))
@@ -582,65 +602,23 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					}
 				}
 
-				// Handle reactions.
-				if reactions, ok := reactionMap[waMsg.RowID]; ok {
-					for _, r := range reactions {
-						reactionValue := mapReaction(r)
-						if reactionValue == "" {
-							continue
-						}
-
-						var reactorID int64
-						if r.SenderServer.Valid && r.SenderServer.String == "lid" {
-							// Lid JID — resolve via jid_map first.
-							phone := resolveLidSender(r.SenderJIDRowID, r.SenderServer.String, lidMap)
-							if phone == "" {
-								reportError("reaction_unresolved", errors.New("reaction sender LID cannot be resolved"))
-								continue
-							}
-							pid, err := imp.store.EnsureParticipantByPhone(ctx, phone, "", "whatsapp")
-							if err != nil {
-								reportError("reaction", fmt.Errorf("ensure reaction participant: %w", err))
-								continue
-							}
-							reactorID = pid
-						} else if r.SenderUser.Valid && r.SenderUser.String != "" {
-							phone := normalizePhone(r.SenderUser.String, r.SenderServer.String)
-							if phone == "" {
-								reportError("reaction_unresolved", errors.New("reaction sender is not a recognized phone JID"))
-								continue
-							}
-							pid, err := imp.store.EnsureParticipantByPhone(ctx, phone, "", "whatsapp")
-							if err != nil {
-								reportError("reaction", fmt.Errorf("ensure reaction participant: %w", err))
-								continue
-							}
-							reactorID = pid
-						} else {
-							// Self reaction.
-							reactorID = selfParticipantID
-						}
-
-						createdAt := time.Unix(r.Timestamp/1000, 0).UTC()
-						if err := imp.store.UpsertReaction(ctx, messageID, reactorID, reactionTypeEmoji, reactionValue, createdAt); err != nil {
-							reportError("reaction", fmt.Errorf("upsert reaction: %w", err))
-						} else {
-							summary.ReactionsAdded++
-						}
-					}
-				}
+				// Retain unknown actors and explicit timestamped reaction changes.
+				summary.ReactionsAdded += imp.importReactions(ctx, messageID, reactionMap[waMsg.RowID],
+					lids, lidMap, selfParticipantID, reportError)
 
 				// FTS indexing.
 				if bodyText.Valid {
-					senderAddr := ""
+					var senderAddr string
 					if waMsg.FromMe == 1 {
 						senderAddr = opts.Phone
 					} else if waMsg.SenderServer.Valid && waMsg.SenderServer.String == "lid" {
 						senderAddr = resolveLidSender(waMsg.SenderJIDRowID, waMsg.SenderServer.String, lidMap)
 					} else if waMsg.SenderUser.Valid {
 						senderAddr = normalizePhone(waMsg.SenderUser.String, waMsg.SenderServer.String)
+					} else {
+						senderAddr = directSenderPhone
 					}
-					if !senderID.Valid && existingMessageID != 0 {
+					if preserveSender && existingMessageID != 0 {
 						senderAddr = priorSearchSender
 					}
 					if priorSearchErr == nil {

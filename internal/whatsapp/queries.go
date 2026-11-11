@@ -127,6 +127,31 @@ func countUnprocessedMessages(ctx context.Context, db *sql.DB) (hidden, orphan i
 	return hidden, orphan, nil
 }
 
+// Orphan system events are excluded by the same policy as events in known
+// chats. Unknown types remain unresolved, even when their text is empty.
+func countExcludedOrphanTypes(ctx context.Context, db *sql.DB) (map[int]int64, error) {
+	rows, err := db.QueryContext(ctx, `SELECT m.message_type,COUNT(*)
+		FROM message m LEFT JOIN chat c ON c._id=m.chat_row_id LEFT JOIN jid j ON j._id=c.jid_row_id
+		WHERE (c._id IS NULL OR (COALESCE(c.hidden,0)=0 AND j._id IS NULL))
+		AND m.message_type IS NOT NULL GROUP BY m.message_type`)
+	if err != nil {
+		return nil, fmt.Errorf("account for excluded orphan types: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	counts := make(map[int]int64)
+	for rows.Next() {
+		var kind int
+		var count int64
+		if err := rows.Scan(&kind, &count); err != nil {
+			return nil, err
+		}
+		if isSkippedType(kind) {
+			counts[kind] = count
+		}
+	}
+	return counts, rows.Err()
+}
+
 // fetchMessages returns messages for a chat, batched after a given _id.
 // Messages are ordered by _id ascending for deterministic resumability.
 // Joins with jid to resolve sender information.
@@ -261,6 +286,10 @@ func fetchReactions(ctx context.Context, db *sql.DB, messageRowIDs []int64) (map
 	}
 
 	result := make(map[int64][]waReaction)
+	fromMeExpr := "NULL"
+	if hasColumn(ctx, db, "message_add_on", "from_me") {
+		fromMeExpr = "ao.from_me"
+	}
 
 	const chunkSize = 500
 	for i := 0; i < len(messageRowIDs); i += chunkSize {
@@ -281,6 +310,7 @@ func fetchReactions(ctx context.Context, db *sql.DB, messageRowIDs []int64) (map
 			SELECT
 				ao.parent_message_row_id,
 				ao.sender_jid_row_id,
+				%s,
 				sj.raw_string,
 				sj.user,
 				sj.server,
@@ -291,8 +321,7 @@ func fetchReactions(ctx context.Context, db *sql.DB, messageRowIDs []int64) (map
 			LEFT JOIN jid sj ON ao.sender_jid_row_id = sj._id
 			WHERE ao.parent_message_row_id IN (%s)
 			  AND ar.reaction IS NOT NULL
-			  AND ar.reaction != ''
-		`, strings.Join(placeholders, ","))
+		`, fromMeExpr, strings.Join(placeholders, ","))
 
 		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -320,7 +349,7 @@ func scanReactionChunk(rows *sql.Rows, result map[int64][]waReaction) error {
 	for rows.Next() {
 		var r waReaction
 		if err := rows.Scan(
-			&r.MessageRowID, &r.SenderJIDRowID,
+			&r.MessageRowID, &r.SenderJIDRowID, &r.FromMe,
 			&r.SenderRawString, &r.SenderUser, &r.SenderServer,
 			&r.ReactionValue, &r.Timestamp,
 		); err != nil {
@@ -505,6 +534,9 @@ func fetchLidMap(ctx context.Context, db *sql.DB) (map[int64]waLidMapping, error
 		var m waLidMapping
 		if err := rows.Scan(&m.LidRowID, &m.PhoneUser, &m.PhoneServer); err != nil {
 			return nil, fmt.Errorf("scan lid mapping: %w", err)
+		}
+		if previous, ok := result[m.LidRowID]; ok && (previous.PhoneUser != m.PhoneUser || previous.PhoneServer != m.PhoneServer) {
+			return nil, errors.New("WhatsApp LID has conflicting authoritative phone mappings")
 		}
 		result[m.LidRowID] = m
 	}
