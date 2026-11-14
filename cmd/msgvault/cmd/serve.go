@@ -1834,6 +1834,7 @@ func daemonDuckDBOptions(c *config.Config) (query.DuckDBOptions, error) {
 	return query.DuckDBOptions{
 		DisableSQLiteScanner:        true,
 		LiveSQLWhenCacheUnavailable: c.Analytics.Engine != config.AnalyticsEngineDuckDB,
+		LiveSQLMessageLists:         c.Analytics.Engine != config.AnalyticsEngineDuckDB,
 		TempDirectory:               tempDirectory,
 		OwnTempDirectory:            true,
 		MemoryLimit:                 c.Analytics.QueryMemoryLimit,

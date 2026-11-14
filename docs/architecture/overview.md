@@ -121,7 +121,9 @@ report stale state rather than silently serving a different search mode.
 
 During startup, the API becomes reachable before analytics maintenance finishes.
 With the automatic analytics engine, eligible queries can use live SQL until
-DuckDB is ready. Cache-dependent routes can return a structured `503` with
+DuckDB is ready. Date-ordered message lists continue to use live SQL in auto
+mode so ordinary browsing does not wait for analytical scans or cache publication.
+Cache-dependent routes can return a structured `503` with
 readiness information. An explicitly selected DuckDB engine waits for its
 required cache. See [API readiness](../api-server.md).
 

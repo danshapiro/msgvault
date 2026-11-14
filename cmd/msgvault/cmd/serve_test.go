@@ -1491,6 +1491,21 @@ func TestOpenDaemonAnalyticsEngineAutoBuildsCacheAtStartup(t *testing.T) {
 	assert.Equal(startupCacheBuildOutcomeNone, outcome, "automatic builds have no explicit outcome")
 }
 
+func TestDaemonDuckDBLiveMessageListPolicy(t *testing.T) {
+	for _, engine := range []string{config.AnalyticsEngineAuto, config.AnalyticsEngineDuckDB} {
+		t.Run(engine, func(t *testing.T) {
+			c := config.NewDefaultConfig()
+			c.HomeDir = t.TempDir()
+			c.Data.DataDir = t.TempDir()
+			c.Analytics.Engine = engine
+			options, err := daemonDuckDBOptions(c)
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, os.RemoveAll(options.TempDirectory)) })
+			assert.Equal(t, engine == config.AnalyticsEngineAuto, options.LiveSQLMessageLists)
+		})
+	}
+}
+
 func TestDaemonDuckDBEnginesUseIsolatedSpillDirectories(t *testing.T) {
 	requirements := require.New(t)
 	c, s := openTestDaemonAnalyticsStore(t)

@@ -63,6 +63,7 @@ type DuckDBEngine struct {
 	tempTableSeq     atomic.Uint64 // Unique suffix for temp tables to avoid concurrent collisions
 
 	liveSQLWhenCacheUnavailable bool
+	liveSQLMessageLists         bool
 
 	// querySem bounds concurrent heavy query execution (see
 	// duckDBQueryConcurrency). Acquired at the top of each expensive public
@@ -125,6 +126,9 @@ type DuckDBOptions struct {
 	// LiveSQLWhenCacheUnavailable serves message analytics from live SQL when
 	// the cache is unusable and a SQLite engine is available.
 	LiveSQLWhenCacheUnavailable bool
+	// LiveSQLMessageLists serves date-ordered message lists from live SQL, keeping
+	// ordinary browsing independent of analytical scans and cache publication.
+	LiveSQLMessageLists bool
 	// DisableSQLiteScanner prevents loading the sqlite_scanner extension even
 	// on platforms where it would normally be available. This forces all SQLite
 	// queries to route through sqliteEngine, matching the Windows code path.
@@ -262,6 +266,7 @@ func newDuckDBEngine(ctx context.Context, analyticsDir string, sqlitePath string
 		sqliteDB:                     sqliteDB,
 		sqliteEngine:                 sqliteEngine,
 		liveSQLWhenCacheUnavailable:  opt.LiveSQLWhenCacheUnavailable,
+		liveSQLMessageLists:          opt.LiveSQLMessageLists,
 		hasSQLiteScanner:             hasSQLiteScanner,
 		tempDirectory:                tempDirectory,
 		ownTempDirectory:             ownTempDirectory,
@@ -1970,9 +1975,12 @@ func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	return accounts, rows.Err()
 }
 
-// ListMessages retrieves messages from Parquet files for fast filtered queries.
-// Joins normalized Parquet tables to reconstruct denormalized view.
+// ListMessages uses live SQL for opted-in chronological lists. Other lists join
+// normalized Parquet tables to reconstruct the denormalized view.
 func (e *DuckDBEngine) ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error) {
+	if e.liveSQLMessageLists && e.sqliteEngine != nil && filter.Sorting.Field == MessageSortByDate {
+		return e.sqliteEngine.ListMessages(ctx, filter)
+	}
 	release, err := e.acquireCacheRead(ctx)
 	if err != nil {
 		if e.useLiveSQL(err) {
