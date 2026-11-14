@@ -875,7 +875,9 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 		if err := resolveClientBackupProgressFlag(cmd); err != nil {
 			return err
 		}
-		return runDaemonCLICommandHTTPFromCobra(cmd, args)
+		return withBackupOwnerInput(cmd, func() error {
+			return runDaemonCLICommandHTTPFromCobra(cmd, args)
+		})
 	}
 	return runBackupCreateLocal(cmd)
 }
@@ -1063,6 +1065,7 @@ func init() {
 	backupInitCmd.Flags().StringVar(&backupInitRepo, "repo", "", "Backup repository directory")
 
 	backupCreateCmd.Flags().StringVar(&backupCreateRepo, "repo", "", "Backup repository directory")
+	backupCreateCmd.Flags().Bool(backupOwnerInputFlag, false, "Cancel when the invoking owner closes stdin (consumes stdin exclusively)")
 	backupCreateCmd.Flags().BoolVar(&backupCreateIncludeConfig, "include-config", false, "Include config.toml verbatim (may contain API keys) in the snapshot")
 	backupCreateCmd.Flags().BoolVar(&backupCreateIncludeTokens, "include-tokens", false, "Include the tokens directory in the snapshot")
 	backupCreateCmd.Flags().BoolVar(&backupCreateAllowPlaintextSecrets, "allow-plaintext-secrets", false, "Allow capturing secrets in plaintext (required with --include-config/--include-tokens on an unencrypted repository)")

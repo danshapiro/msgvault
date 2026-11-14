@@ -2564,6 +2564,7 @@ msgvault backup create [flags]
 | `--tag <text>` | Optional label recorded on the snapshot manifest |
 | `--force-unlock` | Break a stale exclusive repository lock before creating |
 | `--jobs N` | Concurrent attachment capture workers; `0` uses one per CPU |
+| `--cancel-on-stdin-eof` | Cancel the daemon request when the invoking owner closes stdin; consumes stdin exclusively |
 
 ### backup list
 
