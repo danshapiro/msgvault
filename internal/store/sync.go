@@ -1037,22 +1037,28 @@ func (s *Store) ListSyncRunItemsContext(ctx context.Context, syncRunID int64, st
 		args = append(args, status)
 	}
 	if status == SyncRunItemStatusError {
-		// Recognize the synthetic marker text without hiding genuine
-		// failures, even if a later attempt repaired the files.
-		query += ` AND NOT (
+		// Resolve the source's file obligations in one pass, rather than
+		// rescanning later ledger rows separately for every pending item.
+		// Materialization also gives SQLite an indexed lookup by message key.
+		query = `WITH settled_files AS MATERIALIZED (
+			SELECT settled.source_message_id, MAX(settled.id) AS resolved_id
+			FROM sync_runs settled_run
+			JOIN sync_run_items settled ON settled.sync_run_id = settled_run.id
+			WHERE settled_run.source_id = (SELECT source_id FROM sync_runs WHERE id = ?)
+			  AND settled.phase IN ('fetch', 'ingest') AND settled.status = 'resolved'
+			GROUP BY settled.source_message_id
+		) ` + query
+		args = append([]any{syncRunID}, args...)
+		// CASE avoids resolving the file ledger for ordinary errors. Genuine
+		// failures stay visible even when a later attempt repaired the files.
+		query += ` AND CASE WHEN
 			COALESCE(error_kind, '') IN ('attachment_error', 'remote_image_error', 'attachment_remote_image_error')
 			AND COALESCE(error_message, '') = ?
-			AND EXISTS (
-				SELECT 1 FROM sync_run_items settled
-				JOIN sync_runs settled_run ON settled_run.id = settled.sync_run_id
-				WHERE settled.source_message_id = sync_run_items.source_message_id
-				  AND settled.id > sync_run_items.id
-				  AND settled.phase IN ('fetch', 'ingest') AND settled.status = 'resolved'
-				  AND settled_run.source_id = (
-					SELECT source_id FROM sync_runs WHERE id = sync_run_items.sync_run_id
-				  )
-			)
-		)`
+		THEN NOT EXISTS (
+			SELECT 1 FROM settled_files
+			WHERE settled_files.source_message_id = sync_run_items.source_message_id
+			  AND settled_files.resolved_id > sync_run_items.id
+		) ELSE TRUE END`
 		args = append(args, SyncRunItemFilesPendingMessage)
 	}
 	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
