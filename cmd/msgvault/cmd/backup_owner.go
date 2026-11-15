@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 
 	"github.com/muesli/cancelreader"
@@ -31,9 +32,19 @@ func withBackupOwnerInput(cmd *cobra.Command, run func() error) error {
 		return errors.New("backup owner input must be closeable")
 	}
 	var source io.Reader = input
-	if runtime.GOOS == "windows" {
-		// Its Windows file reader opens CONIN$, not an inherited owner
-		// pipe. Keep the existing close-based behavior on that platform.
+	// cancelreader's Windows file reader opens CONIN$, not the owner pipe.
+	useClose := runtime.GOOS == "windows"
+	if file, ok := input.(*os.File); ok && !useClose {
+		info, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("inspect backup owner input: %w", err)
+		}
+		// Regular files and devices such as /dev/null may not support
+		// readiness polling. Preserve their ordinary Read/Close behavior.
+		useClose = info.Mode().IsRegular() || info.Mode()&os.ModeCharDevice != 0
+	}
+	if useClose {
+		// Hide the descriptor to retain the existing Read/Close behavior.
 		source = struct{ io.Reader }{input}
 	}
 	reader, err := cancelreader.NewReader(source)
