@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/spf13/cobra"
 )
@@ -29,9 +30,16 @@ func withBackupOwnerInput(cmd *cobra.Command, run func() error) error {
 		return errors.New("backup owner input must be closeable")
 	}
 	ctx, cancel := context.WithCancelCause(cmd.Context())
+	closeInput := sync.OnceFunc(func() { _ = input.Close() })
+	defer closeInput()
+	read, interrupt, err := backupOwnerInputReader(ctx, input, closeInput)
+	if err != nil {
+		cancel(err)
+		return err
+	}
 	done := make(chan struct{})
 	go func() {
-		_, readErr := io.Copy(io.Discard, input)
+		readErr := read()
 		if readErr != nil {
 			cancel(fmt.Errorf("backup owner input: %w", readErr))
 		} else {
@@ -43,7 +51,7 @@ func withBackupOwnerInput(cmd *cobra.Command, run func() error) error {
 	cmd.SetContext(ctx)
 	defer func() {
 		cancel(context.Canceled)
-		_ = input.Close()
+		interrupt()
 		<-done
 		cmd.SetContext(previous)
 	}()
@@ -52,4 +60,14 @@ func withBackupOwnerInput(cmd *cobra.Command, run func() error) error {
 		return errors.Join(context.Cause(ctx), err)
 	}
 	return err
+}
+
+// In-memory/other-platform readers use their Close contract to interrupt Read.
+// Unix inherited descriptors instead use a cancellable poll loop (see the
+// platform helper); Close alone cannot interrupt an inherited blocking read.
+func backupOwnerCloseReader(input io.ReadCloser, closeInput func()) (func() error, func()) {
+	return func() error {
+		_, err := io.Copy(io.Discard, input)
+		return err
+	}, closeInput
 }

@@ -2566,6 +2566,10 @@ msgvault backup create [flags]
 | `--jobs N` | Concurrent attachment capture workers; `0` uses one per CPU |
 | `--cancel-on-stdin-eof` | Cancel the daemon request when the invoking owner closes stdin; consumes stdin exclusively |
 
+On Unix, owner input must be a pipe or an already-nonblocking stream socket. The command exits after its
+work finishes even while the owner keeps stdin open; owner EOF still cancels
+unfinished work. Regular-file and terminal stdin are rejected with this flag.
+
 ### backup list
 
 ```bash

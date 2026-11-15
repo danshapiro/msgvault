@@ -74,3 +74,28 @@ func TestBackupOwnerInputCancellation(t *testing.T) {
 		})
 	}
 }
+
+// A caller's Close may have side effects; cancellation and final cleanup must
+// share one close even when the reader is not an operating-system file.
+type countingBackupOwnerInput struct {
+	*io.PipeReader
+
+	closes int
+}
+
+func (input *countingBackupOwnerInput) Close() error {
+	input.closes++
+	return input.PipeReader.Close()
+}
+
+func TestBackupOwnerInputClosesOnce(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	input := &countingBackupOwnerInput{PipeReader: reader}
+	command := &cobra.Command{}
+	command.SetContext(t.Context())
+	command.SetIn(input)
+	command.Flags().Bool(backupOwnerInputFlag, true, "")
+	require.NoError(t, withBackupOwnerInput(command, func() error { return nil }))
+	assert.Equal(t, 1, input.closes)
+}
