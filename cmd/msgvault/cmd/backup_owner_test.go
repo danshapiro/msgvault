@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,6 +13,37 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBackupOwnerRedirectedInputEOF(t *testing.T) {
+	for _, mode := range []string{"regular-file", "null-device"} {
+		t.Run(mode, func(t *testing.T) {
+			require := require.New(t)
+			path := os.DevNull
+			if mode == "regular-file" {
+				path = filepath.Join(t.TempDir(), "owner-input")
+				require.NoError(os.WriteFile(path, []byte("owner input\n"), 0600))
+			}
+			input, err := os.Open(path)
+			require.NoError(err)
+			t.Cleanup(func() { _ = input.Close() })
+			parent, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cmd := &cobra.Command{}
+			cmd.SetContext(parent)
+			cmd.SetIn(input)
+			cmd.Flags().Bool(backupOwnerInputFlag, true, "")
+			err = withBackupOwnerInput(cmd, func() error {
+				<-cmd.Context().Done()
+				return cmd.Context().Err()
+			})
+			require.ErrorIs(err, errBackupOwnerInputClosed)
+			require.NoError(parent.Err(), "input EOF must cancel before the parent deadline")
+			assert.Equal(t, parent, cmd.Context())
+			_, err = input.Read(make([]byte, 1))
+			assert.ErrorIs(t, err, os.ErrClosed, "the command owns and closes the input")
+		})
+	}
+}
 
 func TestBackupOwnerInputCancellation(t *testing.T) {
 	for _, mode := range []string{"eof", "read-error", "parent-cancel", "success", "command-failure", "disabled"} {
