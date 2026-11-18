@@ -5335,6 +5335,10 @@ Restore the missing nonempty MIME attachments of one Gmail message with:
 msgvault repair-derived --attachment-message <internal-id-or-gmail-id> --source-id <source-id>
 ```
 
+Deep HTML whose normal text converter exceeds its nesting limit uses the existing non-DOM
+text projection. Original HTML, RAW and attachment bytes stay unchanged; other
+severe MIME errors still require repair.
+
 This mode uses retained RAW without Gmail access. It preserves original payloads,
 message fields, existing attachment rows and valid loose or packed blobs. It adds
 missing MIME occurrences and reconstructs missing loose files. Empty MIME parts

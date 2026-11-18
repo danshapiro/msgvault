@@ -10,6 +10,7 @@ import (
 	stdmime "mime"
 	"net/mail"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -164,8 +165,18 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	// Preserve physical occurrences so parsed evidence matches keyed storage.
 	msg.Attachments = DistinctAttachments(msg.Attachments)
 
-	// Collect any parsing errors
+	// A DOM depth limit loses only a derived projection, not MIME content.
+	// Recover that projection before deciding whether acquisition is incomplete;
+	// every other severe diagnostic still prevents completeness certification.
+	recoveredHTML := false
+	if msg.BodyText == "" && msg.BodyHTML != "" && slices.ContainsFunc(env.Errors, isHTMLDepthConversionError) {
+		msg.BodyText, recoveredHTML = StripHTML(msg.BodyHTML), true
+	}
 	for _, e := range env.Errors {
+		if recoveredHTML && isHTMLDepthConversionError(e) {
+			msg.Errors = append(msg.Errors, fmt.Sprintf("[W] %s: %s; recovered with existing HTML text projection", e.Name, e.Detail))
+			continue
+		}
 		msg.Errors = append(msg.Errors, e.Error())
 		msg.Incomplete = msg.Incomplete || e.Severe
 	}
